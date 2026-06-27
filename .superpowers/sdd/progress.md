@@ -17,3 +17,12 @@ Task 11: complete (commit ff67a86, review clean — all 5 named checks pass [rou
 Task 12: complete (commit 1106fca, review clean — main.go wiring verbatim, slog-only, os.Exit on fatal; build+vet+test all green, 44 tests across 5 packages; Minor: ListenAndServe treats ErrServerClosed as fatal [no graceful shutdown wired, unreachable])
 
 === ALL 12 TASKS COMPLETE ===
+
+=== FINAL WHOLE-BRANCH REVIEW (verdict: With fixes) ===
+Final review found 2 Important (spec-contract) + minors. Fixed in commit 6cecdba:
+- FIX1: anthropicio.MapBackendError maps backend 429->429, 529/5xx->503, 400->400 (was all->502); MapError now uses errors.As. Tests: TestMapBackendError, TestHandlerBackendRateLimit(429), TestHandlerBackendOverloaded(503).
+- FIX2: streaming message_delta now emits input_tokens + cache tokens from EventDone usage. Test: TestHandlerStreamingUsage asserts input_tokens:3.
+- FIX3: unique per-response message id (crypto/rand) replacing hardcoded msg_router, in sse.go + nonstream.go (new id.go).
+Verified by controller: go build ./... (exit 0), go vet ./... (exit 0), go test -count=1 ./... ALL PASS (now 48 tests across 5 pkgs).
+DEFERRED to v1 backlog (conscious): SSE ping keepalives (spec mentioned; trusted-local OK without); decode silent-drop of unknown/non-base64 blocks; errors.As in MapError now done. Remaining minors cosmetic (max shadow, stale comments, map-iteration error order).
+=== PROJECT COMPLETE ===

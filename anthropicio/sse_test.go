@@ -117,7 +117,3 @@ func TestEncodeErrorMidStream(t *testing.T) {
 		t.Errorf("expected message_stop after error in:\n%s", out)
 	}
 }
-
-type errString string
-
-func (e errString) Error() string { return string(e) }

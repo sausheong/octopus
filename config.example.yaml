@@ -1,0 +1,43 @@
+# llmrouter configuration. Copy to config.yaml and edit.
+server:
+  addr: "127.0.0.1:8787"
+
+classifier:
+  model: "anthropic/claude-haiku-3-5-20241022"  # fixed cheap classifier
+  max_tokens: 256
+  timeout: "10s"
+
+# Balanced-score weights (need not sum to 1; the scorer normalizes).
+weights:
+  quality: 0.5
+  cost: 0.3
+  speed: 0.2
+
+# Used when no catalog model survives the capability filter.
+default_model: "anthropic/claude-haiku-3-5-20241022"
+
+# Backend credentials: api_key_env names the env var holding the key.
+providers:
+  anthropic:
+    api_key_env: "ANTHROPIC_API_KEY"
+  openai:
+    api_key_env: "OPENAI_API_KEY"
+  gemini:
+    api_key_env: "GEMINI_API_KEY"
+  qwen:
+    api_key_env: "QWEN_API_KEY"
+    base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+catalog:
+  - id: "anthropic/claude-opus-4-0-20250514"
+    quality: 0.98
+    cost_per_mtok_in: 15.0
+    cost_per_mtok_out: 75.0
+    speed: 0.4
+    caps: { tools: true, vision: true, reasoning: true, max_context: 1000000 }
+  - id: "anthropic/claude-haiku-3-5-20241022"
+    quality: 0.70
+    cost_per_mtok_in: 1.0
+    cost_per_mtok_out: 5.0
+    speed: 0.95
+    caps: { tools: true, vision: true, reasoning: false, max_context: 200000 }

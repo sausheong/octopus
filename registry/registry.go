@@ -64,3 +64,9 @@ func (r *Registry) Resolve(id string) (llm.LLMProvider, string, error) {
 	}
 	return prov, model, nil
 }
+
+// NewForTest builds a Registry from a pre-built provider map. Test-only seam
+// so handlers can be exercised without real API clients.
+func NewForTest(providers map[string]llm.LLMProvider) *Registry {
+	return &Registry{providers: providers}
+}

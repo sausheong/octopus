@@ -78,3 +78,8 @@ func requestHasImages(chat llm.ChatRequest) bool {
 	}
 	return false
 }
+
+// SetClassifier overrides the classification function (test seam).
+func (r *Router) SetClassifier(fn func(ctx context.Context, prov llm.LLMProvider, model string, maxTokens int, turn llm.Message) TaskProfile) {
+	r.classifyFn = fn
+}

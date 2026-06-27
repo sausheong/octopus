@@ -14,3 +14,6 @@ Task 8: complete (commit d3de63e, controller inline review [tiny diff] — verba
 Task 9: complete (commit e89fb5c, review clean — all 4 failure modes return DefaultProfile; Minors: EventError branch untested, partial-JSON edge untested, {} alone→zero profile not default [defensible])
 Task 10: complete (commit 4a77077, review clean — all 4 named checks pass [no-turn skips classifier, cross-checks override post-classify, timeout ctx defer-cancelled, unresolved provider→DefaultProfile]; Minors: fallback/timeout-propagation untested, stale comment in router_test.go from brief)
 Task 11: complete (commit ff67a86, review clean — all 5 named checks pass [routed bare model set before ChatStream, SSE headers+200 before encode, pre-stream errors→HTTP error no half-200, ctx flows to Route+ChatStream, seams minimal]; Minors: Resolve/ChatStream error paths untested, mid-stream EncodeSSE error only logged, writeErrorStatus string-concat)
+Task 12: complete (commit 1106fca, review clean — main.go wiring verbatim, slog-only, os.Exit on fatal; build+vet+test all green, 44 tests across 5 packages; Minor: ListenAndServe treats ErrServerClosed as fatal [no graceful shutdown wired, unreachable])
+
+=== ALL 12 TASKS COMPLETE ===

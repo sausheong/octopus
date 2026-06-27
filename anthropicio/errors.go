@@ -1,6 +1,13 @@
 package anthropicio
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+
+	anthropic "github.com/anthropics/anthropic-sdk-go"
+	openai "github.com/sashabaranov/go-openai"
+	"google.golang.org/genai"
+)
 
 // APIError is a router error carrying a stable Kind that MapError translates
 // into an HTTP status and Anthropic error type.
@@ -20,7 +27,8 @@ func MapError(err error) (int, []byte) {
 	errType := "api_error"
 	msg := err.Error()
 
-	if ae, ok := err.(APIError); ok {
+	var ae APIError
+	if errors.As(err, &ae) {
 		switch ae.Kind {
 		case "invalid_request":
 			status, errType = 400, "invalid_request_error"
@@ -41,4 +49,56 @@ func MapError(err error) (int, []byte) {
 		},
 	})
 	return status, body
+}
+
+// MapBackendError converts a harness provider error into an APIError with the
+// right Kind, inspecting typed SDK errors via errors.As. Falls back to
+// "upstream" (502) for unrecognized errors.
+func MapBackendError(err error) APIError {
+	// anthropic 429 -> rate_limit, 529 -> overloaded
+	var anthErr *anthropic.Error
+	if errors.As(err, &anthErr) {
+		switch anthErr.StatusCode {
+		case 429:
+			return NewAPIError("rate_limit", err.Error())
+		case 529:
+			return NewAPIError("overloaded", err.Error())
+		}
+		if anthErr.StatusCode >= 500 {
+			return NewAPIError("overloaded", err.Error())
+		}
+		if anthErr.StatusCode == 400 {
+			return NewAPIError("invalid_request", err.Error())
+		}
+	}
+	// openai APIError / RequestError: 429 -> rate_limit, 5xx -> overloaded
+	var oaiAPI *openai.APIError
+	if errors.As(err, &oaiAPI) {
+		if oaiAPI.HTTPStatusCode == 429 {
+			return NewAPIError("rate_limit", err.Error())
+		}
+		if oaiAPI.HTTPStatusCode >= 500 && oaiAPI.HTTPStatusCode < 600 {
+			return NewAPIError("overloaded", err.Error())
+		}
+	}
+	var oaiReq *openai.RequestError
+	if errors.As(err, &oaiReq) {
+		if oaiReq.HTTPStatusCode == 429 {
+			return NewAPIError("rate_limit", err.Error())
+		}
+		if oaiReq.HTTPStatusCode >= 500 && oaiReq.HTTPStatusCode < 600 {
+			return NewAPIError("overloaded", err.Error())
+		}
+	}
+	// gemini: genai.APIError is a VALUE type (value receiver Error()), match the value
+	var gErr genai.APIError
+	if errors.As(err, &gErr) {
+		if gErr.Code == 429 {
+			return NewAPIError("rate_limit", err.Error())
+		}
+		if gErr.Code >= 500 && gErr.Code < 600 {
+			return NewAPIError("overloaded", err.Error())
+		}
+	}
+	return NewAPIError("upstream", err.Error())
 }

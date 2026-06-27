@@ -64,7 +64,7 @@ func CollectMessage(model string, events <-chan llm.ChatEvent) ([]byte, error) {
 	}
 
 	msg := map[string]any{
-		"id":            "msg_router",
+		"id":            newMessageID(),
 		"type":          "message",
 		"role":          "assistant",
 		"model":         model,

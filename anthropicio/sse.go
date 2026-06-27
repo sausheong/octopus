@@ -85,7 +85,7 @@ func (s *sseState) start() error {
 	return s.emit("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id":            "msg_router",
+			"id":            newMessageID(),
 			"type":          "message",
 			"role":          "assistant",
 			"model":         s.model,
@@ -194,13 +194,22 @@ func (s *sseState) done(stopReason string, usage *llm.Usage) error {
 		stopReason = "end_turn"
 	}
 	out := 0
+	usageObj := map[string]any{"output_tokens": out}
 	if usage != nil {
 		out = usage.OutputTokens
+		usageObj["output_tokens"] = out
+		usageObj["input_tokens"] = usage.InputTokens
+		if usage.CacheCreationInputTokens > 0 {
+			usageObj["cache_creation_input_tokens"] = usage.CacheCreationInputTokens
+		}
+		if usage.CacheReadInputTokens > 0 {
+			usageObj["cache_read_input_tokens"] = usage.CacheReadInputTokens
+		}
 	}
 	if err := s.emit("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": out},
+		"usage": usageObj,
 	}); err != nil {
 		return err
 	}

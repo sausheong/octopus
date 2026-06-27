@@ -3,8 +3,23 @@ package anthropicio
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/url"
 	"testing"
+
+	anthropic "github.com/anthropics/anthropic-sdk-go"
 )
+
+// anthErr builds a fully-populated *anthropic.Error so that its Error() method
+// (which dereferences Request and Response) does not panic. The real SDK always
+// sets these; a bare struct literal does not.
+func anthErr(status int) *anthropic.Error {
+	return &anthropic.Error{
+		StatusCode: status,
+		Request:    &http.Request{Method: "POST", URL: &url.URL{Scheme: "https", Host: "api", Path: "/v1/messages"}},
+		Response:   &http.Response{StatusCode: status},
+	}
+}
 
 func TestMapErrorKinds(t *testing.T) {
 	cases := []struct {
@@ -42,5 +57,31 @@ func TestMapErrorKinds(t *testing.T) {
 		if parsed.Error.Message == "" {
 			t.Errorf("empty message for %v", c.err)
 		}
+	}
+}
+
+func TestMapBackendError(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantKind   string
+		wantStatus int
+	}{
+		{"anthropic 429", anthErr(429), "rate_limit", 429},
+		{"anthropic 529", anthErr(529), "overloaded", 503},
+		{"unknown", errors.New("boom"), "upstream", 502},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ae := MapBackendError(c.err)
+			if ae.Kind != c.wantKind {
+				t.Errorf("Kind = %q, want %q", ae.Kind, c.wantKind)
+			}
+			// MapError on the returned APIError must yield the expected HTTP status.
+			status, _ := MapError(ae)
+			if status != c.wantStatus {
+				t.Errorf("MapError status = %d, want %d", status, c.wantStatus)
+			}
+		})
 	}
 }

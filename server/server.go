@@ -69,7 +69,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	ch, err := prov.ChatStream(ctx, dr.Chat)
 	if err != nil {
-		writeError(w, anthropicio.NewAPIError("upstream", err.Error()))
+		writeError(w, anthropicio.MapBackendError(err))
 		return
 	}
 
@@ -85,7 +85,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	} else {
 		out, err := anthropicio.CollectMessage(dec.Chosen, ch)
 		if err != nil {
-			writeError(w, anthropicio.NewAPIError("upstream", err.Error()))
+			writeError(w, anthropicio.MapBackendError(err))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

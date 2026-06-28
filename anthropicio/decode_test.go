@@ -1,6 +1,8 @@
 package anthropicio
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -119,5 +121,68 @@ func TestDecodeInvalidJSON(t *testing.T) {
 func TestDecodeNoMessages(t *testing.T) {
 	if _, err := Decode([]byte(`{"model":"m","max_tokens":1,"messages":[]}`)); err == nil {
 		t.Fatal("expected error for empty messages")
+	}
+}
+
+// hasProperties reports whether a tool's decoded Parameters JSON contains a
+// "properties" object (the field some backends require on every tool schema).
+func hasProperties(t *testing.T, raw json.RawMessage) bool {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("tool Parameters is not a JSON object: %s", raw)
+	}
+	_, ok := m["properties"]
+	return ok
+}
+
+func TestDecodeToolSchemaInjectsProperties(t *testing.T) {
+	// A no-arg tool sent as {"type":"object"} (no properties) — Claude Code
+	// does this for several built-in tools. The decoder must inject an empty
+	// properties object so backends that require it accept the request.
+	body := []byte(`{
+		"model":"m","max_tokens":1,
+		"tools":[{"name":"noargs","description":"d","input_schema":{"type":"object"}}],
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	dr, err := Decode(body)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(dr.Chat.Tools) != 1 {
+		t.Fatalf("len(Tools) = %d", len(dr.Chat.Tools))
+	}
+	if !hasProperties(t, dr.Chat.Tools[0].Parameters) {
+		t.Errorf("expected injected properties, got: %s", dr.Chat.Tools[0].Parameters)
+	}
+}
+
+func TestDecodeToolSchemaPreservesExistingProperties(t *testing.T) {
+	// A tool that already declares properties must pass through unchanged.
+	body := []byte(`{
+		"model":"m","max_tokens":1,
+		"tools":[{"name":"getw","description":"d","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	dr, err := Decode(body)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	p := string(dr.Chat.Tools[0].Parameters)
+	if !strings.Contains(p, `"city"`) || !strings.Contains(p, `"required"`) {
+		t.Errorf("existing schema not preserved: %s", p)
+	}
+}
+
+func TestNormalizeToolSchemaEmpty(t *testing.T) {
+	// Missing/empty input_schema yields a valid empty-object schema.
+	got := normalizeToolSchema(nil)
+	if !hasProperties(t, got) {
+		t.Errorf("empty schema not normalized: %s", got)
+	}
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(got, &m)
+	if string(m["type"]) != `"object"` {
+		t.Errorf("expected type object, got: %s", got)
 	}
 }

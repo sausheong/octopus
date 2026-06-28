@@ -26,3 +26,7 @@ Final review found 2 Important (spec-contract) + minors. Fixed in commit 6cecdba
 Verified by controller: go build ./... (exit 0), go vet ./... (exit 0), go test -count=1 ./... ALL PASS (now 48 tests across 5 pkgs).
 DEFERRED to v1 backlog (conscious): SSE ping keepalives (spec mentioned; trusted-local OK without); decode silent-drop of unknown/non-base64 blocks; errors.As in MapError now done. Remaining minors cosmetic (max shadow, stale comments, map-iteration error order).
 === PROJECT COMPLETE ===
+
+=== LIVE INTEGRATION: Claude Code wired through router (post-completion) ===
+Found+fixed real integration bug via live test: Claude Code sends no-arg tools as input_schema {"type":"object"} with NO properties; Vertex-via-proxy backend rejects with "tools.N.custom.input_schema: Field required". Fix: anthropicio/decode.go normalizeToolSchema() injects {"type":"object","properties":{}} when missing (passthrough when present). Tests added: TestDecodeToolSchemaInjectsProperties, TestDecodeToolSchemaPreservesExistingProperties, TestNormalizeToolSchemaEmpty.
+Verified live: `claude -p` (full default toolset) → ROUTER OK; multi-turn Read-tool task → correct answer, 3 turns all routed to same model (stickiness holds live), zero errors. Commit below.

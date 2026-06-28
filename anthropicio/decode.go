@@ -31,7 +31,7 @@ func Decode(body []byte) (DecodedRequest, error) {
 		chat.Tools = append(chat.Tools, llm.ToolDef{
 			Name:        t.Name,
 			Description: t.Description,
-			Parameters:  t.InputSchema,
+			Parameters:  normalizeToolSchema(t.InputSchema),
 		})
 	}
 	for _, wm := range wr.Messages {
@@ -164,4 +164,45 @@ func toolResultText(raw json.RawMessage) string {
 		return strings.Join(parts, "")
 	}
 	return ""
+}
+
+// emptyObjectSchema is the minimal valid JSON Schema for a no-argument tool.
+var emptyObjectSchema = json.RawMessage(`{"type":"object","properties":{}}`)
+
+// normalizeToolSchema ensures a tool's input_schema is a JSON object that
+// always carries "type":"object" and a "properties" object. Clients such as
+// Claude Code legitimately send no-argument tools as {"type":"object"} with no
+// "properties" key (or omit the schema entirely); the Anthropic Messages API
+// accepts that, but some Anthropic-compatible backends (e.g. Vertex via a
+// proxy) reject a custom tool whose input_schema lacks "properties"
+// ("tools.N.custom.input_schema: Field required"). Injecting an empty
+// properties object keeps the request valid everywhere without changing the
+// tool's meaning. A schema that already has properties is returned unchanged.
+func normalizeToolSchema(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return emptyObjectSchema
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		// Not a JSON object (unexpected); leave it to the provider/backend
+		// to reject rather than silently rewriting something we don't model.
+		return raw
+	}
+	changed := false
+	if _, ok := m["type"]; !ok {
+		m["type"] = json.RawMessage(`"object"`)
+		changed = true
+	}
+	if _, ok := m["properties"]; !ok {
+		m["properties"] = json.RawMessage(`{}`)
+		changed = true
+	}
+	if !changed {
+		return raw
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
 }

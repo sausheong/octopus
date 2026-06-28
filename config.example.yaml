@@ -28,6 +28,17 @@ providers:
     api_key_env: "QWEN_API_KEY"
     base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
+  # Providers may use any name and declare a `kind` to pick the client type.
+  # This lets several Anthropic-compatible backends coexist, each with its own
+  # base_url and key. `kind` defaults to the provider name when omitted.
+  # Credentials: prefer `api_key_env` (no secret in the file); `api_key` sets
+  # the key inline and takes precedence — use it only in a gitignored config.
+  #
+  # deepseek:
+  #   kind: anthropic
+  #   api_key_env: "DEEPSEEK_API_KEY"
+  #   base_url: "https://api.deepseek.com/anthropic"
+
 catalog:
   - id: "anthropic/claude-opus-4-0-20250514"
     quality: 0.98

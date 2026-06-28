@@ -27,6 +27,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Resolve every provider's key into its config (reading api_key_env now,
+	// while the environment is still intact), then scrub the ambient
+	// ANTHROPIC_* credentials. The Anthropic SDK otherwise picks up
+	// ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY from the process environment
+	// and sends it as an Authorization: Bearer header alongside the explicit
+	// per-provider x-api-key — Anthropic-compatible backends (DeepSeek,
+	// MiniMax, Qwen) authenticate off that Bearer header, so the ambient
+	// token would leak into and break every non-litellm backend. Pinning each
+	// key inline and clearing the env guarantees each client uses only its own.
+	for name, creds := range cfg.Providers {
+		creds.APIKey = creds.Key()
+		cfg.Providers[name] = creds
+	}
+	os.Unsetenv("ANTHROPIC_AUTH_TOKEN")
+	os.Unsetenv("ANTHROPIC_API_KEY")
+
 	reg, err := registry.New(context.Background(), cfg)
 	if err != nil {
 		slog.Error("registry init failed", "err", err)

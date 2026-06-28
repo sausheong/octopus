@@ -6,7 +6,6 @@ package registry
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/harness/providers/anthropic"
@@ -27,11 +26,17 @@ type Registry struct {
 func New(ctx context.Context, cfg *config.Config) (*Registry, error) {
 	r := &Registry{providers: make(map[string]llm.LLMProvider, len(cfg.Providers))}
 	for name, creds := range cfg.Providers {
-		key := os.Getenv(creds.APIKeyEnv)
+		key := creds.Key()
 		if key == "" {
-			return nil, fmt.Errorf("provider %q: env %q is empty", name, creds.APIKeyEnv)
+			return nil, fmt.Errorf("provider %q: no API key (set api_key or a non-empty api_key_env %q)", name, creds.APIKeyEnv)
 		}
-		switch name {
+		// Kind selects the harness client type; defaults to the provider's
+		// name so the built-in names keep working without a kind field.
+		kind := creds.Kind
+		if kind == "" {
+			kind = name
+		}
+		switch kind {
 		case "anthropic":
 			r.providers[name] = anthropic.NewAnthropicProvider(key, creds.BaseURL)
 		case "openai":
@@ -45,7 +50,7 @@ func New(ctx context.Context, cfg *config.Config) (*Registry, error) {
 			}
 			r.providers[name] = g
 		default:
-			return nil, fmt.Errorf("unknown provider %q (want anthropic|openai|gemini|qwen)", name)
+			return nil, fmt.Errorf("provider %q: unknown kind %q (want anthropic|openai|gemini|qwen)", name, kind)
 		}
 	}
 	return r, nil

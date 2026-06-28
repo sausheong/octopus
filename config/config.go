@@ -39,10 +39,33 @@ type CatalogEntry struct {
 }
 
 // ProviderCreds names the env var holding a provider's API key, plus an
-// optional base URL override.
+// optional base URL override and an optional Kind selecting which harness
+// client type to build. Kind lets several providers under distinct names
+// share the same wire protocol — e.g. multiple Anthropic-compatible
+// backends (DeepSeek, MiniMax, Qwen-coding) each with kind "anthropic" but
+// their own base_url and key. When Kind is empty it defaults to the
+// provider's map key (so "anthropic"/"openai"/"gemini"/"qwen" keep working
+// unchanged).
 type ProviderCreds struct {
+	// APIKey, when set, is the literal API key. It takes precedence over
+	// APIKeyEnv. Use it only in a config file kept out of version control
+	// (config.yaml is gitignored); prefer APIKeyEnv for committed configs.
+	APIKey    string `yaml:"api_key"`
 	APIKeyEnv string `yaml:"api_key_env"`
 	BaseURL   string `yaml:"base_url"`
+	Kind      string `yaml:"kind"`
+}
+
+// Key returns the resolved API key: the inline APIKey if set, otherwise the
+// value of the environment variable named by APIKeyEnv.
+func (p ProviderCreds) Key() string {
+	if p.APIKey != "" {
+		return p.APIKey
+	}
+	if p.APIKeyEnv != "" {
+		return os.Getenv(p.APIKeyEnv)
+	}
+	return ""
 }
 
 // ClassifierCfg configures the fixed classifier model call.
@@ -123,6 +146,22 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Catalog) == 0 {
 		return fmt.Errorf("catalog must have at least one entry")
+	}
+	// Each provider's kind (defaulting to its name) must be a known client
+	// type, and it must carry a credential source (inline key or env var).
+	for name, creds := range c.Providers {
+		kind := creds.Kind
+		if kind == "" {
+			kind = name
+		}
+		switch kind {
+		case "anthropic", "openai", "gemini", "qwen":
+		default:
+			return fmt.Errorf("provider %q has unknown kind %q (want anthropic|openai|gemini|qwen)", name, kind)
+		}
+		if creds.APIKey == "" && creds.APIKeyEnv == "" {
+			return fmt.Errorf("provider %q must set api_key or api_key_env", name)
+		}
 	}
 	// Every catalog id must be provider/model and its provider configured.
 	for _, e := range c.Catalog {

@@ -69,6 +69,47 @@ func TestValidateBadProviderID(t *testing.T) {
 	}
 }
 
+func TestValidateUnknownKind(t *testing.T) {
+	c := baseValid()
+	c.Providers["weird"] = ProviderCreds{Kind: "mystery", APIKey: "x"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for unknown provider kind")
+	}
+}
+
+func TestValidateCustomKindAccepted(t *testing.T) {
+	// A custom-named provider with an explicit known kind + inline key is valid,
+	// and its catalog id (provider/model) resolves to it.
+	c := baseValid()
+	c.Providers["deepseek"] = ProviderCreds{Kind: "anthropic", APIKey: "sk-x", BaseURL: "https://api.deepseek.com/anthropic"}
+	c.Catalog = append(c.Catalog, CatalogEntry{ID: "deepseek/deepseek-v4-pro[1m]", Quality: 0.88, Speed: 0.6, Caps: Caps{Tools: true, MaxContext: 1000000}})
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected valid config, got: %v", err)
+	}
+}
+
+func TestValidateProviderMissingCredentialSource(t *testing.T) {
+	c := baseValid()
+	c.Providers["nokey"] = ProviderCreds{Kind: "anthropic"} // no api_key, no api_key_env
+	c.Catalog = append(c.Catalog, CatalogEntry{ID: "nokey/m", Quality: 0.5, Speed: 0.5, Caps: Caps{MaxContext: 1000}})
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for provider with no api_key or api_key_env")
+	}
+}
+
+func TestKeyPrefersInlineThenEnv(t *testing.T) {
+	os.Setenv("KEY_ENV_ONLY", "from-env")
+	if got := (ProviderCreds{APIKey: "inline"}).Key(); got != "inline" {
+		t.Errorf("inline key = %q, want inline", got)
+	}
+	if got := (ProviderCreds{APIKeyEnv: "KEY_ENV_ONLY"}).Key(); got != "from-env" {
+		t.Errorf("env key = %q, want from-env", got)
+	}
+	if got := (ProviderCreds{}).Key(); got != "" {
+		t.Errorf("empty creds key = %q, want empty", got)
+	}
+}
+
 // baseValid returns a minimally valid Config (env set) for mutation in tests.
 func baseValid() *Config {
 	os.Setenv("TEST_KEY", "sk-test")

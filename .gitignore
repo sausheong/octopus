@@ -1,3 +1,9 @@
 
 # Local environment-specific config (use config.example.yaml as template)
 config.yaml
+
+# Provider credential env files (never track)
+.deepseek-env
+.minimax-env
+.qwen-env
+*-env

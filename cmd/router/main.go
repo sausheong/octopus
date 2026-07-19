@@ -3,10 +3,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/sausheong/llmrouter/config"
 	"github.com/sausheong/llmrouter/registry"
@@ -52,9 +56,30 @@ func main() {
 	rt := router.NewRouter(cfg, reg)
 	srv := server.New(rt, reg, cfg.Catalog)
 
-	slog.Info("llmrouter listening", "addr", cfg.ServerAddr)
-	if err := http.ListenAndServe(cfg.ServerAddr, srv.Handler()); err != nil {
-		slog.Error("server stopped", "err", err)
+	httpSrv := &http.Server{
+		Addr:    cfg.ServerAddr,
+		Handler: srv.Handler(),
+	}
+
+	// Start serving in a goroutine so the main goroutine can wait on signals.
+	go func() {
+		slog.Info("llmrouter listening", "addr", cfg.ServerAddr)
+		if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	slog.Info("shutting down, draining in-flight requests...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		slog.Error("shutdown error", "err", err)
 		os.Exit(1)
 	}
+	slog.Info("stopped")
 }

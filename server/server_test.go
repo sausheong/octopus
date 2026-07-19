@@ -296,4 +296,135 @@ func TestHandlerAllProvidersFail(t *testing.T) {
 	}
 }
 
+// ---- /v1/chat/completions handler tests ------------------------------------
+
+func TestOAIHandlerNonStreaming(t *testing.T) {
+	s := buildServer(t)
+	body := `{"model":"gpt-4o","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, `"object":"chat.completion"`) {
+		t.Errorf("missing object field: %s", out)
+	}
+	if !strings.Contains(out, `"Hello"`) {
+		t.Errorf("missing text content: %s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Errorf("missing finish_reason: %s", out)
+	}
+}
+
+func TestOAIHandlerStreaming(t *testing.T) {
+	s := buildServer(t)
+	body := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, `"chat.completion.chunk"`) {
+		t.Errorf("missing chunk object: %s", out)
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Errorf("missing [DONE]: %s", out)
+	}
+}
+
+func TestOAIHandlerSystemMessage(t *testing.T) {
+	s := buildServer(t)
+	body := `{"model":"gpt-4o","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOAIHandlerBadJSON(t *testing.T) {
+	s := buildServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{bad"))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"error"`) {
+		t.Errorf("missing error body: %s", rec.Body.String())
+	}
+}
+
+func TestOAIHandlerMethodNotAllowed(t *testing.T) {
+	s := buildServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestOAIHandlerBackendError(t *testing.T) {
+	s := buildServerWithProv(t, &errProv{err: anthErr(429)})
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("expected error status, got 200")
+	}
+	if !strings.Contains(rec.Body.String(), `"error"`) {
+		t.Errorf("missing error body: %s", rec.Body.String())
+	}
+}
+
+func TestOAIHandlerFallback(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr:   "x",
+		Classifier:   config.ClassifierCfg{Model: "good/model", MaxTokens: 16},
+		Weights:      config.Weights{Quality: 1, Cost: 1, Speed: 1},
+		DefaultModel: "good/model",
+		Providers: map[string]config.ProviderCreds{
+			"bad":  {APIKeyEnv: "X"},
+			"good": {APIKeyEnv: "X"},
+		},
+		Catalog: []config.CatalogEntry{
+			{ID: "bad/model", Quality: 0.9, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+			{ID: "good/model", Quality: 0.7, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{
+		"bad":  &errProv{err: anthErr(529)},
+		"good": &fakeProv{text: "fallback ok"},
+	})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
+	})
+	s := New(rt, reg, cfg.Catalog)
+
+	body := `{"model":"any","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "fallback ok") {
+		t.Errorf("expected fallback content: %s", rec.Body.String())
+	}
+}
+
 var _ = io.Discard // keep io imported if unused above

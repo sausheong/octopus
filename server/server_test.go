@@ -525,4 +525,67 @@ func TestOAIHandlerOverloadedMaps503(t *testing.T) {
 	}
 }
 
+// midErrProv emits one text delta then an EventError, simulating a provider
+// that fails mid-stream. For non-streaming requests this should trigger fallback
+// (collection fails); for streaming the error arrives after headers are written.
+type midErrProv struct {
+	text string
+	err  error
+}
+
+func (p *midErrProv) Models() []llm.ModelInfo { return nil }
+func (p *midErrProv) NormalizeToolSchema(t []llm.ToolDef) ([]llm.ToolDef, []llm.Diagnostic) {
+	return t, nil
+}
+func (p *midErrProv) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	ch := make(chan llm.ChatEvent, 2)
+	ch <- llm.ChatEvent{Type: llm.EventTextDelta, Text: p.text}
+	ch <- llm.ChatEvent{Type: llm.EventError, Error: p.err}
+	close(ch)
+	return ch, nil
+}
+
+func TestHandlerNonStreamingFallbackOnCollectionError(t *testing.T) {
+	// For buffered (non-streaming) requests, a mid-stream EventError must
+	// trigger fallback to the next provider — collectWithFallback iterates
+	// all candidates before giving up.
+	cfg := &config.Config{
+		ServerAddr:   "x",
+		Classifier:   config.ClassifierCfg{Model: "good/model", MaxTokens: 16},
+		Weights:      config.Weights{Quality: 1, Cost: 1, Speed: 1},
+		DefaultModel: "good/model",
+		Providers: map[string]config.ProviderCreds{
+			"bad":  {APIKeyEnv: "X"},
+			"good": {APIKeyEnv: "X"},
+		},
+		Catalog: []config.CatalogEntry{
+			{ID: "bad/model", Quality: 0.9, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+			{ID: "good/model", Quality: 0.7, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{
+		"bad":  &midErrProv{text: "partial", err: anthErr(529)},
+		"good": &fakeProv{text: "collection fallback"},
+	})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
+	})
+	s := New(rt, reg, cfg.Catalog)
+
+	body := `{"model":"any","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "collection fallback") {
+		t.Errorf("expected fallback content: %s", rec.Body.String())
+	}
+}
+
 var _ = io.Discard // keep io imported if unused above

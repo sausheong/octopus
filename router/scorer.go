@@ -3,6 +3,7 @@ package router
 import (
 	"sort"
 
+	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/llmrouter/config"
 )
 
@@ -15,12 +16,13 @@ const HighQualityFloor = 0.85
 
 // Decision is the structured record of one routing choice. Logged per request.
 type Decision struct {
-	Chosen   string
-	Profile  TaskProfile
-	Eligible []string
-	Scores   map[string]float64
-	Weights  config.Weights
-	Reason   string
+	Chosen    string
+	Profile   TaskProfile
+	Eligible  []string
+	Scores    map[string]float64
+	Weights   config.Weights
+	Reason    string
+	Reasoning llm.ReasoningMode // recommended reasoning mode for the chosen model
 }
 
 // eligible applies the hard capability filter: a model survives only if it
@@ -105,41 +107,41 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, defau
 	}
 
 	qualities := make([]float64, len(elig))
-	costs := make([]float64, len(elig)) // cost score = inverse cost; 0-cost = infinity → sentinel
+	// costScores are computed in two passes so that free (zero-cost) models
+	// always receive the maximum cost score of 1.0 regardless of the scale of
+	// paid models' inverse-cost values. Paid models are normalised within [0,1)
+	// relative to each other; free models sit above all of them at exactly 1.0.
+	costScores := make([]float64, len(elig))
 	speeds := make([]float64, len(elig))
-	hasPaidModel := false
+	var paidInvCosts []float64
+	paidIdx := make([]int, 0, len(elig))
 	for i, e := range elig {
 		qualities[i] = e.Quality
-		c := reqCost(p, e)
-		if c <= 0 {
-			// Free model: use sentinel −1 to distinguish from paid models after
-			// normalization. We replace it with the max+1 value after the loop.
-			costs[i] = -1
-		} else {
-			costs[i] = 1 / c
-			hasPaidModel = true
-		}
 		speeds[i] = e.Speed
-	}
-	// Give free models the best possible cost score (above any paid model).
-	// If there are no paid models, normalize will make all entries equal (neutral).
-	var freeCostScore float64 = 1
-	if hasPaidModel {
-		var maxPaid float64
-		for _, v := range costs {
-			if v > maxPaid {
-				maxPaid = v
-			}
+		c := reqCost(p, e)
+		if c > 0 {
+			paidInvCosts = append(paidInvCosts, 1/c)
+			paidIdx = append(paidIdx, i)
 		}
-		freeCostScore = maxPaid + 1
+		// Free models left at 0; filled in below.
 	}
-	for i, v := range costs {
-		if v < 0 {
-			costs[i] = freeCostScore
+	// Normalise paid models within [0, paidMax]. Then scale into [0, maxPaidNorm]
+	// where maxPaidNorm < 1 so that free models at 1.0 always beat paid models.
+	const maxPaidNorm = 0.99
+	if len(paidInvCosts) > 0 {
+		normed := normalize(paidInvCosts)
+		for k, i := range paidIdx {
+			costScores[i] = normed[k] * maxPaidNorm
+		}
+	}
+	for i := range elig {
+		// Free model: cost score is 1.0, beating every paid model.
+		if costScores[i] == 0 && reqCost(p, elig[i]) <= 0 {
+			costScores[i] = 1.0
 		}
 	}
 	qn := normalize(qualities)
-	cn := normalize(costs)
+	cn := costScores // already in [0,1] — free=1.0, paid in [0,0.99]
 	sn := normalize(speeds)
 
 	wsum := w.Quality + w.Cost + w.Speed

@@ -109,15 +109,15 @@ func parseProfile(s string) (TaskProfile, bool) {
 		p.Domain = "other"
 	}
 
-	// Clamp token estimates to sane bounds: non-negative, max 1M each.
-	if p.EstTokensIn < 0 {
-		p.EstTokensIn = 0
-	} else if p.EstTokensIn > 1_000_000 {
+	// Reject negative token estimates — they would bypass context filtering.
+	// Cap at 1M to guard against absurd values.
+	if p.EstTokensIn < 0 || p.EstTokensOut < 0 {
+		return TaskProfile{}, false
+	}
+	if p.EstTokensIn > 1_000_000 {
 		p.EstTokensIn = 1_000_000
 	}
-	if p.EstTokensOut < 0 {
-		p.EstTokensOut = 0
-	} else if p.EstTokensOut > 1_000_000 {
+	if p.EstTokensOut > 1_000_000 {
 		p.EstTokensOut = 1_000_000
 	}
 

@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,6 +170,62 @@ func TestRouteShortCircuitNotFiredForMultiTurn(t *testing.T) {
 	r.Route(context.Background(), chat)
 	if !called {
 		t.Error("classifier should be called for multi-turn conversation")
+	}
+}
+
+func TestRouteDeterministicFloorFloorsClassifierEstimate(t *testing.T) {
+	// If the classifier underestimates tokens, the deterministic floor should
+	// raise EstTokensIn to at least what EstimateRequestTokens returns.
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	// Classifier returns a tiny estimate regardless of actual content.
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		return TaskProfile{Difficulty: "low", EstTokensIn: 1, EstTokensOut: 1}
+	}
+	longSystem := strings.Repeat("x", 3000) // ~1000 tokens at 3 bytes/token
+	chat := llm.ChatRequest{
+		SystemPrompt: longSystem,
+		Messages:     []llm.Message{{Role: "user", Content: "hi"}},
+	}
+	d := r.Route(context.Background(), chat)
+	det := EstimateRequestTokens(chat)
+	if d.Profile.EstTokensIn < det {
+		t.Errorf("EstTokensIn = %d, want >= deterministic estimate %d", d.Profile.EstTokensIn, det)
+	}
+}
+
+func TestRouteDeterministicFloorDoesNotLower(t *testing.T) {
+	// If the classifier produces a higher estimate than the deterministic floor,
+	// the classifier's estimate should be preserved. Use long content to bypass
+	// the trivial short-circuit so the classifier actually runs.
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		return TaskProfile{Difficulty: "low", EstTokensIn: 999999, EstTokensOut: 999999}
+	}
+	chat := llm.ChatRequest{
+		Messages: []llm.Message{{Role: "user", Content: strings.Repeat("x", shortCircuitBytes+1)}},
+	}
+	d := r.Route(context.Background(), chat)
+	if d.Profile.EstTokensIn < 999999 {
+		t.Errorf("EstTokensIn = %d, classifier's higher estimate should be preserved", d.Profile.EstTokensIn)
+	}
+}
+
+func TestRouteReasoningSetOnDecision(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		return TaskProfile{Difficulty: "high", NeedsReasoning: true, EstTokensIn: 100, EstTokensOut: 100}
+	}
+	// Use content long enough to bypass the trivial short-circuit.
+	chat := llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: strings.Repeat("x", shortCircuitBytes+1)}}}
+	d := r.Route(context.Background(), chat)
+	if d.Reasoning == llm.ReasoningOff {
+		t.Error("Decision.Reasoning should be set when NeedsReasoning=true")
 	}
 }
 

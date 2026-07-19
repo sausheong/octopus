@@ -64,7 +64,31 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 		prof.NeedsTools = true
 	}
 
+	// Apply deterministic token floor: the classifier only sees the last user
+	// turn so it can underestimate large system prompts, histories, and tool
+	// schemas. EstimateRequestTokens counts the full request; we take the max
+	// so the classifier's semantic estimate is never overridden downward.
+	detIn := EstimateRequestTokens(chat)
+	if detIn > prof.EstTokensIn {
+		prof.EstTokensIn = detIn
+	}
+	// Reserve capacity for the requested output (MaxTokens = 0 means "model
+	// default"; treat it as a modest 1024 for context-filter purposes).
+	detOut := chat.MaxTokens
+	if detOut <= 0 {
+		detOut = 1024
+	}
+	if detOut > prof.EstTokensOut {
+		prof.EstTokensOut = detOut
+	}
+
 	d := Score(prof, r.cfg.Catalog, r.cfg.Weights, r.cfg.DefaultModel)
+	// If the profile requires reasoning, request medium effort. This ensures
+	// the chosen model (which must have Caps.Reasoning=true to pass the filter)
+	// actually activates extended thinking rather than leaving it at the default off.
+	if prof.NeedsReasoning {
+		d.Reasoning = llm.ReasoningMedium
+	}
 	slog.Info("routing decision",
 		"chosen", d.Chosen,
 		"reason", d.Reason,

@@ -118,7 +118,7 @@ llmrouter/
 ```bash
 git clone https://github.com/sausheong/llmrouter
 cd llmrouter
-go build ./cmd/router
+go build -o llmrouter ./cmd/router
 ```
 
 ### Configure

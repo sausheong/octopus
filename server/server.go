@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -43,74 +44,74 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// tryProviders attempts ChatStream on the chosen model first (Eligible is
-// already sorted by descending score), then falls back through the rest on
-// any ChatStream error. For each candidate it applies provider-specific tool
-// schema normalization before the call. Returns the open event channel, the
-// model id that succeeded, and an error only if every candidate failed.
-// Fallback is intentionally pre-stream only — once headers are written the
-// caller owns the channel and there is no going back.
-func (s *Server) tryProviders(ctx context.Context, dec router.Decision, chat llm.ChatRequest) (<-chan llm.ChatEvent, string, error) {
-	candidates := []string{dec.Chosen}
+// candidates returns the ordered list of provider IDs to try: chosen first,
+// then the rest of Eligible in score order (duplicates removed).
+func candidates(dec router.Decision) []string {
+	out := []string{dec.Chosen}
 	for _, id := range dec.Eligible {
 		if id != dec.Chosen {
-			candidates = append(candidates, id)
+			out = append(out, id)
 		}
 	}
+	return out
+}
 
+// prepareAttempt resolves a provider candidate, normalizes tools, and applies
+// the routing decision's reasoning mode to the request.
+func (s *Server) prepareAttempt(id string, chat llm.ChatRequest, dec router.Decision) (llm.LLMProvider, llm.ChatRequest, error) {
+	prov, model, err := s.reg.Resolve(id)
+	if err != nil {
+		return nil, llm.ChatRequest{}, err
+	}
+	attempt := chat
+	attempt.Model = model
+	attempt.Reasoning = dec.Reasoning
+	if len(chat.Tools) > 0 {
+		normalized, diags := prov.NormalizeToolSchema(chat.Tools)
+		attempt.Tools = normalized
+		for _, d := range diags {
+			slog.Warn("tool schema normalized", "model", id, "field", d.Field, "reason", d.Reason)
+		}
+	}
+	return prov, attempt, nil
+}
+
+// tryProvidersStream opens a streaming channel for the request, trying each
+// candidate in order. It peeks the first event: an EventError or a closed
+// channel (empty stream) both trigger fallback. Returns the pre-populated
+// channel, the winning model ID, and an error only if every candidate failed.
+func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, chat llm.ChatRequest) (<-chan llm.ChatEvent, string, error) {
 	var lastErr error
-	for _, id := range candidates {
-		prov, model, err := s.reg.Resolve(id)
+	for _, id := range candidates(dec) {
+		prov, attempt, err := s.prepareAttempt(id, chat, dec)
 		if err != nil {
 			lastErr = err
-			slog.Warn("provider resolve failed during fallback", "model", id, "err", err)
+			slog.Warn("provider resolve failed", "model", id, "err", err)
 			continue
-		}
-
-		// Apply provider-specific tool schema normalization for this candidate.
-		attempt := chat
-		attempt.Model = model
-		if len(chat.Tools) > 0 {
-			normalized, diags := prov.NormalizeToolSchema(chat.Tools)
-			attempt.Tools = normalized
-			for _, d := range diags {
-				slog.Warn("tool schema normalized", "model", id, "field", d.Field, "reason", d.Reason)
-			}
 		}
 
 		ch, err := prov.ChatStream(ctx, attempt)
 		if err != nil {
 			lastErr = err
-			if id == dec.Chosen {
-				slog.Warn("chosen provider failed, trying fallback", "model", id, "err", err)
-			} else {
-				slog.Warn("fallback provider failed", "model", id, "err", err)
-			}
+			slog.Warn("provider stream open failed, trying fallback", "model", id, "err", err)
 			continue
 		}
 
-		// Peek at the first event. If it is an immediate EventError the provider
-		// signalled failure via the channel rather than via the error return. We
-		// can still fall back because no HTTP headers have been written yet.
+		// Peek the first event: empty channel or immediate EventError both mean
+		// the provider failed before producing any content — we can still fall back.
 		first, ok := <-ch
 		if !ok {
-			// Channel closed with no events — treat as empty success.
-			empty := make(chan llm.ChatEvent)
-			close(empty)
-			return empty, id, nil
+			lastErr = errors.New("provider returned empty stream")
+			slog.Warn("provider returned empty stream, trying fallback", "model", id)
+			continue
 		}
 		if first.Type == llm.EventError {
 			chErr := first.Error
 			if chErr == nil {
-				chErr = errString("provider stream error")
+				chErr = errors.New("provider stream error")
 			}
 			lastErr = chErr
-			if id == dec.Chosen {
-				slog.Warn("chosen provider stream error, trying fallback", "model", id, "err", chErr)
-			} else {
-				slog.Warn("fallback provider stream error", "model", id, "err", chErr)
-			}
-			// Drain the now-broken channel before moving on.
+			slog.Warn("provider stream error on first event, trying fallback", "model", id, "err", chErr)
 			go func() {
 				for range ch {
 				}
@@ -118,7 +119,7 @@ func (s *Server) tryProviders(ctx context.Context, dec router.Decision, chat llm
 			continue
 		}
 
-		// First event is valid — prepend it back onto a new channel.
+		// Valid first event — prepend onto a new channel and return.
 		out := make(chan llm.ChatEvent, 1)
 		out <- first
 		go func() {
@@ -127,6 +128,48 @@ func (s *Server) tryProviders(ctx context.Context, dec router.Decision, chat llm
 				out <- ev
 			}
 		}()
+		if id != dec.Chosen {
+			slog.Info("using fallback model", "model", id, "original", dec.Chosen)
+		}
+		return out, id, nil
+	}
+	return nil, "", lastErr
+}
+
+// collectWithFallback attempts buffered collection for the request, trying each
+// candidate in order. Unlike streaming, the full response is collected before
+// any bytes are written, so mid-stream errors in the channel can also trigger
+// fallback. Returns the collected bytes, the winning model ID, and an error
+// only if every candidate failed.
+func (s *Server) collectWithFallback(
+	ctx context.Context,
+	dec router.Decision,
+	chat llm.ChatRequest,
+	collect func(model string, ch <-chan llm.ChatEvent) ([]byte, error),
+) ([]byte, string, error) {
+	var lastErr error
+	for _, id := range candidates(dec) {
+		prov, attempt, err := s.prepareAttempt(id, chat, dec)
+		if err != nil {
+			lastErr = err
+			slog.Warn("provider resolve failed", "model", id, "err", err)
+			continue
+		}
+
+		ch, err := prov.ChatStream(ctx, attempt)
+		if err != nil {
+			lastErr = err
+			slog.Warn("provider stream open failed, trying fallback", "model", id, "err", err)
+			continue
+		}
+
+		out, err := collect(id, ch)
+		if err != nil {
+			lastErr = err
+			slog.Warn("provider collection failed, trying fallback", "model", id, "err", err)
+			continue
+		}
+
 		if id != dec.Chosen {
 			slog.Info("using fallback model", "model", id, "original", dec.Chosen)
 		}
@@ -227,13 +270,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dec := s.rt.Route(ctx, dr.Chat)
 
-	ch, chosen, err := s.tryProviders(ctx, dec, dr.Chat)
-	if err != nil {
-		writeError(w, anthropicio.MapBackendError(err))
-		return
-	}
-
 	if dr.Stream {
+		ch, chosen, err := s.tryProvidersStream(ctx, dec, dr.Chat)
+		if err != nil {
+			writeError(w, anthropicio.MapBackendError(err))
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -242,8 +284,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		if err := anthropicio.EncodeSSE(fw, chosen, ch); err != nil {
 			slog.Error("sse encode failed", "err", err, "model", chosen)
 		}
+		slog.Info("request handled", "model", chosen, "requested_model", dr.RequestedModel,
+			"stream", true, "reason", dec.Reason, "elapsed_ms", time.Since(start).Milliseconds())
 	} else {
-		out, err := anthropicio.CollectMessage(chosen, ch)
+		out, chosen, err := s.collectWithFallback(ctx, dec, dr.Chat, func(model string, ch <-chan llm.ChatEvent) ([]byte, error) {
+			return anthropicio.CollectMessage(model, ch)
+		})
 		if err != nil {
 			writeError(w, anthropicio.MapBackendError(err))
 			return
@@ -251,15 +297,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(out)
+		slog.Info("request handled", "model", chosen, "requested_model", dr.RequestedModel,
+			"stream", false, "reason", dec.Reason, "elapsed_ms", time.Since(start).Milliseconds())
 	}
-
-	slog.Info("request handled",
-		"model", chosen,
-		"requested_model", dr.RequestedModel,
-		"stream", dr.Stream,
-		"reason", dec.Reason,
-		"elapsed_ms", time.Since(start).Milliseconds(),
-	)
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -290,13 +330,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dec := s.rt.Route(ctx, chat)
 
-	ch, chosen, err := s.tryProviders(ctx, dec, chat)
-	if err != nil {
-		oaiBackendError(w, err)
-		return
-	}
-
 	if stream {
+		ch, chosen, err := s.tryProvidersStream(ctx, dec, chat)
+		if err != nil {
+			oaiBackendError(w, err)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -305,8 +344,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if err := openaiio.EncodeSSE(fw, chosen, ch); err != nil {
 			slog.Error("oai sse encode failed", "err", err, "model", chosen)
 		}
+		slog.Info("request handled", "endpoint", "oai", "model", chosen,
+			"requested_model", requestedModel, "stream", true,
+			"reason", dec.Reason, "elapsed_ms", time.Since(start).Milliseconds())
 	} else {
-		out, err := openaiio.CollectCompletion(chosen, ch)
+		out, chosen, err := s.collectWithFallback(ctx, dec, chat, func(model string, ch <-chan llm.ChatEvent) ([]byte, error) {
+			return openaiio.CollectCompletion(model, ch)
+		})
 		if err != nil {
 			oaiBackendError(w, err)
 			return
@@ -314,16 +358,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(out)
+		slog.Info("request handled", "endpoint", "oai", "model", chosen,
+			"requested_model", requestedModel, "stream", false,
+			"reason", dec.Reason, "elapsed_ms", time.Since(start).Milliseconds())
 	}
-
-	slog.Info("request handled",
-		"endpoint", "oai",
-		"model", chosen,
-		"requested_model", requestedModel,
-		"stream", stream,
-		"reason", dec.Reason,
-		"elapsed_ms", time.Since(start).Milliseconds(),
-	)
 }
 
 // writeErrorStatus writes an Anthropic-shaped error with an explicit status

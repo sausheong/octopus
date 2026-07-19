@@ -42,6 +42,33 @@ func TrivialProfile() TaskProfile {
 	}
 }
 
+// tokensPerByte is a conservative character-to-token ratio used for
+// deterministic sizing. Real tokenizers average ~4 bytes/token for English;
+// we use 3 to err on the side of over-estimating (safer for context filtering).
+const tokensPerByte = 3
+
+// bytesPerImage is a rough token cost for an image. Most vision APIs charge
+// 1000-2000 tokens per image depending on resolution; 1500 is a safe midpoint.
+const tokensPerImage = 1500
+
+// EstimateRequestTokens returns a deterministic lower-bound token estimate for
+// the full inbound request: system prompt, all message content, all tool
+// definitions, and image overhead. This estimate is used to floor the
+// classifier's LLM-generated guess so that large system prompts or long
+// conversation histories cannot cause a model to be selected whose context
+// window is actually too small.
+func EstimateRequestTokens(chat llm.ChatRequest) int {
+	n := len(chat.SystemPrompt) / tokensPerByte
+	for _, m := range chat.Messages {
+		n += len(m.Content) / tokensPerByte
+		n += len(m.Images) * tokensPerImage
+	}
+	for _, t := range chat.Tools {
+		n += len(t.Name)/tokensPerByte + len(t.Description)/tokensPerByte + len(t.Parameters)/tokensPerByte
+	}
+	return n
+}
+
 // isTrivial reports whether a request is simple enough to skip the classifier.
 // Conditions: single-turn (no prior assistant messages), last user turn is
 // short, no images, and no tools. Multi-turn conversations are never trivial —

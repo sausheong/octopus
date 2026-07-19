@@ -61,14 +61,14 @@ func TestScoreContextFilter(t *testing.T) {
 	}
 }
 
-func TestScoreNoEligibleFallsBack(t *testing.T) {
+func TestScoreNoEligibleSetsFlag(t *testing.T) {
 	p := TaskProfile{Difficulty: "high", NeedsReasoning: true, EstTokensIn: 2_000_000} // nothing fits
 	w := config.Weights{Quality: 1}
 	d := Score(p, cat(), w, "anthropic/haiku")
-	if d.Chosen != "anthropic/haiku" {
-		t.Fatalf("Chosen = %q, want default", d.Chosen)
+	if !d.NoEligible {
+		t.Fatal("expected NoEligible=true when no model passes capability filter")
 	}
-	if d.Reason != "default_model fallback (no eligible)" {
+	if d.Reason != "no eligible model" {
 		t.Errorf("Reason = %q", d.Reason)
 	}
 }
@@ -118,6 +118,28 @@ func TestScoreFreeModeGetsMaxCostScore(t *testing.T) {
 	// Also verify the free model's cost score is strictly higher than the paid model's.
 	if d.Scores["local/free"] <= d.Scores["cloud/paid"] {
 		t.Errorf("free model score %v not > paid model score %v", d.Scores["local/free"], d.Scores["cloud/paid"])
+	}
+}
+
+func TestScoreFreeModelWinsReadmeRecipe(t *testing.T) {
+	// Regression: the exact mixed local/cloud catalog and weights from the README
+	// must route a TrivialProfile to the local free model, not to Haiku.
+	catalog := []config.CatalogEntry{
+		{ID: "anthropic/claude-opus-4-0-20250514", Quality: 0.98,
+			CostPerMTokIn: 15.0, CostPerMTokOut: 75.0, Speed: 0.4,
+			Caps: config.Caps{Tools: true, Vision: true, Reasoning: true, MaxContext: 1000000}},
+		{ID: "anthropic/claude-haiku-3-5-20241022", Quality: 0.70,
+			CostPerMTokIn: 1.0, CostPerMTokOut: 5.0, Speed: 0.95,
+			Caps: config.Caps{Tools: true, Vision: true, Reasoning: false, MaxContext: 200000}},
+		{ID: "mlx/Qwen3-8B-4bit", Quality: 0.60,
+			CostPerMTokIn: 0.0, CostPerMTokOut: 0.0, Speed: 0.85,
+			Caps: config.Caps{Tools: false, Vision: false, Reasoning: false, MaxContext: 32768}},
+	}
+	w := config.Weights{Quality: 0.5, Cost: 0.4, Speed: 0.1}
+	p := TrivialProfile() // EstTokensIn:100, EstTokensOut:200 — well within MLX context
+	d := Score(p, catalog, w, "anthropic/claude-haiku-3-5-20241022")
+	if d.Chosen != "mlx/Qwen3-8B-4bit" {
+		t.Fatalf("Chosen = %q, want mlx/Qwen3-8B-4bit (free local model should win for trivial tasks)", d.Chosen)
 	}
 }
 

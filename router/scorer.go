@@ -16,13 +16,14 @@ const HighQualityFloor = 0.85
 
 // Decision is the structured record of one routing choice. Logged per request.
 type Decision struct {
-	Chosen    string
-	Profile   TaskProfile
-	Eligible  []string
-	Scores    map[string]float64
-	Weights   config.Weights
-	Reason    string
-	Reasoning llm.ReasoningMode // recommended reasoning mode for the chosen model
+	Chosen     string
+	Profile    TaskProfile
+	Eligible   []string
+	Scores     map[string]float64
+	Weights    config.Weights
+	Reason     string
+	Reasoning  llm.ReasoningMode // recommended reasoning mode for the chosen model
+	NoEligible bool              // true when no catalog model passed the capability filter
 }
 
 // eligible applies the hard capability filter: a model survives only if it
@@ -97,12 +98,13 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, defau
 	}
 	if len(elig) == 0 {
 		return Decision{
-			Chosen:   defaultModel,
-			Profile:  p,
-			Eligible: nil,
-			Scores:   map[string]float64{},
-			Weights:  w,
-			Reason:   "default_model fallback (no eligible)",
+			Chosen:     defaultModel,
+			Profile:    p,
+			Eligible:   nil,
+			Scores:     map[string]float64{},
+			Weights:    w,
+			Reason:     "no eligible model",
+			NoEligible: true,
 		}
 	}
 
@@ -125,9 +127,13 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, defau
 		}
 		// Free models left at 0; filled in below.
 	}
-	// Normalise paid models within [0, paidMax]. Then scale into [0, maxPaidNorm]
-	// where maxPaidNorm < 1 so that free models at 1.0 always beat paid models.
-	const maxPaidNorm = 0.99
+	// Normalise paid models within [0, maxPaidNorm] so that free models at 1.0
+	// always beat any paid model regardless of the cost weight. The gap of
+	// 1.0 - maxPaidNorm is the minimum advantage a free model has over the
+	// cheapest paid model in the cost dimension alone. 0.5 means a free model
+	// needs at least half the cost weight less in other dimensions to win,
+	// which is a meaningful preference without completely overriding quality.
+	const maxPaidNorm = 0.5
 	if len(paidInvCosts) > 0 {
 		normed := normalize(paidInvCosts)
 		for k, i := range paidIdx {

@@ -588,4 +588,118 @@ func TestHandlerNonStreamingFallbackOnCollectionError(t *testing.T) {
 	}
 }
 
+// emptyProv returns a channel that closes immediately with no events.
+type emptyProv struct{}
+
+func (p *emptyProv) Models() []llm.ModelInfo { return nil }
+func (p *emptyProv) NormalizeToolSchema(t []llm.ToolDef) ([]llm.ToolDef, []llm.Diagnostic) {
+	return t, nil
+}
+func (p *emptyProv) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	ch := make(chan llm.ChatEvent)
+	close(ch)
+	return ch, nil
+}
+
+func TestHandlerNoEligibleReturns422(t *testing.T) {
+	// A request whose token footprint exceeds all catalog models should get 422,
+	// not a silent route to default_model.
+	cfg := &config.Config{
+		ServerAddr:   "x",
+		Weights:      config.Weights{Quality: 1, Cost: 1, Speed: 1},
+		DefaultModel: "anthropic/haiku",
+		Providers:    map[string]config.ProviderCreds{"anthropic": {APIKeyEnv: "X"}},
+		Catalog: []config.CatalogEntry{
+			{ID: "anthropic/haiku", Quality: 0.7, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 100}}, // tiny context
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"anthropic": &fakeProv{text: "should not reach"}})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10000, EstTokensOut: 10000}
+	})
+	s := New(rt, reg, cfg.Catalog)
+
+	body := `{"model":"any","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	// Should be 400 (Anthropic endpoint maps invalid_request to 400).
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOAIHandlerNoEligibleReturns422(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr:   "x",
+		Weights:      config.Weights{Quality: 1, Cost: 1, Speed: 1},
+		DefaultModel: "anthropic/haiku",
+		Providers:    map[string]config.ProviderCreds{"anthropic": {APIKeyEnv: "X"}},
+		Catalog: []config.CatalogEntry{
+			{ID: "anthropic/haiku", Quality: 0.7, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 100}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"anthropic": &fakeProv{text: "should not reach"}})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10000, EstTokensOut: 10000}
+	})
+	s := New(rt, reg, cfg.Catalog)
+
+	body := `{"model":"any","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandlerFallbackOnEmptyBufferedStream(t *testing.T) {
+	// Primary provider returns an empty channel (no events). collectWithFallback
+	// must detect this and try the next candidate.
+	cfg := &config.Config{
+		ServerAddr:   "x",
+		Classifier:   config.ClassifierCfg{Model: "good/model", MaxTokens: 16},
+		Weights:      config.Weights{Quality: 1, Cost: 1, Speed: 1},
+		DefaultModel: "good/model",
+		Providers: map[string]config.ProviderCreds{
+			"bad":  {APIKeyEnv: "X"},
+			"good": {APIKeyEnv: "X"},
+		},
+		Catalog: []config.CatalogEntry{
+			{ID: "bad/model", Quality: 0.9, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+			{ID: "good/model", Quality: 0.7, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{
+		"bad":  &emptyProv{},
+		"good": &fakeProv{text: "empty stream fallback"},
+	})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
+	})
+	s := New(rt, reg, cfg.Catalog)
+
+	body := `{"model":"any","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "empty stream fallback") {
+		t.Errorf("expected fallback content: %s", rec.Body.String())
+	}
+}
+
 var _ = io.Discard // keep io imported if unused above

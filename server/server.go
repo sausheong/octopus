@@ -163,7 +163,17 @@ func (s *Server) collectWithFallback(
 			continue
 		}
 
-		out, err := collect(id, ch)
+		// Require at least one meaningful event before handing the channel to
+		// the collector. An empty stream (closed without events) is treated as
+		// an upstream failure so the next candidate can be tried.
+		peeked, peekErr := peekForContent(ch)
+		if peekErr != nil {
+			lastErr = peekErr
+			slog.Warn("provider returned empty or failed stream, trying fallback", "model", id, "err", peekErr)
+			continue
+		}
+
+		out, err := collect(id, peeked)
 		if err != nil {
 			lastErr = err
 			slog.Warn("provider collection failed, trying fallback", "model", id, "err", err)
@@ -181,6 +191,36 @@ func (s *Server) collectWithFallback(
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// peekForContent reads the first event from ch. If the channel is empty
+// (closed without events) or the first event is EventError, it returns an
+// error so collectWithFallback can try the next candidate. Otherwise it
+// returns a new channel with the first event prepended.
+func peekForContent(ch <-chan llm.ChatEvent) (<-chan llm.ChatEvent, error) {
+	first, ok := <-ch
+	if !ok {
+		return nil, errors.New("provider returned empty stream")
+	}
+	if first.Type == llm.EventError {
+		go func() {
+			for range ch {
+			}
+		}()
+		if first.Error != nil {
+			return nil, first.Error
+		}
+		return nil, errors.New("provider stream error")
+	}
+	out := make(chan llm.ChatEvent, 1)
+	out <- first
+	go func() {
+		defer close(out)
+		for ev := range ch {
+			out <- ev
+		}
+	}()
+	return out, nil
+}
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -270,6 +310,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dec := s.rt.Route(ctx, dr.Chat)
 
+	if dec.NoEligible {
+		writeError(w, anthropicio.NewAPIError("invalid_request", "no catalog model can satisfy this request (context too large or missing capability)"))
+		return
+	}
+
 	if dr.Stream {
 		ch, chosen, err := s.tryProvidersStream(ctx, dec, dr.Chat)
 		if err != nil {
@@ -329,6 +374,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	dec := s.rt.Route(ctx, chat)
+
+	if dec.NoEligible {
+		writeOAIError(w, http.StatusUnprocessableEntity, "invalid_request_error", "no catalog model can satisfy this request (context too large or missing capability)")
+		return
+	}
 
 	if stream {
 		ch, chosen, err := s.tryProvidersStream(ctx, dec, chat)

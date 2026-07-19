@@ -59,9 +59,13 @@ func main() {
 	httpSrv := &http.Server{
 		Addr:    cfg.ServerAddr,
 		Handler: srv.Handler(),
-		// ReadHeaderTimeout prevents Slowloris-style attacks.
+		// ReadHeaderTimeout prevents Slowloris-style header attacks.
+		// ReadTimeout covers header + body so slow body senders cannot hold
+		// connections indefinitely. SSE responses are not affected because
+		// ReadTimeout only applies until the request body is fully read.
 		// No WriteTimeout: SSE streams are long-lived by design.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 

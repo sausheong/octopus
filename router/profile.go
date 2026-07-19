@@ -42,31 +42,59 @@ func TrivialProfile() TaskProfile {
 	}
 }
 
-// tokensPerByte is a conservative character-to-token ratio used for
-// deterministic sizing. Real tokenizers average ~4 bytes/token for English;
-// we use 3 to err on the side of over-estimating (safer for context filtering).
+// tokensPerByte is a conservative byte-to-token ratio. Real tokenizers average
+// ~4 bytes/token for English; we use 3 to over-estimate (safer for context
+// filtering). We sum all bytes before dividing to avoid losing short fields
+// to per-field integer truncation.
 const tokensPerByte = 3
 
-// bytesPerImage is a rough token cost for an image. Most vision APIs charge
-// 1000-2000 tokens per image depending on resolution; 1500 is a safe midpoint.
-const tokensPerImage = 1500
+// tokensPerImage is a conservative token cost per image. Vision APIs typically
+// charge 1000–2000 tokens depending on resolution; we use 2000 (the high end)
+// to avoid under-estimating.
+const tokensPerImage = 2000
 
-// EstimateRequestTokens returns a deterministic lower-bound token estimate for
-// the full inbound request: system prompt, all message content, all tool
-// definitions, and image overhead. This estimate is used to floor the
-// classifier's LLM-generated guess so that large system prompts or long
-// conversation histories cannot cause a model to be selected whose context
-// window is actually too small.
+// msgOverheadBytes is the approximate structural overhead per message
+// (role tag, formatting). Conservative estimate.
+const msgOverheadBytes = 12
+
+// EstimateRequestTokens returns a conservative token estimate for the full
+// inbound request: system prompt, all message content (including tool-call
+// arguments and tool-result text), tool definitions, and image overhead.
+// It sums all byte lengths before applying ceiling division so that no field
+// is silently rounded to zero.
+//
+// This is an approximation — accurate only within a factor of ~2 without
+// provider tokenizers — but it is intentionally conservative (over-estimates)
+// to serve as a reliable lower bound for context-window filtering.
 func EstimateRequestTokens(chat llm.ChatRequest) int {
-	n := len(chat.SystemPrompt) / tokensPerByte
+	var totalBytes int
+
+	totalBytes += len(chat.SystemPrompt)
+
 	for _, m := range chat.Messages {
-		n += len(m.Content) / tokensPerByte
-		n += len(m.Images) * tokensPerImage
+		totalBytes += msgOverheadBytes
+		totalBytes += len(m.Content)
+		// Tool-call arguments from assistant messages.
+		for _, tc := range m.ToolCalls {
+			totalBytes += len(tc.ID) + len(tc.Name) + len(tc.Input)
+		}
+		// Tool result metadata.
+		if m.ToolCallID != "" {
+			totalBytes += len(m.ToolCallID)
+		}
 	}
+
 	for _, t := range chat.Tools {
-		n += len(t.Name)/tokensPerByte + len(t.Description)/tokensPerByte + len(t.Parameters)/tokensPerByte
+		totalBytes += len(t.Name) + len(t.Description) + len(t.Parameters)
 	}
-	return n
+
+	// Images are billed separately in tokens, not bytes.
+	imageTokens := 0
+	for _, m := range chat.Messages {
+		imageTokens += len(m.Images) * tokensPerImage
+	}
+
+	return (totalBytes+tokensPerByte-1)/tokensPerByte + imageTokens
 }
 
 // isTrivial reports whether a request is simple enough to skip the classifier.

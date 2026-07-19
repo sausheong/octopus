@@ -24,6 +24,11 @@ func NewRouter(cfg *config.Config, reg *registry.Registry) *Router {
 	return &Router{cfg: cfg, reg: reg, classifyFn: Classify}
 }
 
+// shortCircuitTokens is the content-length threshold (in bytes, used as a
+// proxy for tokens) below which the classifier is skipped. Requests this
+// small are assumed trivial/low-difficulty with no special capability needs.
+const shortCircuitBytes = 500
+
 // Route classifies the last genuine user turn, applies request-derived
 // capability cross-checks, scores the catalog, and returns the Decision.
 func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
@@ -31,6 +36,9 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 	var prof TaskProfile
 	if !ok {
 		prof = DefaultProfile()
+	} else if isTrivial(chat, turn) {
+		prof = TrivialProfile()
+		slog.Debug("classifier skipped (trivial request)")
 	} else {
 		prov, model, err := r.reg.Resolve(r.cfg.Classifier.Model)
 		if err != nil {

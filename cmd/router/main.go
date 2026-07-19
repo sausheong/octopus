@@ -50,7 +50,7 @@ func main() {
 	}
 
 	rt := router.NewRouter(cfg, reg)
-	srv := server.New(rt, reg)
+	srv := server.New(rt, reg, cfg.Catalog)
 
 	slog.Info("llmrouter listening", "addr", cfg.ServerAddr)
 	if err := http.ListenAndServe(cfg.ServerAddr, srv.Handler()); err != nil {

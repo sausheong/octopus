@@ -73,7 +73,7 @@ func buildServerWithProv(t *testing.T, prov llm.LLMProvider) *Server {
 	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
 		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
 	})
-	return New(rt, reg)
+	return New(rt, reg, cfg.Catalog)
 }
 
 // buildServer wires a Server whose registry + router use the fake provider.
@@ -96,7 +96,7 @@ func buildServer(t *testing.T) *Server {
 	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
 		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
 	})
-	return New(rt, reg)
+	return New(rt, reg, cfg.Catalog)
 }
 
 func TestHandlerNonStreaming(t *testing.T) {
@@ -195,6 +195,33 @@ func TestHandlerStreamingUsage(t *testing.T) {
 	out := rec.Body.String()
 	if !strings.Contains(out, `"input_tokens":3`) {
 		t.Errorf("message_delta usage missing input_tokens: %s", out)
+	}
+}
+
+func TestHandlerModels(t *testing.T) {
+	s := buildServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"object":"list"`) {
+		t.Errorf("missing list object: %s", body)
+	}
+	if !strings.Contains(body, `"anthropic/haiku"`) {
+		t.Errorf("missing catalog model in response: %s", body)
+	}
+}
+
+func TestHandlerModelsMethodNotAllowed(t *testing.T) {
+	s := buildServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
 	}
 }
 

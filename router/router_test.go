@@ -73,6 +73,105 @@ func TestRouteCrossChecksTools(t *testing.T) {
 	}
 }
 
+func TestRouteShortCircuitSkipsClassifier(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	called := false
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		called = true
+		return TaskProfile{}
+	}
+	chat := llm.ChatRequest{
+		Messages: []llm.Message{{Role: "user", Content: "hi"}}, // short, no images, no tools
+	}
+	d := r.Route(context.Background(), chat)
+	if called {
+		t.Error("classifier should not be called for a trivial request")
+	}
+	if d.Profile.Difficulty != "trivial" {
+		t.Errorf("Difficulty = %q, want trivial", d.Profile.Difficulty)
+	}
+}
+
+func TestRouteShortCircuitNotFiredWithTools(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	called := false
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		called = true
+		return TaskProfile{Difficulty: "low"}
+	}
+	chat := llm.ChatRequest{
+		Tools:    []llm.ToolDef{{Name: "search"}},
+		Messages: []llm.Message{{Role: "user", Content: "hi"}},
+	}
+	r.Route(context.Background(), chat)
+	if !called {
+		t.Error("classifier should be called when request has tools")
+	}
+}
+
+func TestRouteShortCircuitNotFiredWithImages(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	called := false
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		called = true
+		return TaskProfile{Difficulty: "low"}
+	}
+	chat := llm.ChatRequest{
+		Messages: []llm.Message{{Role: "user", Content: "look", Images: []llm.ImageContent{{MimeType: "image/png", Data: []byte("x")}}}},
+	}
+	r.Route(context.Background(), chat)
+	if !called {
+		t.Error("classifier should be called when turn has images")
+	}
+}
+
+func TestRouteShortCircuitNotFiredForLongContent(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	called := false
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		called = true
+		return TaskProfile{Difficulty: "medium"}
+	}
+	longContent := string(make([]byte, shortCircuitBytes+1))
+	chat := llm.ChatRequest{
+		Messages: []llm.Message{{Role: "user", Content: longContent}},
+	}
+	r.Route(context.Background(), chat)
+	if !called {
+		t.Error("classifier should be called for long content")
+	}
+}
+
+func TestRouteShortCircuitNotFiredForMultiTurn(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	called := false
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		called = true
+		return TaskProfile{Difficulty: "low"}
+	}
+	chat := llm.ChatRequest{
+		Messages: []llm.Message{
+			{Role: "user", Content: "do you want me to proceed?"},
+			{Role: "assistant", Content: "Yes, please go ahead."},
+			{Role: "user", Content: "yes"},
+		},
+	}
+	r.Route(context.Background(), chat)
+	if !called {
+		t.Error("classifier should be called for multi-turn conversation")
+	}
+}
+
 func TestRouteNoUserTurnUsesDefaultProfile(t *testing.T) {
 	cfg := testCfg()
 	reg, _ := registry.New(context.Background(), cfg)

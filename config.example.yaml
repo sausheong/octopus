@@ -28,6 +28,14 @@ providers:
     api_key_env: "QWEN_API_KEY"
     base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
+  # Local inference server (mlx-lm, Ollama, LM Studio, etc.).
+  # Set base_url to the server's OpenAI-compatible endpoint and api_key to any
+  # non-empty string if the server doesn't require authentication.
+  mlx:
+    kind: openai
+    api_key_env: "MLX_API_KEY"
+    base_url: "http://localhost:8080/v1"
+
   # Providers may use any name and declare a `kind` to pick the client type.
   # This lets several Anthropic-compatible backends coexist, each with its own
   # base_url and key. `kind` defaults to the provider name when omitted.
@@ -52,3 +60,13 @@ catalog:
     cost_per_mtok_out: 5.0
     speed: 0.95
     caps: { tools: true, vision: true, reasoning: false, max_context: 200000 }
+
+  # Local model — set id to "mlx/<model-name>" where model-name matches what
+  # the local server reports. Cost is zero for local inference; tune quality,
+  # speed, caps, and max_context to match the model you are running.
+  - id: "mlx/your-model-name"
+    quality: 0.60
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    speed: 0.85
+    caps: { tools: false, vision: false, reasoning: false, max_context: 32768 }

@@ -44,11 +44,21 @@ func TestClassifyParsesJSON(t *testing.T) {
 }
 
 func TestClassifyJSONWithPreamble(t *testing.T) {
-	// Model wraps JSON in prose; extractor should still find the object.
-	p := &fakeProvider{text: "Here is the classification:\n{\"difficulty\":\"low\",\"domain\":\"qa\"}\nDone."}
+	// Model wraps complete JSON in prose; extractor should find the object.
+	full := `{"difficulty":"low","needs_reasoning":false,"needs_vision":false,"needs_tools":false,"est_tokens_in":50,"est_tokens_out":100,"domain":"qa"}`
+	p := &fakeProvider{text: "Here is the classification:\n" + full + "\nDone."}
 	prof := Classify(context.Background(), p, "m", 256, llm.Message{Role: "user", Content: "hi"})
 	if prof.Difficulty != "low" || prof.Domain != "qa" {
 		t.Fatalf("profile = %+v", prof)
+	}
+}
+
+func TestClassifyIncompleteJSONFallsBack(t *testing.T) {
+	// Partial JSON (missing required fields) must fall back to DefaultProfile.
+	p := &fakeProvider{text: `{"difficulty":"low","domain":"qa"}`}
+	prof := Classify(context.Background(), p, "m", 256, llm.Message{Role: "user", Content: "hi"})
+	if prof != DefaultProfile() {
+		t.Fatalf("profile = %+v, want default", prof)
 	}
 }
 

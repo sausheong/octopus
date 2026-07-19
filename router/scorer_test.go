@@ -99,3 +99,41 @@ func TestScoreHighDifficultyPrefersQuality(t *testing.T) {
 		t.Fatalf("Chosen = %q, want anthropic/opus for hard task", d.Chosen)
 	}
 }
+
+func TestScoreFreeModeGetsMaxCostScore(t *testing.T) {
+	// A zero-cost local model must not be penalized with the worst cost score.
+	// With equal quality and speed, the free model must win on a cost-heavy weight.
+	catalog := []config.CatalogEntry{
+		{ID: "cloud/paid", Quality: 0.8, CostPerMTokIn: 10, CostPerMTokOut: 30, Speed: 0.8,
+			Caps: config.Caps{MaxContext: 100000}},
+		{ID: "local/free", Quality: 0.8, CostPerMTokIn: 0, CostPerMTokOut: 0, Speed: 0.8,
+			Caps: config.Caps{MaxContext: 100000}},
+	}
+	p := TaskProfile{Difficulty: "low", EstTokensIn: 1000, EstTokensOut: 500}
+	w := config.Weights{Quality: 0.1, Cost: 0.8, Speed: 0.1}
+	d := Score(p, catalog, w, "local/free")
+	if d.Chosen != "local/free" {
+		t.Fatalf("Chosen = %q, want local/free (free model must win cost-heavy scoring)", d.Chosen)
+	}
+	// Also verify the free model's cost score is strictly higher than the paid model's.
+	if d.Scores["local/free"] <= d.Scores["cloud/paid"] {
+		t.Errorf("free model score %v not > paid model score %v", d.Scores["local/free"], d.Scores["cloud/paid"])
+	}
+}
+
+func TestScoreEligibleSortedByScore(t *testing.T) {
+	// Eligible list must be in descending score order so the first fallback
+	// candidate is always the second-best model.
+	p := TaskProfile{Difficulty: "low", EstTokensIn: 100, EstTokensOut: 100}
+	w := config.Weights{Quality: 0.5, Cost: 0.3, Speed: 0.2}
+	d := Score(p, cat(), w, "anthropic/haiku")
+	if len(d.Eligible) < 2 {
+		t.Fatalf("expected >= 2 eligible, got %v", d.Eligible)
+	}
+	for i := 1; i < len(d.Eligible); i++ {
+		if d.Scores[d.Eligible[i-1]] < d.Scores[d.Eligible[i]] {
+			t.Errorf("eligible[%d] score %v < eligible[%d] score %v — not sorted descending",
+				i-1, d.Scores[d.Eligible[i-1]], i, d.Scores[d.Eligible[i]])
+		}
+	}
+}

@@ -427,4 +427,102 @@ func TestOAIHandlerFallback(t *testing.T) {
 	}
 }
 
+// asyncErrProv returns a channel that immediately emits EventError, simulating
+// a provider that signals failure via the stream rather than the error return.
+type asyncErrProv struct{ err error }
+
+func (p *asyncErrProv) Models() []llm.ModelInfo { return nil }
+func (p *asyncErrProv) NormalizeToolSchema(t []llm.ToolDef) ([]llm.ToolDef, []llm.Diagnostic) {
+	return t, nil
+}
+func (p *asyncErrProv) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	ch := make(chan llm.ChatEvent, 1)
+	ch <- llm.ChatEvent{Type: llm.EventError, Error: p.err}
+	close(ch)
+	return ch, nil
+}
+
+func TestHandlerFallbackOnAsyncStreamError(t *testing.T) {
+	// Primary provider signals failure via EventError on the channel (not via
+	// the error return of ChatStream). tryProviders must detect this and fall
+	// back to the next eligible provider.
+	cfg := &config.Config{
+		ServerAddr:   "x",
+		Classifier:   config.ClassifierCfg{Model: "good/model", MaxTokens: 16},
+		Weights:      config.Weights{Quality: 1, Cost: 1, Speed: 1},
+		DefaultModel: "good/model",
+		Providers: map[string]config.ProviderCreds{
+			"bad":  {APIKeyEnv: "X"},
+			"good": {APIKeyEnv: "X"},
+		},
+		Catalog: []config.CatalogEntry{
+			{ID: "bad/model", Quality: 0.9, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+			{ID: "good/model", Quality: 0.7, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{
+		"bad":  &asyncErrProv{err: anthErr(529)},
+		"good": &fakeProv{text: "async fallback"},
+	})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
+	})
+	s := New(rt, reg, cfg.Catalog)
+
+	body := `{"model":"any","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "async fallback") {
+		t.Errorf("expected fallback content: %s", rec.Body.String())
+	}
+}
+
+func TestHandlerOversizedBody(t *testing.T) {
+	s := buildServer(t)
+	// Send a body larger than maxRequestBytes (32 MiB).
+	huge := strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"` + strings.Repeat("x", 33<<20) + `"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", huge)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatal("expected error for oversized body, got 200")
+	}
+}
+
+func TestOAIHandlerRateLimitMaps429(t *testing.T) {
+	s := buildServerWithProv(t, &errProv{err: anthErr(429)})
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"rate_limit_error"`) {
+		t.Errorf("missing rate_limit_error: %s", rec.Body.String())
+	}
+}
+
+func TestOAIHandlerOverloadedMaps503(t *testing.T) {
+	s := buildServerWithProv(t, &errProv{err: anthErr(529)})
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"overloaded_error"`) {
+		t.Errorf("missing overloaded_error: %s", rec.Body.String())
+	}
+}
+
 var _ = io.Discard // keep io imported if unused above

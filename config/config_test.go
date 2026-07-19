@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -132,6 +133,65 @@ func TestValidateClassifierModelBadFormIsError(t *testing.T) {
 	c.Classifier.Model = "noslash"
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected error for classifier.model not in provider/model form")
+	}
+}
+
+func TestValidateNaNWeightIsError(t *testing.T) {
+	c := baseValid()
+	c.Weights.Quality = math.NaN()
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for NaN weight")
+	}
+}
+
+func TestValidateInfWeightIsError(t *testing.T) {
+	c := baseValid()
+	c.Weights.Cost = math.Inf(1)
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for infinite weight")
+	}
+}
+
+func TestValidateNaNCatalogQualityIsError(t *testing.T) {
+	c := baseValid()
+	c.Catalog[0].Quality = math.NaN()
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for NaN catalog quality")
+	}
+}
+
+func TestValidateDuplicateCatalogIDIsError(t *testing.T) {
+	c := baseValid()
+	c.Catalog = append(c.Catalog, c.Catalog[0]) // duplicate
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for duplicate catalog id")
+	}
+}
+
+func TestLoadUnknownFieldIsError(t *testing.T) {
+	// Write a temp YAML with an unknown key and verify Load rejects it.
+	f, err := os.CreateTemp("", "llmrouter-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	_, _ = f.WriteString(`
+server:
+  addr: "127.0.0.1:9999"
+unknown_key: "should fail"
+weights: {quality: 1, cost: 1, speed: 1}
+default_model: "anthropic/m"
+providers:
+  anthropic: {api_key: "x"}
+catalog:
+  - id: "anthropic/m"
+    quality: 0.7
+    speed: 0.9
+    caps: {max_context: 100000}
+`)
+	f.Close()
+	if _, err := Load(f.Name()); err == nil {
+		t.Fatal("expected error for unknown YAML field")
 	}
 }
 

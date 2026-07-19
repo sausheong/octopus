@@ -50,30 +50,61 @@ func Classify(ctx context.Context, prov llm.LLMProvider, model string, maxTokens
 	return prof
 }
 
-// parseProfile extracts the first JSON object from s, unmarshals it into a
-// TaskProfile, and clamps/validates all fields so untrusted classifier output
-// can never corrupt routing logic.
+// rawProfile is the wire type for classifier JSON — pointer fields let us
+// distinguish missing keys from zero/false values.
+type rawProfile struct {
+	Difficulty     *string `json:"difficulty"`
+	NeedsReasoning *bool   `json:"needs_reasoning"`
+	NeedsVision    *bool   `json:"needs_vision"`
+	NeedsTools     *bool   `json:"needs_tools"`
+	EstTokensIn    *int    `json:"est_tokens_in"`
+	EstTokensOut   *int    `json:"est_tokens_out"`
+	Domain         *string `json:"domain"`
+}
+
+// parseProfile extracts the first JSON object from s, validates required
+// fields are present, and clamps all values. Returns ok=false — causing
+// the caller to use DefaultProfile — if the JSON is missing, malformed,
+// or omits any required field.
 func parseProfile(s string) (TaskProfile, bool) {
 	start := strings.IndexByte(s, '{')
 	end := strings.LastIndexByte(s, '}')
 	if start < 0 || end <= start {
 		return TaskProfile{}, false
 	}
-	var p TaskProfile
-	if err := json.Unmarshal([]byte(s[start:end+1]), &p); err != nil {
+	var raw rawProfile
+	if err := json.Unmarshal([]byte(s[start:end+1]), &raw); err != nil {
 		return TaskProfile{}, false
 	}
 
-	// Clamp difficulty to known values; default to "medium" on unknown.
-	switch p.Difficulty {
-	case "trivial", "low", "medium", "high":
-	default:
-		p.Difficulty = "medium"
+	// All fields are required; a missing field means the classifier produced
+	// an incomplete response — treat it as a failure and use DefaultProfile.
+	if raw.Difficulty == nil || raw.NeedsReasoning == nil || raw.NeedsVision == nil ||
+		raw.NeedsTools == nil || raw.EstTokensIn == nil || raw.EstTokensOut == nil ||
+		raw.Domain == nil {
+		return TaskProfile{}, false
 	}
 
-	// Clamp domain to known values; default to "other" on unknown.
-	switch p.Domain {
+	p := TaskProfile{
+		NeedsReasoning: *raw.NeedsReasoning,
+		NeedsVision:    *raw.NeedsVision,
+		NeedsTools:     *raw.NeedsTools,
+		EstTokensIn:    *raw.EstTokensIn,
+		EstTokensOut:   *raw.EstTokensOut,
+	}
+
+	// Clamp difficulty to known values; unknown → conservative "high".
+	switch *raw.Difficulty {
+	case "trivial", "low", "medium", "high":
+		p.Difficulty = *raw.Difficulty
+	default:
+		p.Difficulty = "high"
+	}
+
+	// Clamp domain to known values.
+	switch *raw.Domain {
 	case "code", "writing", "qa", "math", "other":
+		p.Domain = *raw.Domain
 	default:
 		p.Domain = "other"
 	}

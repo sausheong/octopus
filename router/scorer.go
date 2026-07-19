@@ -105,17 +105,38 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, defau
 	}
 
 	qualities := make([]float64, len(elig))
-	costs := make([]float64, len(elig)) // cost score = inverse cost
+	costs := make([]float64, len(elig)) // cost score = inverse cost; 0-cost = infinity → sentinel
 	speeds := make([]float64, len(elig))
+	hasPaidModel := false
 	for i, e := range elig {
 		qualities[i] = e.Quality
 		c := reqCost(p, e)
 		if c <= 0 {
-			costs[i] = 0 // becomes 1 after normalize if all zero; else lowest
+			// Free model: use sentinel −1 to distinguish from paid models after
+			// normalization. We replace it with the max+1 value after the loop.
+			costs[i] = -1
 		} else {
 			costs[i] = 1 / c
+			hasPaidModel = true
 		}
 		speeds[i] = e.Speed
+	}
+	// Give free models the best possible cost score (above any paid model).
+	// If there are no paid models, normalize will make all entries equal (neutral).
+	var freeCostScore float64 = 1
+	if hasPaidModel {
+		var maxPaid float64
+		for _, v := range costs {
+			if v > maxPaid {
+				maxPaid = v
+			}
+		}
+		freeCostScore = maxPaid + 1
+	}
+	for i, v := range costs {
+		if v < 0 {
+			costs[i] = freeCostScore
+		}
 	}
 	qn := normalize(qualities)
 	cn := normalize(costs)

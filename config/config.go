@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -140,6 +141,10 @@ func (c *Config) Validate() error {
 	if c.ServerAddr == "" {
 		return fmt.Errorf("server.addr is required")
 	}
+	finite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+	if !finite(c.Weights.Quality) || !finite(c.Weights.Cost) || !finite(c.Weights.Speed) {
+		return fmt.Errorf("weights must be finite numbers")
+	}
 	if c.Weights.Quality < 0 || c.Weights.Cost < 0 || c.Weights.Speed < 0 {
 		return fmt.Errorf("weights must be non-negative")
 	}
@@ -180,6 +185,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("catalog id %q is duplicated", e.ID)
 		}
 		seen[e.ID] = true
+		if !finite(e.Quality) || !finite(e.Speed) || !finite(e.CostPerMTokIn) || !finite(e.CostPerMTokOut) {
+			return fmt.Errorf("catalog id %q: numeric fields must be finite", e.ID)
+		}
 		if e.Quality < 0 || e.Quality > 1 {
 			return fmt.Errorf("catalog id %q: quality must be in [0,1], got %v", e.ID, e.Quality)
 		}

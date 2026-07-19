@@ -88,13 +88,56 @@ func (s *Server) tryProviders(ctx context.Context, dec router.Decision, chat llm
 			}
 			continue
 		}
+
+		// Peek at the first event. If it is an immediate EventError the provider
+		// signalled failure via the channel rather than via the error return. We
+		// can still fall back because no HTTP headers have been written yet.
+		first, ok := <-ch
+		if !ok {
+			// Channel closed with no events — treat as empty success.
+			empty := make(chan llm.ChatEvent)
+			close(empty)
+			return empty, id, nil
+		}
+		if first.Type == llm.EventError {
+			chErr := first.Error
+			if chErr == nil {
+				chErr = errString("provider stream error")
+			}
+			lastErr = chErr
+			if id == dec.Chosen {
+				slog.Warn("chosen provider stream error, trying fallback", "model", id, "err", chErr)
+			} else {
+				slog.Warn("fallback provider stream error", "model", id, "err", chErr)
+			}
+			// Drain the now-broken channel before moving on.
+			go func() {
+				for range ch {
+				}
+			}()
+			continue
+		}
+
+		// First event is valid — prepend it back onto a new channel.
+		out := make(chan llm.ChatEvent, 1)
+		out <- first
+		go func() {
+			defer close(out)
+			for ev := range ch {
+				out <- ev
+			}
+		}()
 		if id != dec.Chosen {
 			slog.Info("using fallback model", "model", id, "original", dec.Chosen)
 		}
-		return ch, id, nil
+		return out, id, nil
 	}
 	return nil, "", lastErr
 }
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {

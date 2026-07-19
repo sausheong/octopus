@@ -2,8 +2,11 @@
 server:
   addr: "127.0.0.1:8787"
 
+# classifier: routes each request through a cheap model to decide which catalog
+# model to use. Omit (or leave model empty) for pure-local setups — the router
+# will use a conservative default profile instead of making a classifier call.
 classifier:
-  model: "anthropic/claude-haiku-3-5-20241022"  # fixed cheap classifier
+  model: "anthropic/claude-haiku-3-5-20241022"
   max_tokens: 256
   timeout: "10s"
 

@@ -106,6 +106,35 @@ func TestValidateLocalProviderBaseURLOnly(t *testing.T) {
 	}
 }
 
+func TestValidateClassifierModelEmptyIsValid(t *testing.T) {
+	// Pure-local setup: no classifier model, router always uses DefaultProfile.
+	c := baseValid()
+	c.Classifier.Model = ""
+	c.Classifier.MaxTokens = 0
+	c.Classifier.Timeout = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("empty classifier.model should be valid, got: %v", err)
+	}
+}
+
+func TestValidateClassifierModelUnconfiguredProviderIsValid(t *testing.T) {
+	// classifier.model may reference a provider not in cfg.Providers — the
+	// router falls back to DefaultProfile at runtime rather than failing.
+	c := baseValid()
+	c.Classifier.Model = "cloud/some-model" // "cloud" is not in Providers
+	if err := c.Validate(); err != nil {
+		t.Fatalf("classifier referencing unconfigured provider should be valid, got: %v", err)
+	}
+}
+
+func TestValidateClassifierModelBadFormIsError(t *testing.T) {
+	c := baseValid()
+	c.Classifier.Model = "noslash"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for classifier.model not in provider/model form")
+	}
+}
+
 func TestKeyPrefersInlineThenEnv(t *testing.T) {
 	os.Setenv("KEY_ENV_ONLY", "from-env")
 	if got := (ProviderCreds{APIKey: "inline"}).Key(); got != "inline" {

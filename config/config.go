@@ -173,21 +173,32 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("catalog id %q references unconfigured provider %q", e.ID, p)
 		}
 	}
-	// Classifier + default_model must resolve to a configured provider.
-	for label, id := range map[string]string{"classifier.model": c.Classifier.Model, "default_model": c.DefaultModel} {
-		p, ok := providerOf(id)
+	// default_model must resolve to a configured provider — it is the last-resort
+	// fallback and must always be reachable.
+	{
+		p, ok := providerOf(c.DefaultModel)
 		if !ok {
-			return fmt.Errorf("%s %q must be in provider/model form", label, id)
+			return fmt.Errorf("default_model %q must be in provider/model form", c.DefaultModel)
 		}
 		if _, ok := c.Providers[p]; !ok {
-			return fmt.Errorf("%s %q references unconfigured provider %q", label, id, p)
+			return fmt.Errorf("default_model %q references unconfigured provider %q", c.DefaultModel, p)
 		}
 	}
-	if c.Classifier.MaxTokens <= 0 {
-		return fmt.Errorf("classifier.max_tokens must be > 0")
-	}
-	if c.Classifier.Timeout <= 0 {
-		return fmt.Errorf("classifier.timeout must be > 0")
+	// classifier.model is optional. When empty the router always uses
+	// DefaultProfile (no LLM call), which is safe for pure-local setups.
+	// When set it must be valid provider/model form; the provider need not be
+	// configured — if it isn't, the router falls back to DefaultProfile at
+	// runtime rather than refusing to start.
+	if c.Classifier.Model != "" {
+		if _, ok := providerOf(c.Classifier.Model); !ok {
+			return fmt.Errorf("classifier.model %q must be in provider/model form", c.Classifier.Model)
+		}
+		if c.Classifier.MaxTokens <= 0 {
+			return fmt.Errorf("classifier.max_tokens must be > 0")
+		}
+		if c.Classifier.Timeout <= 0 {
+			return fmt.Errorf("classifier.timeout must be > 0")
+		}
 	}
 	return nil
 }

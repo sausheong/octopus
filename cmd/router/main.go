@@ -59,6 +59,10 @@ func main() {
 	httpSrv := &http.Server{
 		Addr:    cfg.ServerAddr,
 		Handler: srv.Handler(),
+		// ReadHeaderTimeout prevents Slowloris-style attacks.
+		// No WriteTimeout: SSE streams are long-lived by design.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Start serving in a goroutine so the main goroutine can wait on signals.

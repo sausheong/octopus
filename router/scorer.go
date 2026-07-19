@@ -1,6 +1,10 @@
 package router
 
-import "github.com/sausheong/llmrouter/config"
+import (
+	"sort"
+
+	"github.com/sausheong/llmrouter/config"
+)
 
 // HighQualityFloor is the quality a "high"-difficulty task wants. For such
 // tasks, models below the floor are filtered out — but only when at least one
@@ -137,6 +141,13 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, defau
 			bestIdx = i
 		}
 	}
+
+	// Sort eligible IDs by descending score so tryProviders walks them in the
+	// same order as the primary selection. Catalog order is the tie-breaker:
+	// stable sort preserves the original catalog positions for equal scores.
+	sort.SliceStable(eligIDs, func(i, j int) bool {
+		return scores[eligIDs[i]] > scores[eligIDs[j]]
+	})
 
 	return Decision{
 		Chosen:   elig[bestIdx].ID,

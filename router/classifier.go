@@ -50,8 +50,9 @@ func Classify(ctx context.Context, prov llm.LLMProvider, model string, maxTokens
 	return prof
 }
 
-// parseProfile extracts the first JSON object from s and unmarshals it into a
-// TaskProfile. Returns ok=false if no object is found or it doesn't parse.
+// parseProfile extracts the first JSON object from s, unmarshals it into a
+// TaskProfile, and clamps/validates all fields so untrusted classifier output
+// can never corrupt routing logic.
 func parseProfile(s string) (TaskProfile, bool) {
 	start := strings.IndexByte(s, '{')
 	end := strings.LastIndexByte(s, '}')
@@ -62,5 +63,32 @@ func parseProfile(s string) (TaskProfile, bool) {
 	if err := json.Unmarshal([]byte(s[start:end+1]), &p); err != nil {
 		return TaskProfile{}, false
 	}
+
+	// Clamp difficulty to known values; default to "medium" on unknown.
+	switch p.Difficulty {
+	case "trivial", "low", "medium", "high":
+	default:
+		p.Difficulty = "medium"
+	}
+
+	// Clamp domain to known values; default to "other" on unknown.
+	switch p.Domain {
+	case "code", "writing", "qa", "math", "other":
+	default:
+		p.Domain = "other"
+	}
+
+	// Clamp token estimates to sane bounds: non-negative, max 1M each.
+	if p.EstTokensIn < 0 {
+		p.EstTokensIn = 0
+	} else if p.EstTokensIn > 1_000_000 {
+		p.EstTokensIn = 1_000_000
+	}
+	if p.EstTokensOut < 0 {
+		p.EstTokensOut = 0
+	} else if p.EstTokensOut > 1_000_000 {
+		p.EstTokensOut = 1_000_000
+	}
+
 	return p, true
 }

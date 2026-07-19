@@ -105,7 +105,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	var yc yamlConfig
-	if err := yaml.Unmarshal(data, &yc); err != nil {
+	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&yc); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	c := &Config{
@@ -163,7 +165,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("provider %q must set api_key, api_key_env, or base_url", name)
 		}
 	}
-	// Every catalog id must be provider/model and its provider configured.
+	// Every catalog id must be provider/model, its provider configured, and
+	// its numeric fields in range. Duplicate IDs are also rejected.
+	seen := make(map[string]bool, len(c.Catalog))
 	for _, e := range c.Catalog {
 		p, ok := providerOf(e.ID)
 		if !ok {
@@ -171,6 +175,19 @@ func (c *Config) Validate() error {
 		}
 		if _, ok := c.Providers[p]; !ok {
 			return fmt.Errorf("catalog id %q references unconfigured provider %q", e.ID, p)
+		}
+		if seen[e.ID] {
+			return fmt.Errorf("catalog id %q is duplicated", e.ID)
+		}
+		seen[e.ID] = true
+		if e.Quality < 0 || e.Quality > 1 {
+			return fmt.Errorf("catalog id %q: quality must be in [0,1], got %v", e.ID, e.Quality)
+		}
+		if e.Speed < 0 || e.Speed > 1 {
+			return fmt.Errorf("catalog id %q: speed must be in [0,1], got %v", e.ID, e.Speed)
+		}
+		if e.CostPerMTokIn < 0 || e.CostPerMTokOut < 0 {
+			return fmt.Errorf("catalog id %q: costs must be non-negative", e.ID)
 		}
 	}
 	// default_model must resolve to a configured provider — it is the last-resort

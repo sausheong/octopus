@@ -19,6 +19,9 @@ import (
 	"github.com/sausheong/llmrouter/router"
 )
 
+// maxRequestBytes caps the body size for inbound requests (32 MiB).
+const maxRequestBytes = 32 << 20
+
 // Server handles POST /v1/messages, POST /v1/chat/completions, and GET /v1/models.
 type Server struct {
 	rt      *router.Router
@@ -40,11 +43,13 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// tryProviders attempts ChatStream on the chosen model first, then falls back
-// through the eligible list in score order on any ChatStream error. Returns the
-// open event channel, the model id that succeeded, and an error only if every
-// candidate failed. Fallback is intentionally pre-stream only — once headers
-// are written the caller owns the channel and there is no going back.
+// tryProviders attempts ChatStream on the chosen model first (Eligible is
+// already sorted by descending score), then falls back through the rest on
+// any ChatStream error. For each candidate it applies provider-specific tool
+// schema normalization before the call. Returns the open event channel, the
+// model id that succeeded, and an error only if every candidate failed.
+// Fallback is intentionally pre-stream only — once headers are written the
+// caller owns the channel and there is no going back.
 func (s *Server) tryProviders(ctx context.Context, dec router.Decision, chat llm.ChatRequest) (<-chan llm.ChatEvent, string, error) {
 	candidates := []string{dec.Chosen}
 	for _, id := range dec.Eligible {
@@ -61,8 +66,19 @@ func (s *Server) tryProviders(ctx context.Context, dec router.Decision, chat llm
 			slog.Warn("provider resolve failed during fallback", "model", id, "err", err)
 			continue
 		}
-		chat.Model = model
-		ch, err := prov.ChatStream(ctx, chat)
+
+		// Apply provider-specific tool schema normalization for this candidate.
+		attempt := chat
+		attempt.Model = model
+		if len(chat.Tools) > 0 {
+			normalized, diags := prov.NormalizeToolSchema(chat.Tools)
+			attempt.Tools = normalized
+			for _, d := range diags {
+				slog.Warn("tool schema normalized", "model", id, "field", d.Field, "reason", d.Reason)
+			}
+		}
+
+		ch, err := prov.ChatStream(ctx, attempt)
 		if err != nil {
 			lastErr = err
 			if id == dec.Chosen {
@@ -126,6 +142,25 @@ func writeOAIError(w http.ResponseWriter, status int, errType, msg string) {
 	_, _ = w.Write(body)
 }
 
+// oaiBackendError maps a provider error to an OpenAI-shaped HTTP response,
+// preserving 429/503 status semantics rather than collapsing everything to 502.
+func oaiBackendError(w http.ResponseWriter, err error) {
+	ae := anthropicio.MapBackendError(err)
+	var status int
+	var errType string
+	switch ae.Kind {
+	case "rate_limit":
+		status, errType = http.StatusTooManyRequests, "rate_limit_error"
+	case "overloaded":
+		status, errType = http.StatusServiceUnavailable, "overloaded_error"
+	case "invalid_request":
+		status, errType = http.StatusBadRequest, "invalid_request_error"
+	default:
+		status, errType = http.StatusBadGateway, "api_error"
+	}
+	writeOAIError(w, status, errType, ae.Message)
+}
+
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -134,6 +169,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, anthropicio.NewAPIError("invalid_request", "cannot read body"))
@@ -191,6 +227,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOAIError(w, http.StatusBadRequest, "invalid_request_error", "cannot read body")
@@ -212,8 +249,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	ch, chosen, err := s.tryProviders(ctx, dec, chat)
 	if err != nil {
-		ae := anthropicio.MapBackendError(err)
-		writeOAIError(w, http.StatusBadGateway, "api_error", ae.Message)
+		oaiBackendError(w, err)
 		return
 	}
 
@@ -229,8 +265,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		out, err := openaiio.CollectCompletion(chosen, ch)
 		if err != nil {
-			ae := anthropicio.MapBackendError(err)
-			writeOAIError(w, http.StatusBadGateway, "api_error", ae.Message)
+			oaiBackendError(w, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

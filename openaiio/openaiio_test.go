@@ -52,6 +52,34 @@ func TestDecodeBadJSON(t *testing.T) {
 	}
 }
 
+func TestDecodeRejectsInvalidRequests(t *testing.T) {
+	tests := []string{
+		`{"max_tokens":0,"messages":[{"role":"user","content":"x"}]}`,
+		`{"temperature":2.1,"messages":[{"role":"user","content":"x"}]}`,
+		`{"messages":[{"role":"bogus","content":"x"}]}`,
+		`{"messages":[{"role":"tool","content":"x"}]}`,
+		`{"tools":[{"type":"function","function":{"name":""}}],"messages":[{"role":"user","content":"x"}]}`,
+		`{"messages":[{"role":"user","content":[{"type":"audio"}]}]}`,
+		`{"messages":[{"role":"assistant","tool_calls":[{"id":"t","type":"function","function":{"name":"f","arguments":"{"}}]}]}`,
+	}
+	for _, body := range tests {
+		if _, _, _, err := Decode([]byte(body)); err == nil {
+			t.Errorf("Decode accepted invalid request: %s", body)
+		}
+	}
+}
+
+func TestDecodeDeveloperMessageAsSystem(t *testing.T) {
+	chat, _, _, err := Decode([]byte(`{"messages":[{"role":"developer","content":"policy"},{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	system, rest := ExtractSystem(chat.Messages)
+	if system != "policy" || len(rest) != 1 {
+		t.Fatalf("system=%q rest=%+v", system, rest)
+	}
+}
+
 func TestDecodeSystemMessage(t *testing.T) {
 	body := `{"model":"m","messages":[
 		{"role":"system","content":"you are helpful"},
@@ -338,6 +366,41 @@ func TestEncodeSSEToolCallDoneWithoutStart(t *testing.T) {
 	}
 	if !strings.Contains(out, "data: [DONE]") {
 		t.Errorf("missing [DONE]: %s", out)
+	}
+}
+
+func TestEncodeSSEToolCallStartThenDoneIncludesArguments(t *testing.T) {
+	ch := events(
+		llm.ChatEvent{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc1", Name: "fn"}},
+		llm.ChatEvent{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{ID: "tc1", Name: "fn", Input: json.RawMessage(`{"a":1}`)}},
+		llm.ChatEvent{Type: llm.EventDone, StopReason: "tool_use"},
+	)
+	w := &bufWriter{}
+	if err := EncodeSSE(w, "m", ch); err != nil {
+		t.Fatalf("EncodeSSE: %v", err)
+	}
+	if !strings.Contains(w.String(), `"arguments":"{\"a\":1}"`) {
+		t.Fatalf("full arguments were lost after Start/Done: %s", w.String())
+	}
+}
+
+func TestEncodeSSEMultipleStartedToolCallsKeepIndices(t *testing.T) {
+	ch := events(
+		llm.ChatEvent{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc1", Name: "one"}},
+		llm.ChatEvent{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc2", Name: "two"}},
+		llm.ChatEvent{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{ID: "tc1", Name: "one", Input: json.RawMessage(`{"a":1}`)}},
+		llm.ChatEvent{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{ID: "tc2", Name: "two", Input: json.RawMessage(`{"b":2}`)}},
+		llm.ChatEvent{Type: llm.EventDone, StopReason: "tool_use"},
+	)
+	w := &bufWriter{}
+	if err := EncodeSSE(w, "m", ch); err != nil {
+		t.Fatalf("EncodeSSE: %v", err)
+	}
+	out := w.String()
+	for _, want := range []string{`"index":0`, `"index":1`, `"arguments":"{\"a\":1}"`, `"arguments":"{\"b\":2}"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %s in %s", want, out)
+		}
 	}
 }
 

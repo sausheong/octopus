@@ -54,11 +54,27 @@ func TestValidateNegativeWeight(t *testing.T) {
 	}
 }
 
-func TestValidateDefaultModelUnknownProvider(t *testing.T) {
+func TestValidateDeprecatedDefaultModelIsIgnored(t *testing.T) {
 	c := baseValid()
 	c.DefaultModel = "ghost/m"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("deprecated default_model should be ignored: %v", err)
+	}
+}
+
+func TestValidateDefaultModelMayBeOmitted(t *testing.T) {
+	c := baseValid()
+	c.DefaultModel = ""
+	if err := c.Validate(); err != nil {
+		t.Fatalf("deprecated default_model should be optional: %v", err)
+	}
+}
+
+func TestValidateRequiresMaxContext(t *testing.T) {
+	c := baseValid()
+	c.Catalog[0].Caps.MaxContext = 0
 	if err := c.Validate(); err == nil {
-		t.Fatal("expected error for default_model with unconfigured provider")
+		t.Fatal("expected error for missing caps.max_context")
 	}
 }
 

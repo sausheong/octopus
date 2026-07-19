@@ -19,8 +19,8 @@ type TaskProfile struct {
 }
 
 // DefaultProfile is the conservative fallback used when the classifier call
-// fails, times out, or returns unparseable output. It routes toward capable
-// models so a classifier hiccup never silently downgrades quality.
+// fails, times out, or returns unparseable output. It prefers capable models
+// without making optional reasoning support a hard availability requirement.
 func DefaultProfile() TaskProfile {
 	return TaskProfile{
 		Difficulty:     "high",

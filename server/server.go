@@ -65,7 +65,13 @@ func (s *Server) prepareAttempt(id string, chat llm.ChatRequest, dec router.Deci
 	}
 	attempt := chat
 	attempt.Model = model
-	attempt.Reasoning = dec.Reasoning
+	attempt.Reasoning = llm.ReasoningOff
+	for _, entry := range s.catalog {
+		if entry.ID == id && entry.Caps.Reasoning {
+			attempt.Reasoning = dec.Reasoning
+			break
+		}
+	}
 	if len(chat.Tools) > 0 {
 		normalized, diags := prov.NormalizeToolSchema(chat.Tools)
 		attempt.Tools = normalized

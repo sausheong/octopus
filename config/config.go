@@ -21,7 +21,8 @@ type Weights struct {
 	Speed   float64 `yaml:"speed"`
 }
 
-// Caps are a model's hard capabilities, used as filters by the scorer.
+// Caps describe model capabilities. Tools, vision, and context are hard
+// constraints; reasoning support is a scoring preference.
 type Caps struct {
 	Tools      bool `yaml:"tools"`
 	Vision     bool `yaml:"vision"`
@@ -78,9 +79,11 @@ type ClassifierCfg struct {
 
 // Config is the full router configuration.
 type Config struct {
-	ServerAddr   string                   `yaml:"-"`
-	Classifier   ClassifierCfg            `yaml:"classifier"`
-	Weights      Weights                  `yaml:"weights"`
+	ServerAddr string        `yaml:"-"`
+	Classifier ClassifierCfg `yaml:"classifier"`
+	Weights    Weights       `yaml:"weights"`
+	// DefaultModel is accepted for compatibility with older configuration
+	// files. It is deprecated and ignored; an empty eligible set is an error.
 	DefaultModel string                   `yaml:"default_model"`
 	Providers    map[string]ProviderCreds `yaml:"providers"`
 	Catalog      []CatalogEntry           `yaml:"catalog"`
@@ -197,16 +200,8 @@ func (c *Config) Validate() error {
 		if e.CostPerMTokIn < 0 || e.CostPerMTokOut < 0 {
 			return fmt.Errorf("catalog id %q: costs must be non-negative", e.ID)
 		}
-	}
-	// default_model must resolve to a configured provider — it is the last-resort
-	// fallback and must always be reachable.
-	{
-		p, ok := providerOf(c.DefaultModel)
-		if !ok {
-			return fmt.Errorf("default_model %q must be in provider/model form", c.DefaultModel)
-		}
-		if _, ok := c.Providers[p]; !ok {
-			return fmt.Errorf("default_model %q references unconfigured provider %q", c.DefaultModel, p)
+		if e.Caps.MaxContext <= 0 {
+			return fmt.Errorf("catalog id %q: caps.max_context must be > 0", e.ID)
 		}
 	}
 	// classifier.model is optional. When empty the router always uses

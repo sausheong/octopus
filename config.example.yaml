@@ -16,9 +16,6 @@ weights:
   cost: 0.3
   speed: 0.2
 
-# Used when no catalog model survives the capability filter.
-default_model: "anthropic/claude-haiku-3-5-20241022"
-
 # Backend credentials: api_key_env names the env var holding the key.
 providers:
   anthropic:

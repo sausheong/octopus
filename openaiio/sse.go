@@ -16,9 +16,38 @@ type SSEWriter interface {
 // EncodeSSE drains events and writes OpenAI-format SSE chunks to w.
 func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 	id := newChatID()
-	// active tool call being accumulated
-	var activeTCIdx int
-	activeTC := false
+	type toolState struct {
+		index   int
+		id      string
+		name    string
+		deltaed bool
+		done    bool
+	}
+	var toolCalls []*toolState
+	nextToolIndex := 0
+	toolSeen := false
+	findTool := func(tc *llm.ToolCall) *toolState {
+		if tc != nil {
+			for _, state := range toolCalls {
+				if !state.done && tc.ID != "" && state.id == tc.ID {
+					return state
+				}
+			}
+			for _, state := range toolCalls {
+				if !state.done && tc.Name != "" && state.name == tc.Name {
+					return state
+				}
+			}
+		}
+		// Argument deltas often have no ID. Associate those with the most
+		// recently opened call, which matches provider event ordering.
+		for i := len(toolCalls) - 1; i >= 0; i-- {
+			if !toolCalls[i].done {
+				return toolCalls[i]
+			}
+		}
+		return nil
+	}
 
 	emit := func(delta map[string]any, finishReason *string) error {
 		choice := map[string]any{"index": 0, "delta": delta}
@@ -60,9 +89,13 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 			if ev.ToolCall == nil {
 				continue
 			}
+			state := &toolState{index: nextToolIndex, id: ev.ToolCall.ID, name: ev.ToolCall.Name}
+			nextToolIndex++
+			toolCalls = append(toolCalls, state)
+			toolSeen = true
 			delta := map[string]any{
 				"tool_calls": []any{map[string]any{
-					"index": activeTCIdx,
+					"index": state.index,
 					"id":    ev.ToolCall.ID,
 					"type":  "function",
 					"function": map[string]any{
@@ -74,35 +107,43 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 			if err := emit(delta, nil); err != nil {
 				return err
 			}
-			activeTC = true
 
 		case llm.EventToolCallDelta:
-			if ev.ToolCall == nil || !activeTC {
+			if ev.ToolCall == nil {
+				continue
+			}
+			state := findTool(ev.ToolCall)
+			if state == nil {
 				continue
 			}
 			delta := map[string]any{
 				"tool_calls": []any{map[string]any{
-					"index":    activeTCIdx,
+					"index":    state.index,
 					"function": map[string]any{"arguments": string(ev.ToolCall.Input)},
 				}},
 			}
 			if err := emit(delta, nil); err != nil {
 				return err
 			}
+			state.deltaed = true
 
 		case llm.EventToolCallDone:
 			if ev.ToolCall == nil {
 				continue
 			}
-			if !activeTC {
+			state := findTool(ev.ToolCall)
+			if state == nil {
 				// Provider sent Done without Start — emit a combined chunk.
+				state = &toolState{index: nextToolIndex, id: ev.ToolCall.ID, name: ev.ToolCall.Name}
+				nextToolIndex++
+				toolCalls = append(toolCalls, state)
 				input := ev.ToolCall.Input
 				if len(input) == 0 {
 					input = json.RawMessage("{}")
 				}
 				delta := map[string]any{
 					"tool_calls": []any{map[string]any{
-						"index": activeTCIdx,
+						"index": state.index,
 						"id":    ev.ToolCall.ID,
 						"type":  "function",
 						"function": map[string]any{
@@ -114,9 +155,22 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 				if err := emit(delta, nil); err != nil {
 					return err
 				}
+			} else if !state.deltaed {
+				input := ev.ToolCall.Input
+				if len(input) == 0 {
+					input = json.RawMessage("{}")
+				}
+				if err := emit(map[string]any{
+					"tool_calls": []any{map[string]any{
+						"index":    state.index,
+						"function": map[string]any{"arguments": string(input)},
+					}},
+				}, nil); err != nil {
+					return err
+				}
 			}
-			activeTCIdx++
-			activeTC = false
+			state.done = true
+			toolSeen = true
 
 		case llm.EventError:
 			msg := "stream error"
@@ -138,7 +192,7 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 
 		case llm.EventDone:
 			fr := mapStopReason(ev.StopReason)
-			if activeTCIdx > 0 {
+			if toolSeen {
 				fr = "tool_calls"
 			}
 			if err := emit(map[string]any{}, &fr); err != nil {

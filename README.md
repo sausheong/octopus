@@ -42,7 +42,7 @@ Client request
 
 ### Classifier
 
-The classifier is a cheap, fast model (typically Haiku) that reads the last genuine user turn and produces a `TaskProfile`:
+The classifier is a cheap, fast model (typically Haiku) that reads a bounded window of recent conversation context and produces a `TaskProfile`:
 
 - `difficulty`: trivial / low / medium / high
 - `needs_reasoning`: requires multi-step logic, math, or planning
@@ -60,9 +60,9 @@ Classifier failures (timeout, parse error, unresolvable provider) fall back to `
 
 The scorer applies two passes to the catalog:
 
-1. **Hard capability filter**: eliminates models that cannot satisfy the profile (wrong caps, context too small).
+1. **Hard capability filter**: eliminates models missing required tool or vision support, or whose context window is too small. Reasoning support is a preference, so a classifier failure cannot make ordinary local models unavailable.
 2. **Quality floor for hard tasks**: if difficulty is `high`, models below quality 0.85 are dropped — but only when at least one model clears the floor, so the set is never emptied on quality alone.
-3. **Weighted balanced score**: remaining models are ranked by `quality × wq + cost_efficiency × wc + speed × ws`. Weights are normalised so they need not sum to 1.
+3. **Weighted balanced score**: remaining models are ranked by `quality × wq + cost_efficiency × wc + speed × ws`, with a modest bonus for reasoning-capable models when the profile benefits from it. Weights are normalised so they need not sum to 1.
 
 The top-scoring model (earliest in catalog order on ties) becomes `Decision.Chosen`. The full scored list is kept in `Decision.Eligible` for fallback.
 
@@ -138,8 +138,6 @@ weights:
   cost: 0.3
   speed: 0.2
 
-default_model: "anthropic/claude-haiku-3-5-20241022"
-
 providers:
   anthropic:
     api_key_env: "ANTHROPIC_API_KEY"
@@ -157,13 +155,13 @@ catalog:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-./router
+./llmrouter
 ```
 
 Or with a custom config path:
 
 ```bash
-./router -config /path/to/config.yaml
+./llmrouter -config /path/to/config.yaml
 ```
 
 ---
@@ -194,9 +192,9 @@ Balanced-score knobs. Need not sum to 1 — the scorer normalises them.
 | `cost`    | Weight for cost efficiency (inverse of request $). |
 | `speed`   | Weight for model speed score (0–1 in catalog).     |
 
-### `default_model`
+### `default_model` (deprecated)
 
-Fallback `provider/model` used when no catalog entry survives the capability filter. Must reference a configured provider.
+Accepted only for compatibility with older files and ignored. When no catalog entry satisfies the required capabilities and context size, the router returns a clear request error instead of sending the request to an unsuitable fallback.
 
 ### `providers`
 
@@ -249,8 +247,6 @@ weights:
   cost: 0.3
   speed: 0.2
 
-default_model: "mlx/Qwen3-8B-4bit"
-
 providers:
   mlx:
     kind: openai
@@ -279,8 +275,6 @@ weights:
   quality: 0.5
   cost: 0.4
   speed: 0.1
-
-default_model: "anthropic/claude-haiku-3-5-20241022"
 
 providers:
   anthropic:

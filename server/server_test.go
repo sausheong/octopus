@@ -99,6 +99,23 @@ func buildServer(t *testing.T) *Server {
 	return New(rt, reg, cfg.Catalog)
 }
 
+func TestPrepareAttemptOnlyEnablesSupportedReasoning(t *testing.T) {
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"p": &fakeProv{}})
+	s := New(nil, reg, []config.CatalogEntry{
+		{ID: "p/reasoning", Caps: config.Caps{Reasoning: true, MaxContext: 1000}},
+		{ID: "p/ordinary", Caps: config.Caps{MaxContext: 1000}},
+	})
+	dec := router.Decision{Reasoning: llm.ReasoningMedium}
+	_, capable, err := s.prepareAttempt("p/reasoning", llm.ChatRequest{}, dec)
+	if err != nil || capable.Reasoning != llm.ReasoningMedium {
+		t.Fatalf("capable attempt reasoning=%q err=%v", capable.Reasoning, err)
+	}
+	_, ordinary, err := s.prepareAttempt("p/ordinary", llm.ChatRequest{}, dec)
+	if err != nil || ordinary.Reasoning != llm.ReasoningOff {
+		t.Fatalf("ordinary attempt reasoning=%q err=%v", ordinary.Reasoning, err)
+	}
+}
+
 func TestHandlerNonStreaming(t *testing.T) {
 	s := buildServer(t)
 	body := `{"model":"claude","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`

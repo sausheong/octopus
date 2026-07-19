@@ -3,6 +3,8 @@ package router
 import (
 	"context"
 	"log/slog"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/llmrouter/config"
@@ -51,7 +53,7 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 				cctx, cancel = context.WithTimeout(ctx, r.cfg.Classifier.Timeout)
 				defer cancel()
 			}
-			prof = r.classifyFn(cctx, prov, model, r.cfg.Classifier.MaxTokens, turn)
+			prof = r.classifyFn(cctx, prov, model, r.cfg.Classifier.MaxTokens, classificationTurn(chat, turn))
 		}
 	}
 
@@ -64,9 +66,9 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 		prof.NeedsTools = true
 	}
 
-	// Apply deterministic token floor: the classifier only sees the last user
-	// turn so it can underestimate large system prompts, histories, and tool
-	// schemas. EstimateRequestTokens counts the full request; we take the max
+	// Apply deterministic token floor: classifier context is deliberately
+	// bounded, so it can underestimate large system prompts, histories, and
+	// tool schemas. EstimateRequestTokens counts the full request; we take the max
 	// so the classifier's semantic estimate is never overridden downward.
 	detIn := EstimateRequestTokens(chat)
 	if detIn > prof.EstTokensIn {
@@ -82,10 +84,9 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 		prof.EstTokensOut = detOut
 	}
 
-	d := Score(prof, r.cfg.Catalog, r.cfg.Weights, r.cfg.DefaultModel)
-	// If the profile requires reasoning, request medium effort. This ensures
-	// the chosen model (which must have Caps.Reasoning=true to pass the filter)
-	// actually activates extended thinking rather than leaving it at the default off.
+	d := Score(prof, r.cfg.Catalog, r.cfg.Weights)
+	// If the profile benefits from reasoning, recommend medium effort. The
+	// server applies it only to candidates that advertise reasoning support.
 	if prof.NeedsReasoning {
 		d.Reasoning = llm.ReasoningMedium
 	}
@@ -99,6 +100,74 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 		"eligible", d.Eligible,
 	)
 	return d
+}
+
+const maxClassifierContextBytes = 12 << 10
+
+// classificationTurn gives the classifier enough recent conversation to
+// understand replies such as "continue" while bounding classifier cost. A
+// genuinely single-turn request is passed through unchanged.
+func classificationTurn(chat llm.ChatRequest, turn llm.Message) llm.Message {
+	if chat.SystemPrompt == "" && len(chat.Messages) == 1 {
+		return turn
+	}
+
+	chunks := make([]string, 0, len(chat.Messages)+1)
+	if chat.SystemPrompt != "" {
+		chunks = append(chunks, "system: "+chat.SystemPrompt)
+	}
+	for _, m := range chat.Messages {
+		var b strings.Builder
+		b.WriteString(m.Role)
+		b.WriteString(": ")
+		b.WriteString(m.Content)
+		if len(m.Images) > 0 {
+			b.WriteString(" [image attached]")
+		}
+		for _, tc := range m.ToolCalls {
+			b.WriteString(" [tool call ")
+			b.WriteString(tc.Name)
+			b.WriteString(": ")
+			b.Write(tc.Input)
+			b.WriteByte(']')
+		}
+		if m.ToolCallID != "" {
+			b.WriteString(" [tool result for ")
+			b.WriteString(m.ToolCallID)
+			b.WriteByte(']')
+		}
+		chunks = append(chunks, b.String())
+	}
+
+	// Retain whole recent turns where possible; only an individually oversized
+	// latest turn is truncated, at a UTF-8 boundary.
+	selected := make([]string, 0, len(chunks))
+	used := 0
+	for i := len(chunks) - 1; i >= 0; i-- {
+		need := len(chunks[i])
+		if len(selected) > 0 {
+			need++
+		}
+		if used+need > maxClassifierContextBytes {
+			if len(selected) == 0 {
+				s := chunks[i]
+				if len(s) > maxClassifierContextBytes {
+					s = s[len(s)-maxClassifierContextBytes:]
+					for !utf8.ValidString(s) {
+						s = s[1:]
+					}
+				}
+				selected = append(selected, s)
+			}
+			break
+		}
+		selected = append(selected, chunks[i])
+		used += need
+	}
+	for i, j := 0, len(selected)-1; i < j; i, j = i+1, j-1 {
+		selected[i], selected[j] = selected[j], selected[i]
+	}
+	return llm.Message{Role: "user", Content: strings.Join(selected, "\n")}
 }
 
 // requestHasImages reports whether any message carries image content.

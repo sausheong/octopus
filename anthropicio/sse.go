@@ -25,6 +25,12 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 	}
 	for ev := range events {
 		switch ev.Type {
+		case eventThinkingBlock:
+			if thinking, signature, ok := eventThinking(ev); ok {
+				if err := enc.thinkingBlock(thinking, signature); err != nil {
+					return err
+				}
+			}
 		case llm.EventTextDelta:
 			if err := enc.textDelta(ev.Text); err != nil {
 				return err
@@ -64,9 +70,40 @@ type sseState struct {
 	w           SSEWriter
 	model       string
 	index       int    // index of the next/open block
-	openType    string // "", "text", "tool_use"
+	openType    string // "", "text", "thinking", "tool_use"
 	toolDeltaed bool   // whether an input_json_delta was already sent for the open tool block
 	finished    bool
+}
+
+func (s *sseState) thinkingBlock(thinking, signature string) error {
+	if err := s.closeOpen(); err != nil {
+		return err
+	}
+	if err := s.emit("content_block_start", map[string]any{
+		"type":          "content_block_start",
+		"index":         s.index,
+		"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
+	}); err != nil {
+		return err
+	}
+	s.openType = "thinking"
+	if thinking != "" {
+		if err := s.emit("content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": s.index,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": thinking},
+		}); err != nil {
+			return err
+		}
+	}
+	if signature != "" {
+		if err := s.emit("content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": s.index,
+			"delta": map[string]any{"type": "signature_delta", "signature": signature},
+		}); err != nil {
+			return err
+		}
+	}
+	return s.closeOpen()
 }
 
 func (s *sseState) emit(event string, payload any) error {

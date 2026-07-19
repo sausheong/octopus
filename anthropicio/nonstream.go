@@ -19,11 +19,21 @@ func CollectMessage(model string, events <-chan llm.ChatEvent) ([]byte, error) {
 		Input json.RawMessage `json:"input"`
 	}
 	var tools []toolBlock
+	type thinkingBlock struct {
+		Type      string `json:"type"`
+		Thinking  string `json:"thinking"`
+		Signature string `json:"signature,omitempty"`
+	}
+	var thinking []thinkingBlock
 	stopReason := "end_turn"
 	in, out := 0, 0
 
 	for ev := range events {
 		switch ev.Type {
+		case eventThinkingBlock:
+			if body, signature, ok := eventThinking(ev); ok {
+				thinking = append(thinking, thinkingBlock{Type: "thinking", Thinking: body, Signature: signature})
+			}
 		case llm.EventTextDelta:
 			text.WriteString(ev.Text)
 		case llm.EventToolCallDone:
@@ -53,6 +63,9 @@ func CollectMessage(model string, events <-chan llm.ChatEvent) ([]byte, error) {
 	}
 
 	var content []any
+	for _, tb := range thinking {
+		content = append(content, tb)
+	}
 	if text.Len() > 0 {
 		content = append(content, map[string]any{"type": "text", "text": text.String()})
 	}

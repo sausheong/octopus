@@ -124,6 +124,22 @@ func TestDecodeNoMessages(t *testing.T) {
 	}
 }
 
+func TestDecodeRejectsInvalidRequests(t *testing.T) {
+	tests := []string{
+		`{"max_tokens":0,"messages":[{"role":"user","content":"x"}]}`,
+		`{"max_tokens":1,"temperature":1.1,"messages":[{"role":"user","content":"x"}]}`,
+		`{"max_tokens":1,"messages":[{"role":"system","content":"x"}]}`,
+		`{"max_tokens":1,"system":{"bad":true},"messages":[{"role":"user","content":"x"}]}`,
+		`{"max_tokens":1,"tools":[{"name":"","input_schema":{}}],"messages":[{"role":"user","content":"x"}]}`,
+		`{"max_tokens":1,"messages":[{"role":"user","content":[{"type":"audio"}]}]}`,
+	}
+	for _, body := range tests {
+		if _, err := Decode([]byte(body)); err == nil {
+			t.Errorf("Decode accepted invalid request: %s", body)
+		}
+	}
+}
+
 // hasProperties reports whether a tool's decoded Parameters JSON contains a
 // "properties" object (the field some backends require on every tool schema).
 func hasProperties(t *testing.T, raw json.RawMessage) bool {

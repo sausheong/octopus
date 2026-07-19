@@ -8,7 +8,6 @@ weights:
   quality: 0.5
   cost: 0.3
   speed: 0.2
-default_model: "anthropic/claude-haiku-3-5-20241022"
 providers:
   anthropic:
     api_key_env: "ANTHROPIC_API_KEY"

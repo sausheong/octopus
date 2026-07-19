@@ -12,7 +12,7 @@ import (
 type bufWriter struct{ b strings.Builder }
 
 func (w *bufWriter) Write(p []byte) (int, error) { return w.b.Write(p) }
-func (w *bufWriter) Flush()                       {}
+func (w *bufWriter) Flush()                      {}
 
 // parseSSE returns the ordered list of event types from an SSE payload.
 func parseSSE(s string) []string {

@@ -173,6 +173,52 @@ func TestRouteShortCircuitNotFiredForMultiTurn(t *testing.T) {
 	}
 }
 
+func TestRouteClassifierReceivesRecentConversation(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	var classified string
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		classified = turn.Content
+		return TaskProfile{Difficulty: "medium", EstTokensIn: 100, EstTokensOut: 100}
+	}
+	chat := llm.ChatRequest{Messages: []llm.Message{
+		{Role: "user", Content: "Refactor the complex parser without changing its API."},
+		{Role: "assistant", Content: "I have a plan."},
+		{Role: "user", Content: "continue"},
+	}}
+	r.Route(context.Background(), chat)
+	for _, want := range []string{"complex parser", "I have a plan", "continue"} {
+		if !strings.Contains(classified, want) {
+			t.Errorf("classifier context missing %q: %q", want, classified)
+		}
+	}
+}
+
+func TestRouteClassifierFreeLocalModelHandlesNonTrivialRequest(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr: "x",
+		Weights:    config.Weights{Quality: 0.5, Cost: 0.4, Speed: 0.1},
+		Providers: map[string]config.ProviderCreds{
+			"local": {Kind: "openai", BaseURL: "http://127.0.0.1:8080/v1"},
+		},
+		Catalog: []config.CatalogEntry{{
+			ID: "local/model", Quality: 0.6, Speed: 0.8,
+			Caps: config.Caps{MaxContext: 32768},
+		}},
+	}
+	reg, err := registry.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	d := NewRouter(cfg, reg).Route(context.Background(), llm.ChatRequest{
+		Messages: []llm.Message{{Role: "user", Content: strings.Repeat("build this feature ", 40)}},
+	})
+	if d.NoEligible || d.Chosen != "local/model" {
+		t.Fatalf("decision = %+v, want local/model", d)
+	}
+}
+
 func TestRouteDeterministicFloorFloorsClassifierEstimate(t *testing.T) {
 	// If the classifier underestimates tokens, the deterministic floor should
 	// raise EstTokensIn to at least what EstimateRequestTokens returns.

@@ -51,6 +51,8 @@ type wireBlock struct {
 	ToolUseID string          `json:"tool_use_id"`
 	Content   json.RawMessage `json:"content"` // tool_result: string OR []block
 	IsError   bool            `json:"is_error"`
+	Thinking  string          `json:"thinking"`
+	Signature string          `json:"signature"`
 }
 
 type wireImageSrc struct {

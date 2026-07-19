@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/sausheong/harness/llm"
@@ -18,16 +19,35 @@ func Decode(body []byte) (DecodedRequest, error) {
 	if len(wr.Messages) == 0 {
 		return DecodedRequest{}, fmt.Errorf("messages must not be empty")
 	}
+	if wr.MaxTokens <= 0 {
+		return DecodedRequest{}, fmt.Errorf("max_tokens must be > 0")
+	}
+	if wr.Temperature != nil && (math.IsNaN(*wr.Temperature) || math.IsInf(*wr.Temperature, 0) || *wr.Temperature < 0 || *wr.Temperature > 1) {
+		return DecodedRequest{}, fmt.Errorf("temperature must be a finite number in [0,1]")
+	}
+	system, err := decodeSystem(wr.System)
+	if err != nil {
+		return DecodedRequest{}, err
+	}
 
 	chat := llm.ChatRequest{
 		Model:        wr.Model,
 		MaxTokens:    wr.MaxTokens,
-		SystemPrompt: decodeSystem(wr.System),
+		SystemPrompt: system,
 	}
 	if wr.Temperature != nil {
 		chat.Temperature = *wr.Temperature
 	}
 	for _, t := range wr.Tools {
+		if strings.TrimSpace(t.Name) == "" {
+			return DecodedRequest{}, fmt.Errorf("tool name must not be empty")
+		}
+		if len(t.InputSchema) > 0 {
+			var schema map[string]json.RawMessage
+			if err := json.Unmarshal(t.InputSchema, &schema); err != nil || schema == nil {
+				return DecodedRequest{}, fmt.Errorf("tool %q input_schema must be a JSON object", t.Name)
+			}
+		}
 		chat.Tools = append(chat.Tools, llm.ToolDef{
 			Name:        t.Name,
 			Description: t.Description,
@@ -35,6 +55,9 @@ func Decode(body []byte) (DecodedRequest, error) {
 		})
 	}
 	for _, wm := range wr.Messages {
+		if wm.Role != "user" && wm.Role != "assistant" {
+			return DecodedRequest{}, fmt.Errorf("invalid message role %q", wm.Role)
+		}
 		msgs, err := decodeMessage(wm)
 		if err != nil {
 			return DecodedRequest{}, err
@@ -51,25 +74,28 @@ func Decode(body []byte) (DecodedRequest, error) {
 
 // decodeSystem accepts either a JSON string or an array of {type:text,text}
 // blocks, joining block texts with newlines.
-func decodeSystem(raw json.RawMessage) string {
+func decodeSystem(raw json.RawMessage) (string, error) {
 	if len(raw) == 0 {
-		return ""
+		return "", nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return s, nil
 	}
 	var blocks []wireBlock
-	if err := json.Unmarshal(raw, &blocks); err == nil {
+	if err := json.Unmarshal(raw, &blocks); err == nil && blocks != nil {
 		var parts []string
 		for _, b := range blocks {
-			if b.Type == "text" && b.Text != "" {
+			if b.Type != "text" {
+				return "", fmt.Errorf("system content block type %q is not supported", b.Type)
+			}
+			if b.Text != "" {
 				parts = append(parts, b.Text)
 			}
 		}
-		return strings.Join(parts, "\n")
+		return strings.Join(parts, "\n"), nil
 	}
-	return ""
+	return "", fmt.Errorf("system must be a string or an array of text blocks")
 }
 
 // decodeMessage converts one wire message into one or more llm.Messages.
@@ -86,6 +112,9 @@ func decodeMessage(wm wireMessage) ([]llm.Message, error) {
 	var blocks []wireBlock
 	if err := json.Unmarshal(wm.Content, &blocks); err != nil {
 		return nil, fmt.Errorf("invalid message content: %w", err)
+	}
+	if len(blocks) == 0 {
+		return nil, fmt.Errorf("message content blocks must not be empty")
 	}
 
 	var out []llm.Message
@@ -108,19 +137,38 @@ func decodeMessage(wm wireMessage) ([]llm.Message, error) {
 		case "text":
 			textParts = append(textParts, b.Text)
 			hasBase = true
-		case "image":
-			if b.Source != nil && b.Source.Type == "base64" {
-				data, err := base64.StdEncoding.DecodeString(b.Source.Data)
-				if err != nil {
-					return nil, fmt.Errorf("invalid base64 image: %w", err)
-				}
-				base.Images = append(base.Images, llm.ImageContent{
-					MimeType: b.Source.MediaType,
-					Data:     data,
-				})
-				hasBase = true
+		case "thinking":
+			if wm.Role != "assistant" {
+				return nil, fmt.Errorf("thinking blocks are only valid in assistant messages")
 			}
+			if !appendThinkingBlock(&base, b.Thinking, b.Signature) {
+				return nil, fmt.Errorf("thinking blocks require a harness version with thinking-block support")
+			}
+			hasBase = true
+		case "image":
+			if wm.Role != "user" {
+				return nil, fmt.Errorf("image blocks are only valid in user messages")
+			}
+			if b.Source == nil || b.Source.Type != "base64" || b.Source.MediaType == "" || b.Source.Data == "" {
+				return nil, fmt.Errorf("image source must be non-empty base64 data with a media_type")
+			}
+			data, err := base64.StdEncoding.DecodeString(b.Source.Data)
+			if err != nil {
+				return nil, fmt.Errorf("invalid base64 image: %w", err)
+			}
+			base.Images = append(base.Images, llm.ImageContent{MimeType: b.Source.MediaType, Data: data})
+			hasBase = true
 		case "tool_use":
+			if wm.Role != "assistant" {
+				return nil, fmt.Errorf("tool_use blocks are only valid in assistant messages")
+			}
+			if b.ID == "" || b.Name == "" || !json.Valid(b.Input) {
+				return nil, fmt.Errorf("tool_use requires id, name, and valid JSON input")
+			}
+			var input map[string]json.RawMessage
+			if err := json.Unmarshal(b.Input, &input); err != nil || input == nil {
+				return nil, fmt.Errorf("tool_use input must be a JSON object")
+			}
 			base.ToolCalls = append(base.ToolCalls, llm.ToolCall{
 				ID:    b.ID,
 				Name:  b.Name,
@@ -128,15 +176,27 @@ func decodeMessage(wm wireMessage) ([]llm.Message, error) {
 			})
 			hasBase = true
 		case "tool_result":
+			if wm.Role != "user" {
+				return nil, fmt.Errorf("tool_result blocks are only valid in user messages")
+			}
+			if b.ToolUseID == "" {
+				return nil, fmt.Errorf("tool_result requires tool_use_id")
+			}
 			// Tool results are their own user messages. Flush any pending
 			// base first to preserve order.
 			flushBase()
+			content, err := toolResultText(b.Content)
+			if err != nil {
+				return nil, err
+			}
 			out = append(out, llm.Message{
 				Role:       "user",
 				ToolCallID: b.ToolUseID,
-				Content:    toolResultText(b.Content),
+				Content:    content,
 				IsError:    b.IsError,
 			})
+		default:
+			return nil, fmt.Errorf("unsupported message content block type %q", b.Type)
 		}
 	}
 	flushBase()
@@ -145,25 +205,26 @@ func decodeMessage(wm wireMessage) ([]llm.Message, error) {
 
 // toolResultText extracts text from a tool_result content field, which may be
 // a plain string or an array of text blocks.
-func toolResultText(raw json.RawMessage) string {
+func toolResultText(raw json.RawMessage) (string, error) {
 	if len(raw) == 0 {
-		return ""
+		return "", nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return s, nil
 	}
 	var blocks []wireBlock
-	if err := json.Unmarshal(raw, &blocks); err == nil {
+	if err := json.Unmarshal(raw, &blocks); err == nil && blocks != nil {
 		var parts []string
 		for _, b := range blocks {
-			if b.Type == "text" {
-				parts = append(parts, b.Text)
+			if b.Type != "text" {
+				return "", fmt.Errorf("tool_result content block type %q is not supported", b.Type)
 			}
+			parts = append(parts, b.Text)
 		}
-		return strings.Join(parts, "")
+		return strings.Join(parts, ""), nil
 	}
-	return ""
+	return "", fmt.Errorf("tool_result content must be a string or text-block array")
 }
 
 // emptyObjectSchema is the minimal valid JSON Schema for a no-argument tool.

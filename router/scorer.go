@@ -22,7 +22,7 @@ type Decision struct {
 	Scores     map[string]float64
 	Weights    config.Weights
 	Reason     string
-	Reasoning  llm.ReasoningMode // recommended reasoning mode for the chosen model
+	Reasoning  llm.ReasoningMode // recommended mode when an attempted candidate supports reasoning
 	NoEligible bool              // true when no catalog model passed the capability filter
 }
 
@@ -36,10 +36,7 @@ func eligible(p TaskProfile, e config.CatalogEntry) bool {
 	if p.NeedsTools && !e.Caps.Tools {
 		return false
 	}
-	if p.NeedsReasoning && !e.Caps.Reasoning {
-		return false
-	}
-	if e.Caps.MaxContext > 0 && p.EstTokensIn+p.EstTokensOut > e.Caps.MaxContext {
+	if p.EstTokensIn+p.EstTokensOut > e.Caps.MaxContext {
 		return false
 	}
 	return true
@@ -74,9 +71,10 @@ func normalize(vals []float64) []float64 {
 }
 
 // Score runs the full selection: filter, normalize sub-scores, weighted sum,
-// deterministic tie-break by catalog order. Never errors; falls back to
-// defaultModel when nothing is eligible.
-func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, defaultModel string) Decision {
+// deterministic tie-break by catalog order. Reasoning support is a preference,
+// not a hard requirement: ordinary models can still serve a request when no
+// reasoning-capable model is available.
+func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights) Decision {
 	var elig []config.CatalogEntry
 	for _, e := range catalog {
 		if eligible(p, e) {
@@ -98,7 +96,7 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, defau
 	}
 	if len(elig) == 0 {
 		return Decision{
-			Chosen:     defaultModel,
+			Chosen:     "",
 			Profile:    p,
 			Eligible:   nil,
 			Scores:     map[string]float64{},
@@ -162,6 +160,12 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, defau
 	bestScore := -1.0
 	for i, e := range elig {
 		s := wq*qn[i] + wc*cn[i] + ws*sn[i]
+		// Keep this bonus deliberately modest. It breaks otherwise close choices
+		// in favour of native reasoning without making that optional feature
+		// outweigh the configured quality/cost/speed policy.
+		if p.NeedsReasoning && e.Caps.Reasoning {
+			s += 0.1
+		}
 		scores[e.ID] = s
 		eligIDs[i] = e.ID
 		// Strictly greater keeps the earliest (catalog-order) entry on ties.

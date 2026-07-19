@@ -225,4 +225,75 @@ func TestHandlerModelsMethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestHandlerFallbackOnProviderError(t *testing.T) {
+	// Two providers: "bad" always errors, "good" succeeds. Scorer will pick
+	// "bad/model" first (higher quality score), then fall back to "good/model".
+	cfg := &config.Config{
+		ServerAddr:   "x",
+		Classifier:   config.ClassifierCfg{Model: "good/model", MaxTokens: 16},
+		Weights:      config.Weights{Quality: 1, Cost: 1, Speed: 1},
+		DefaultModel: "good/model",
+		Providers: map[string]config.ProviderCreds{
+			"bad":  {APIKeyEnv: "X"},
+			"good": {APIKeyEnv: "X"},
+		},
+		Catalog: []config.CatalogEntry{
+			{ID: "bad/model", Quality: 0.9, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+			{ID: "good/model", Quality: 0.7, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{
+		"bad":  &errProv{err: anthErr(529)},
+		"good": &fakeProv{text: "fallback response"},
+	})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
+	})
+	s := New(rt, reg, cfg.Catalog)
+
+	body := `{"model":"any","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "fallback response") {
+		t.Errorf("expected fallback response in body: %s", rec.Body.String())
+	}
+}
+
+func TestHandlerAllProvidersFail(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr:   "x",
+		Classifier:   config.ClassifierCfg{Model: "bad/model", MaxTokens: 16},
+		Weights:      config.Weights{Quality: 1, Cost: 1, Speed: 1},
+		DefaultModel: "bad/model",
+		Providers:    map[string]config.ProviderCreds{"bad": {APIKeyEnv: "X"}},
+		Catalog: []config.CatalogEntry{
+			{ID: "bad/model", Quality: 0.9, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.9,
+				Caps: config.Caps{MaxContext: 200000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"bad": &errProv{err: anthErr(529)}})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
+	})
+	s := New(rt, reg, cfg.Catalog)
+
+	body := `{"model":"any","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("expected error status when all providers fail, got 200")
+	}
+}
+
 var _ = io.Discard // keep io imported if unused above

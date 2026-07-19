@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/llmrouter/anthropicio"
 	"github.com/sausheong/llmrouter/config"
 	"github.com/sausheong/llmrouter/openaiio"
@@ -36,6 +38,46 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	return mux
+}
+
+// tryProviders attempts ChatStream on the chosen model first, then falls back
+// through the eligible list in score order on any ChatStream error. Returns the
+// open event channel, the model id that succeeded, and an error only if every
+// candidate failed. Fallback is intentionally pre-stream only — once headers
+// are written the caller owns the channel and there is no going back.
+func (s *Server) tryProviders(ctx context.Context, dec router.Decision, chat llm.ChatRequest) (<-chan llm.ChatEvent, string, error) {
+	candidates := []string{dec.Chosen}
+	for _, id := range dec.Eligible {
+		if id != dec.Chosen {
+			candidates = append(candidates, id)
+		}
+	}
+
+	var lastErr error
+	for _, id := range candidates {
+		prov, model, err := s.reg.Resolve(id)
+		if err != nil {
+			lastErr = err
+			slog.Warn("provider resolve failed during fallback", "model", id, "err", err)
+			continue
+		}
+		chat.Model = model
+		ch, err := prov.ChatStream(ctx, chat)
+		if err != nil {
+			lastErr = err
+			if id == dec.Chosen {
+				slog.Warn("chosen provider failed, trying fallback", "model", id, "err", err)
+			} else {
+				slog.Warn("fallback provider failed", "model", id, "err", err)
+			}
+			continue
+		}
+		if id != dec.Chosen {
+			slog.Info("using fallback model", "model", id, "original", dec.Chosen)
+		}
+		return ch, id, nil
+	}
+	return nil, "", lastErr
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -106,14 +148,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dec := s.rt.Route(ctx, dr.Chat)
 
-	prov, model, err := s.reg.Resolve(dec.Chosen)
-	if err != nil {
-		writeError(w, anthropicio.NewAPIError("upstream", "cannot resolve chosen model: "+err.Error()))
-		return
-	}
-	dr.Chat.Model = model
-
-	ch, err := prov.ChatStream(ctx, dr.Chat)
+	ch, chosen, err := s.tryProviders(ctx, dec, dr.Chat)
 	if err != nil {
 		writeError(w, anthropicio.MapBackendError(err))
 		return
@@ -125,11 +160,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
 		fw := &flushWriter{w: w}
-		if err := anthropicio.EncodeSSE(fw, dec.Chosen, ch); err != nil {
-			slog.Error("sse encode failed", "err", err, "model", dec.Chosen)
+		if err := anthropicio.EncodeSSE(fw, chosen, ch); err != nil {
+			slog.Error("sse encode failed", "err", err, "model", chosen)
 		}
 	} else {
-		out, err := anthropicio.CollectMessage(dec.Chosen, ch)
+		out, err := anthropicio.CollectMessage(chosen, ch)
 		if err != nil {
 			writeError(w, anthropicio.MapBackendError(err))
 			return
@@ -140,7 +175,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("request handled",
-		"model", dec.Chosen,
+		"model", chosen,
 		"requested_model", dr.RequestedModel,
 		"stream", dr.Stream,
 		"reason", dec.Reason,
@@ -175,14 +210,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dec := s.rt.Route(ctx, chat)
 
-	prov, model, err := s.reg.Resolve(dec.Chosen)
-	if err != nil {
-		writeOAIError(w, http.StatusBadGateway, "api_error", "cannot resolve chosen model: "+err.Error())
-		return
-	}
-	chat.Model = model
-
-	ch, err := prov.ChatStream(ctx, chat)
+	ch, chosen, err := s.tryProviders(ctx, dec, chat)
 	if err != nil {
 		ae := anthropicio.MapBackendError(err)
 		writeOAIError(w, http.StatusBadGateway, "api_error", ae.Message)
@@ -195,11 +223,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
 		fw := &flushWriter{w: w}
-		if err := openaiio.EncodeSSE(fw, dec.Chosen, ch); err != nil {
-			slog.Error("oai sse encode failed", "err", err, "model", dec.Chosen)
+		if err := openaiio.EncodeSSE(fw, chosen, ch); err != nil {
+			slog.Error("oai sse encode failed", "err", err, "model", chosen)
 		}
 	} else {
-		out, err := openaiio.CollectCompletion(dec.Chosen, ch)
+		out, err := openaiio.CollectCompletion(chosen, ch)
 		if err != nil {
 			ae := anthropicio.MapBackendError(err)
 			writeOAIError(w, http.StatusBadGateway, "api_error", ae.Message)
@@ -212,7 +240,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("request handled",
 		"endpoint", "oai",
-		"model", dec.Chosen,
+		"model", chosen,
 		"requested_model", requestedModel,
 		"stream", stream,
 		"reason", dec.Reason,

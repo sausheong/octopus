@@ -20,14 +20,15 @@ type Registry struct {
 	providers map[string]llm.LLMProvider
 }
 
-// New constructs a provider per cfg.Providers entry. The API key is read from
-// the env var named by APIKeyEnv; an empty value is a fatal misconfiguration.
+// New constructs a provider per cfg.Providers entry. For providers with a
+// base_url but no credentials (local inference servers), an empty key is
+// allowed — the harness client will send no Authorization header.
 // Unknown provider names are an error (we only know the four harness backends).
 func New(ctx context.Context, cfg *config.Config) (*Registry, error) {
 	r := &Registry{providers: make(map[string]llm.LLMProvider, len(cfg.Providers))}
 	for name, creds := range cfg.Providers {
 		key := creds.Key()
-		if key == "" {
+		if key == "" && creds.BaseURL == "" {
 			return nil, fmt.Errorf("provider %q: no API key (set api_key or a non-empty api_key_env %q)", name, creds.APIKeyEnv)
 		}
 		// Kind selects the harness client type; defaults to the provider's

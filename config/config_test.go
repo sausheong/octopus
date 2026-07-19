@@ -90,10 +90,19 @@ func TestValidateCustomKindAccepted(t *testing.T) {
 
 func TestValidateProviderMissingCredentialSource(t *testing.T) {
 	c := baseValid()
-	c.Providers["nokey"] = ProviderCreds{Kind: "anthropic"} // no api_key, no api_key_env
+	c.Providers["nokey"] = ProviderCreds{Kind: "openai"} // no api_key, no api_key_env, no base_url
 	c.Catalog = append(c.Catalog, CatalogEntry{ID: "nokey/m", Quality: 0.5, Speed: 0.5, Caps: Caps{MaxContext: 1000}})
 	if err := c.Validate(); err == nil {
-		t.Fatal("expected error for provider with no api_key or api_key_env")
+		t.Fatal("expected error for provider with no api_key, api_key_env, or base_url")
+	}
+}
+
+func TestValidateLocalProviderBaseURLOnly(t *testing.T) {
+	c := baseValid()
+	c.Providers["local"] = ProviderCreds{Kind: "openai", BaseURL: "http://localhost:8080/v1"}
+	c.Catalog = append(c.Catalog, CatalogEntry{ID: "local/my-model", Quality: 0.6, Speed: 0.9, Caps: Caps{MaxContext: 32768}})
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected base_url-only provider to be valid, got: %v", err)
 	}
 }
 

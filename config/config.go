@@ -159,8 +159,8 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("provider %q has unknown kind %q (want anthropic|openai|gemini|qwen)", name, kind)
 		}
-		if creds.APIKey == "" && creds.APIKeyEnv == "" {
-			return fmt.Errorf("provider %q must set api_key or api_key_env", name)
+		if creds.APIKey == "" && creds.APIKeyEnv == "" && creds.BaseURL == "" {
+			return fmt.Errorf("provider %q must set api_key, api_key_env, or base_url", name)
 		}
 	}
 	// Every catalog id must be provider/model and its provider configured.

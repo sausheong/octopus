@@ -9,6 +9,7 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
 ## Contents
 
 - [Quick start](#quick-start)
+- [macOS menu bar app](#macos-menu-bar-app)
 - [Claude Code setup](#claude-code-setup)
 - [Prompt caching](#prompt-caching)
 - [Routing behavior](#routing-behavior)
@@ -35,6 +36,7 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
 - Extended-thinking/reasoning mapping and thinking-block round trips.
 - Tool calls, parallel tool results, images, streaming usage, and refusal propagation.
 - Loopback-only binding, bounded request bodies, transport timeouts, and graceful shutdown.
+- Native macOS menu-bar app with structured settings, an Advanced YAML editor, and immediate validated reloads.
 
 ## Quick start
 
@@ -48,16 +50,22 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
 ```bash
 git clone https://github.com/sausheong/octopus.git
 cd octopus
-make build
+make app
 ```
 
-This builds `./octopus` from `./cmd/octopus`. The equivalent Go command is:
+On macOS this builds `dist/Octopus.app`. Launch it with:
 
 ```bash
-GOWORK=off go build -o octopus ./cmd/octopus
+open dist/Octopus.app
 ```
 
+Octopus appears only in the menu bar; it does not add a Dock icon. See [macOS menu bar app](#macos-menu-bar-app) for setup details. On Linux and other supported non-macOS systems, use `make build` to build the headless `./octopus` command.
+
 ### Configure
+
+On macOS, choose **Settings…** from the Octopus menu-bar menu. Saving creates or updates `~/.octopus/config.yaml` and reloads the router immediately. You can use the structured General, Providers, and Models forms or edit the full file in Advanced YAML.
+
+For the headless command, copy the example file:
 
 ```bash
 cp config.example.yaml config.yaml
@@ -98,7 +106,9 @@ catalog:
 
 Use a model ID accepted by your provider and current pricing for the catalog cost fields.
 
-### Run
+### Run the headless command
+
+The commands in this section apply to non-macOS builds. The macOS app reads `~/.octopus/config.yaml` and manages its own lifecycle.
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -112,6 +122,210 @@ Use another configuration file with:
 ```
 
 The process logs `octopus listening` when it is ready. It handles `SIGINT` and `SIGTERM` by draining in-flight requests for up to 30 seconds.
+
+## macOS menu bar app
+
+### Build and launch
+
+Requirements are macOS 13 or newer, Xcode Command Line Tools, and Go 1.25 or newer.
+
+```bash
+make app
+open dist/Octopus.app
+```
+
+For regular use, copy `dist/Octopus.app` to `/Applications`. The locally built app is ad-hoc signed rather than distributed through the App Store; macOS may ask you to confirm the first launch.
+
+### Signed installer
+
+Release maintainers can build a Developer ID-signed, notarized installer package. The required Developer ID Application and Developer ID Installer certificates must be installed in the current user's Keychain.
+
+Set the release environment variables:
+
+```bash
+export APPLE_ID="developer@example.com"
+export TEAM_ID="ABCDE12345"
+export APP_SIGN_ID="Developer ID Application: Example Company (ABCDE12345)"
+export PKG_SIGN_ID="Developer ID Installer: Example Company (ABCDE12345)"
+export KEYCHAIN_PROFILE="octopus-notary"
+```
+
+Store the notarization credentials once. Apple prompts securely for the app-specific password; it does not need to be placed in an environment variable or command history.
+
+```bash
+make notary-profile
+```
+
+Then create the installer:
+
+```bash
+make installer
+```
+
+The target builds `Octopus.app`, signs it with the hardened runtime and a trusted timestamp, verifies that its signing team matches `TEAM_ID`, creates a signed package that installs the app in `/Applications`, submits the package using `KEYCHAIN_PROFILE`, waits for notarization, staples the ticket, and validates the finished installer. The result is written to `dist/Octopus-<version>.pkg`, where the version comes from `packaging/Info.plist`.
+
+`KEYCHAIN_PROFILE` supplies the stored Apple ID credentials during notarization. `APPLE_ID` and `TEAM_ID` are used when creating that profile; `make installer` also requires them so an incomplete release environment fails before signing begins. Never commit these values or an app-specific password to the repository.
+
+### Publishing a release
+
+Before publishing, review and commit every change that belongs in the release. The release command deliberately refuses to run with modified, staged, or untracked files because a Git tag must identify one complete, reproducible commit.
+
+```bash
+git status --short
+git add <files-to-release>
+git commit -m "Describe the release changes"
+git status --short            # must produce no output
+```
+
+If every current file belongs in the release, `git add -A` can replace the selective `git add` command. Review the staged contents with `git diff --cached` before committing; do not include local configuration, credentials, build products, or unrelated work.
+
+Confirm that GitHub CLI authentication and the Apple notarization profile are ready:
+
+```bash
+gh auth status
+xcrun notarytool history --keychain-profile "$KEYCHAIN_PROFILE"
+```
+
+With all five release environment variables set, publish a three-component semantic version:
+
+```bash
+make release v0.1.0
+```
+
+The version must use the exact `vX.Y.Z` form; prerelease suffixes and partial versions are not accepted. The release target performs the following operations:
+
+1. Verifies the clean worktree, required environment variables, signing identities, notarization profile, GitHub authentication, and current Git branch.
+2. Runs the complete test suite.
+3. Updates `packaging/Info.plist` and increments its build number when the requested version differs, then commits and pushes that version change.
+4. Creates and pushes an annotated Git tag.
+5. Creates a draft GitHub release. Its notes contain a short description, up to eight recent commit subjects, installation guidance, and a full-changelog link when an earlier tag exists.
+6. Runs `make installer` to build, sign, notarize, staple, and validate `dist/Octopus-X.Y.Z.pkg`.
+7. Uploads the installer and publishes the draft as the latest GitHub release.
+
+The command pushes commits and tags to `origin`; verify the current branch and remote before running it. It does not collect or commit outstanding development work automatically—the only commit it creates is the version metadata update.
+
+#### Release troubleshooting
+
+`error: the Git worktree must be clean before creating a release` means `git status --short` reports at least one modified, staged, or untracked file. Review those files, commit the ones intended for the release, and remove, ignore, or separately preserve anything that should not be published. Then rerun the release command.
+
+The GitHub release remains a draft if building, signing, notarization, or upload fails. Correct the problem and run the same command again to resume it. A published version cannot be overwritten by this target.
+
+The menu contains exactly two items:
+
+1. **Settings…** opens the local settings web app in your default browser.
+2. **Quit Octopus** stops the router and settings server, then exits.
+
+There is no Dock icon and no application-window menu. The settings server binds to a random loopback port and is available only while Octopus is running.
+
+### Settings and live reload
+
+The app always reads and writes `~/.octopus/config.yaml`. If the file does not exist, Settings opens with safe defaults; the file is created on the first successful save. The containing directory is created with mode `0700` and the file is written atomically with mode `0600`.
+
+Settings has five sections:
+
+- **General** controls the router address, classifier, scoring weights, and session/cache behavior.
+- **Providers** configures provider kinds, endpoints, environment-variable names, and optional inline credentials. Inline credentials are stored locally in the YAML file; prefer environment variables when practical.
+- **Models** edits the routing catalog, pricing, capabilities, and context limits.
+- **Advanced YAML** edits the complete configuration directly.
+- **Insights** shows request volume, token usage, estimated spend, savings over time, cache efficiency, and model usage.
+
+Every save is parsed and validated before replacing the existing file. A valid save reloads the router immediately without restarting the menu-bar app. If validation fails, the existing file and running router remain unchanged and the settings page shows the error. If a newly saved configuration cannot start—for example because a credential environment variable is absent—the file remains saved, the previous working router stays active when possible, and the status area reports the problem.
+
+The settings interface follows the macOS light or dark appearance and supports keyboard navigation, visible focus states, reduced motion, and WCAG 2.2 AA contrast.
+
+### Insights and savings calculation
+
+Insights is the final item in the Settings sidebar. It records one aggregate observation when a provider completes a request with final token usage. Tracking begins after an Insights-capable build starts; Octopus does not reconstruct earlier history from logs.
+
+#### What Insights provides
+
+The range selector supports the last 7, 30, 90, or 365 days. Every range shows:
+
+- **Net savings**: estimated savings after routing, prompt-cache effects, and classifier overhead.
+- **Actual cost**: the chosen model's cache-adjusted cost plus any classifier cost.
+- **Baseline cost**: estimated uncached cost of using the highest-quality eligible model instead.
+- **Requests and tokens**: completed requests and provider-reported input, output, cache-creation, and cache-read tokens.
+- **Savings over time**: cumulative actual cost and cumulative net savings across the selected daily range.
+- **Model routing**: savings from choosing a less expensive model rather than the baseline model.
+- **Prompt caching**: the chosen model's uncached cost minus its measured cache-adjusted cost. An initial cache write can make this negative.
+- **Classifier overhead**: input and output cost of nontrivial request classification, subtracted from savings.
+- **Cache hit rate**: cache-read input tokens divided by all reported input tokens, including ordinary input and cache creation.
+- **Model usage**: completed requests, tokens, and serving cost grouped by the model that returned the response. Classifier cost appears in the summary rather than this table.
+
+If a request uses models whose catalog prices are all zero, Insights still counts its requests and tokens but warns that savings may be understated.
+
+#### Baseline selection
+
+The baseline is selected independently for every request:
+
+1. Octopus applies the normal tool, vision, context-window, and high-difficulty quality filters.
+2. It considers only the models left in that request's eligible set.
+3. It selects the model with the highest configured `quality` value. If the chosen model ties for highest quality, it remains the baseline.
+4. It prices the baseline using the completed request's measured input and output token quantities at ordinary uncached catalog rates.
+
+This counterfactual answers: "What would the same measured request have cost on the highest-quality model Octopus could safely have selected?"
+
+#### Cost formulas
+
+Let `Pᵢ(model)` and `Pₒ(model)` be the configured input and output prices per million tokens. Provider-reported token counts are:
+
+- `I`: ordinary input tokens
+- `W`: cache-creation input tokens
+- `R`: cache-read input tokens
+- `O`: output tokens
+
+The uncached cost of a model is:
+
+```text
+uncached(model) = ((I + W + R) / 1,000,000 × Pᵢ(model))
+                 + (O / 1,000,000 × Pₒ(model))
+```
+
+The measured cost of the chosen model is:
+
+```text
+chosen measured = ((I + W × write_multiplier + R × 0.10) / 1,000,000 × Pᵢ(chosen))
+                  + (O / 1,000,000 × Pₒ(chosen))
+```
+
+The cache write multiplier is `1.25` for a five-minute cache and `2.00` for a one-hour cache. Classifier input and output tokens are priced separately using the classifier model's catalog prices.
+
+The displayed savings components are:
+
+```text
+routing savings = uncached(baseline) - uncached(chosen)
+cache savings = uncached(chosen) - chosen measured
+net savings = routing savings + cache savings - classifier overhead
+actual cost = chosen measured + classifier overhead
+```
+
+Octopus retains negative routing, cache, and net savings. A negative value truthfully indicates that the chosen route, a cache write, or classifier overhead cost more than the baseline for that period.
+
+#### Persistence and privacy
+
+Insights stores daily totals and per-model aggregates in `~/.octopus/insights.json`. The containing `~/.octopus` directory uses mode `0700`; the ledger is atomically replaced with mode `0600`.
+
+The ledger contains no prompts, responses, system instructions, tool definitions, session identifiers, API keys, or other credentials. It contains dates, model IDs, token totals, request counts, and calculated USD amounts. Quit Octopus before manually removing `~/.octopus/insights.json` to reset history.
+
+#### Accuracy and limitations
+
+These figures are estimates, not provider invoices. They depend on current catalog prices and provider-reported usage. Requests without final provider usage are not counted. Changing catalog prices affects future observations only; historical aggregates retain the economics calculated when each request completed.
+
+The counterfactual uses the completed request's measured token quantities for both the chosen and baseline models. A different baseline model might have produced a different number of output tokens in reality. Provider-specific taxes, volume discounts, batch discounts, tiered pricing, and charges not represented by `cost_per_mtok_in` or `cost_per_mtok_out` are outside the calculation.
+
+### Provider credentials at launch
+
+Start Octopus from an environment containing the provider credentials named in the configuration. For a local development build:
+
+```bash
+ANTHROPIC_API_KEY="sk-ant-..." dist/Octopus.app/Contents/MacOS/octopus
+```
+
+Applications opened from Finder do not inherit shell-only exports. For routine Finder launches, provide credentials through your login-session environment, use the optional inline-key field in the local configuration, or use a local provider that does not require a key. Prefer environment-variable names such as `ANTHROPIC_API_KEY`; an inline key is stored in `~/.octopus/config.yaml`, which Octopus protects with mode `0600` but does not encrypt.
+
+### Remove the app
+
+Quit Octopus, remove `Octopus.app`, and optionally remove `~/.octopus` if you no longer want the configuration and Insights history. Removing `~/.octopus` deletes user data and is not performed by the build or app.
 
 ## Claude Code setup
 
@@ -464,6 +678,8 @@ For a persistent local installation, run the binary under your operating system'
 
 ## Observability and troubleshooting
 
+The macOS Settings **Insights** section is the primary view for aggregate usage and estimated savings. It supports 7-day, 30-day, 90-day, and one-year ranges.
+
 Octopus emits structured `slog` text records to standard error. Useful entries include:
 
 - `octopus listening`: successful startup and bind address.
@@ -592,12 +808,17 @@ Edit `DIRECT_BASE`, `DIRECT_API_KEY`, and `DIRECT_MODEL` near the top of the scr
 
 ```bash
 make build       # build ./octopus
+make app         # build dist/Octopus.app on macOS
+make installer   # build, sign, notarize, and staple a macOS .pkg
+make release v0.1.0 # publish a versioned GitHub release and installer
+make notary-profile # store notarization credentials in Keychain (one-time)
+make open-app    # build and launch the macOS app
 make test        # GOWORK=off go test ./...
 make test-race   # race detector across all packages
 make vet         # go vet ./...
 make tidy        # go mod tidy and go mod verify
-make run         # build and run with ./config.yaml
-make clean       # remove the generated binary
+make run         # build and run (menu-bar app on macOS)
+make clean       # remove the generated binary and app bundle
 ```
 
 Tests are hermetic and do not make live provider calls.
@@ -608,25 +829,19 @@ Tests are hermetic and do not make live provider calls.
 octopus/
 ├── cmd/octopus/       Process entry point and HTTP server lifecycle
 ├── config/            YAML schema, loading, defaults, and validation
+├── desktop/           Live router lifecycle and validated reloads
+├── menubar/           Native macOS status-item integration
+├── settings/          Settings API, persistence, and web interface
+├── packaging/         macOS app-bundle metadata
 ├── registry/          Provider construction and provider/model resolution
 ├── router/            Classification, token estimation, scoring, affinity
 ├── anthropicio/       Anthropic request decoder and response encoders
 ├── openaiio/          OpenAI request decoder and response encoders
 ├── server/            HTTP endpoints, fallback, normalization, observation
-├── scripts/           Benchmark utility
+├── scripts/           Build and benchmark utilities
 ├── config.example.yaml
 ├── Makefile
 └── octopus.png
 ```
 
 The shared provider abstraction and implementations live in [`github.com/sausheong/harness`](https://github.com/sausheong/harness). Octopus currently requires harness `v0.3.4`.
-
-## Rename compatibility
-
-The project was previously named `llmrouter`.
-
-- The repository and Go module are now `github.com/sausheong/octopus`.
-- The executable is now `octopus`.
-- The command package is now `./cmd/octopus`.
-- `X-Octopus-Session-ID` replaces `X-LLMRouter-Session-ID`.
-- The legacy session header remains accepted for existing clients.

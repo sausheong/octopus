@@ -15,6 +15,7 @@ import (
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/octopus/anthropicio"
 	"github.com/sausheong/octopus/config"
+	"github.com/sausheong/octopus/insights"
 	"github.com/sausheong/octopus/openaiio"
 	"github.com/sausheong/octopus/registry"
 	"github.com/sausheong/octopus/router"
@@ -25,14 +26,19 @@ const maxRequestBytes = 32 << 20
 
 // Server handles POST /v1/messages, POST /v1/chat/completions, and GET /v1/models.
 type Server struct {
-	rt      *router.Router
-	reg     *registry.Registry
-	catalog []config.CatalogEntry
+	rt            *router.Router
+	reg           *registry.Registry
+	catalog       []config.CatalogEntry
+	usageObserver func(insights.Observation)
 }
 
 // New builds a Server.
-func New(rt *router.Router, reg *registry.Registry, catalog []config.CatalogEntry) *Server {
-	return &Server{rt: rt, reg: reg, catalog: catalog}
+func New(rt *router.Router, reg *registry.Registry, catalog []config.CatalogEntry, observers ...func(insights.Observation)) *Server {
+	server := &Server{rt: rt, reg: reg, catalog: catalog}
+	if len(observers) > 0 {
+		server.usageObserver = observers[0]
+	}
+	return server
 }
 
 // Handler returns the HTTP handler (mux) for the server.
@@ -137,7 +143,7 @@ func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, ch
 		if id != dec.Chosen {
 			slog.Info("using fallback model", "model", id, "original", dec.Chosen)
 		}
-		return s.observeEvents(chat, id, out), id, nil
+		return s.observeEvents(chat, id, dec, out), id, nil
 	}
 	return nil, "", lastErr
 }
@@ -179,7 +185,7 @@ func (s *Server) collectWithFallback(
 			continue
 		}
 
-		out, err := collect(id, s.observeEvents(chat, id, peeked))
+		out, err := collect(id, s.observeEvents(chat, id, dec, peeked))
 		if err != nil {
 			lastErr = err
 			slog.Warn("provider collection failed, trying fallback", "model", id, "err", err)
@@ -194,9 +200,9 @@ func (s *Server) collectWithFallback(
 	return nil, "", lastErr
 }
 
-func (s *Server) observeEvents(chat llm.ChatRequest, model string, in <-chan llm.ChatEvent) <-chan llm.ChatEvent {
+func (s *Server) observeEvents(chat llm.ChatRequest, model string, decision router.Decision, in <-chan llm.ChatEvent) <-chan llm.ChatEvent {
 	// Skip the wrapper goroutine entirely when observation is a no-op.
-	if s.rt == nil || !s.rt.NeedsObservation() {
+	if (s.rt == nil || !s.rt.NeedsObservation()) && s.usageObserver == nil {
 		return in
 	}
 	out := make(chan llm.ChatEvent, 1)
@@ -204,7 +210,14 @@ func (s *Server) observeEvents(chat llm.ChatRequest, model string, in <-chan llm
 		defer close(out)
 		for ev := range in {
 			if ev.Type == llm.EventDone {
-				s.rt.Observe(chat, model, ev.Usage)
+				if s.rt != nil && s.rt.NeedsObservation() {
+					s.rt.Observe(chat, model, ev.Usage)
+				}
+				if s.usageObserver != nil && ev.Usage != nil {
+					s.usageObserver(insights.Observation{
+						Chat: chat, Model: model, Decision: decision, Usage: ev.Usage, Catalog: s.catalog,
+					})
+				}
 			}
 			out <- ev
 		}

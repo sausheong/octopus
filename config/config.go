@@ -17,18 +17,18 @@ import (
 // Weights are the balanced-score knobs. They need not sum to 1; the scorer
 // normalizes. All must be >= 0.
 type Weights struct {
-	Quality float64 `yaml:"quality"`
-	Cost    float64 `yaml:"cost"`
-	Speed   float64 `yaml:"speed"`
+	Quality float64 `yaml:"quality" json:"quality"`
+	Cost    float64 `yaml:"cost" json:"cost"`
+	Speed   float64 `yaml:"speed" json:"speed"`
 }
 
 // Caps describe model capabilities. Tools, vision, and context are hard
 // constraints; reasoning support is a scoring preference.
 type Caps struct {
-	Tools      bool `yaml:"tools"`
-	Vision     bool `yaml:"vision"`
-	Reasoning  bool `yaml:"reasoning"`
-	MaxContext int  `yaml:"max_context"`
+	Tools      bool `yaml:"tools" json:"tools"`
+	Vision     bool `yaml:"vision" json:"vision"`
+	Reasoning  bool `yaml:"reasoning" json:"reasoning"`
+	MaxContext int  `yaml:"max_context" json:"max_context"`
 }
 
 // CatalogEntry is one candidate model. ID is "provider/model".
@@ -104,16 +104,18 @@ type yamlConfig struct {
 	Server struct {
 		Addr string `yaml:"addr"`
 	} `yaml:"server"`
-	Classifier ClassifierCfg `yaml:"classifier"`
-	Weights    Weights       `yaml:"weights"`
-	Routing    struct {
-		SessionSticky *bool         `yaml:"session_sticky"`
-		SessionTTL    time.Duration `yaml:"session_ttl"`
-		CacheAware    *bool         `yaml:"cache_aware"`
-	} `yaml:"routing"`
+	Classifier   ClassifierCfg            `yaml:"classifier"`
+	Weights      Weights                  `yaml:"weights"`
+	Routing      yamlRoutingCfg           `yaml:"routing"`
 	DefaultModel string                   `yaml:"default_model"`
 	Providers    map[string]ProviderCreds `yaml:"providers"`
 	Catalog      []CatalogEntry           `yaml:"catalog"`
+}
+
+type yamlRoutingCfg struct {
+	SessionSticky *bool         `yaml:"session_sticky"`
+	SessionTTL    time.Duration `yaml:"session_ttl"`
+	CacheAware    *bool         `yaml:"cache_aware"`
 }
 
 // Load reads, parses, and validates the config at path.
@@ -122,6 +124,11 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+	return Parse(data)
+}
+
+// Parse decodes and validates an Octopus YAML configuration.
+func Parse(data []byte) (*Config, error) {
 	var yc yamlConfig
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true)
@@ -156,6 +163,33 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// Marshal validates and encodes a Config using Octopus's nested YAML shape.
+func Marshal(c *Config) ([]byte, error) {
+	if c == nil {
+		return nil, fmt.Errorf("config is required")
+	}
+	copyCfg := *c
+	if err := copyCfg.Validate(); err != nil {
+		return nil, err
+	}
+	sticky := copyCfg.Routing.SessionSticky
+	cacheAware := copyCfg.Routing.CacheAware
+	yc := yamlConfig{
+		Classifier:   copyCfg.Classifier,
+		Weights:      copyCfg.Weights,
+		Routing:      yamlRoutingCfg{SessionSticky: &sticky, SessionTTL: copyCfg.Routing.SessionTTL, CacheAware: &cacheAware},
+		DefaultModel: copyCfg.DefaultModel,
+		Providers:    copyCfg.Providers,
+		Catalog:      copyCfg.Catalog,
+	}
+	yc.Server.Addr = copyCfg.ServerAddr
+	data, err := yaml.Marshal(&yc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	return data, nil
 }
 
 // providerOf returns the provider half of a "provider/model" id, and whether

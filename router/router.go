@@ -19,8 +19,8 @@ import (
 type Router struct {
 	cfg *config.Config
 	reg *registry.Registry
-	// classifyFn is the classification seam; defaults to Classify. Tests
-	// override it to avoid real provider calls.
+	// classifyFn is the classification seam. Nil uses classifyWithUsage;
+	// tests override it to avoid real provider calls.
 	classifyFn func(ctx context.Context, prov llm.LLMProvider, model string, maxTokens int, turn llm.Message) TaskProfile
 	sessionsMu sync.Mutex
 	sessions   map[string]sessionState
@@ -52,7 +52,6 @@ func NewRouter(cfg *config.Config, reg *registry.Registry) *Router {
 	return &Router{
 		cfg:           cfg,
 		reg:           reg,
-		classifyFn:    Classify,
 		sessions:      make(map[string]sessionState),
 		cachingModels: caching,
 	}
@@ -68,6 +67,7 @@ const shortCircuitBytes = 500
 func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 	turn, ok := LastUserTurn(chat.Messages)
 	var prof TaskProfile
+	var classifierUsage *llm.Usage
 	if !ok {
 		prof = DefaultProfile()
 	} else if isTrivial(chat, turn) {
@@ -85,7 +85,12 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 				cctx, cancel = context.WithTimeout(ctx, r.cfg.Classifier.Timeout)
 				defer cancel()
 			}
-			prof = r.classifyFn(cctx, prov, model, r.cfg.Classifier.MaxTokens, classificationTurn(chat, turn))
+			classifierTurn := classificationTurn(chat, turn)
+			if r.classifyFn != nil {
+				prof = r.classifyFn(cctx, prov, model, r.cfg.Classifier.MaxTokens, classifierTurn)
+			} else {
+				prof, classifierUsage = classifyWithUsage(cctx, prov, model, r.cfg.Classifier.MaxTokens, classifierTurn)
+			}
 		}
 	}
 
@@ -123,6 +128,8 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 	}
 	multipliers := r.cacheInputMultipliersForSession(chat, sid)
 	d := ScoreWithInputMultipliers(prof, r.cfg.Catalog, r.cfg.Weights, multipliers)
+	d.ClassifierModel = r.cfg.Classifier.Model
+	d.ClassifierUsage = classifierUsage
 	if sticky := r.stickyModelForSession(sid); sticky != "" {
 		for _, id := range d.Eligible {
 			if id == sticky {
@@ -150,9 +157,9 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 }
 
 const (
-	cacheReadInputMultiplier       = 0.10
-	cacheWrite5mInputMultiplier    = 1.25
-	cacheWrite1HourInputMultiplier = 2.00
+	CacheReadInputMultiplier       = 0.10
+	CacheWrite5mInputMultiplier    = 1.25
+	CacheWrite1HourInputMultiplier = 2.00
 )
 
 // SessionID returns an explicit client session ID, or a deterministic fallback
@@ -198,7 +205,7 @@ func (r *Router) stickyModelForSession(sid string) string {
 }
 
 func (r *Router) cacheInputMultipliersForSession(chat llm.ChatRequest, sid string) map[string]float64 {
-	ttl := cacheTTL(chat)
+	ttl := CacheTTL(chat)
 	if !r.cfg.Routing.CacheAware || ttl == 0 || sid == "" {
 		return nil
 	}
@@ -212,16 +219,16 @@ func (r *Router) cacheInputMultipliersForSession(chat llm.ChatRequest, sid strin
 		if !r.cachingModels[entry.ID] {
 			continue
 		}
-		multipliers[entry.ID] = cacheWrite5mInputMultiplier
+		multipliers[entry.ID] = CacheWrite5mInputMultiplier
 		if ttl == time.Hour {
-			multipliers[entry.ID] = cacheWrite1HourInputMultiplier
+			multipliers[entry.ID] = CacheWrite1HourInputMultiplier
 		}
 		if state.Model == entry.ID && state.CacheUntil.After(now) {
 			fraction := state.CacheFraction
 			if fraction <= 0 || fraction > 1 {
 				fraction = 1
 			}
-			multipliers[entry.ID] = 1 - fraction + fraction*cacheReadInputMultiplier
+			multipliers[entry.ID] = 1 - fraction + fraction*CacheReadInputMultiplier
 		}
 	}
 	return multipliers
@@ -248,7 +255,7 @@ func (r *Router) Observe(chat llm.ChatRequest, model string, usage *llm.Usage) {
 		state.CacheFraction = previous.CacheFraction
 	}
 	if usage != nil && (usage.CacheCreationInputTokens > 0 || usage.CacheReadInputTokens > 0) {
-		if cacheDuration := cacheTTL(chat); cacheDuration > 0 {
+		if cacheDuration := CacheTTL(chat); cacheDuration > 0 {
 			state.CacheUntil = now.Add(cacheDuration)
 			cached := usage.CacheCreationInputTokens + usage.CacheReadInputTokens
 			total := cached + usage.InputTokens
@@ -281,7 +288,7 @@ func (r *Router) Observe(chat llm.ChatRequest, model string, usage *llm.Usage) {
 	}
 }
 
-func cacheTTL(chat llm.ChatRequest) time.Duration {
+func CacheTTL(chat llm.ChatRequest) time.Duration {
 	var controls []*llm.CacheControl
 	controls = append(controls, chat.CacheControl)
 	for _, part := range chat.SystemPromptParts {

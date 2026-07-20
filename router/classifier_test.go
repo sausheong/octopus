@@ -11,6 +11,7 @@ import (
 type fakeProvider struct {
 	text    string
 	failNew bool
+	usage   *llm.Usage
 }
 
 func (f *fakeProvider) Models() []llm.ModelInfo { return nil }
@@ -23,9 +24,21 @@ func (f *fakeProvider) ChatStream(ctx context.Context, req llm.ChatRequest) (<-c
 	}
 	ch := make(chan llm.ChatEvent, 2)
 	ch <- llm.ChatEvent{Type: llm.EventTextDelta, Text: f.text}
-	ch <- llm.ChatEvent{Type: llm.EventDone}
+	ch <- llm.ChatEvent{Type: llm.EventDone, Usage: f.usage}
 	close(ch)
 	return ch, nil
+}
+
+func TestClassifyWithUsageReturnsClassifierOverhead(t *testing.T) {
+	want := &llm.Usage{InputTokens: 120, OutputTokens: 18}
+	p := &fakeProvider{
+		text:  `{"difficulty":"low","needs_reasoning":false,"needs_vision":false,"needs_tools":false,"est_tokens_in":50,"est_tokens_out":100,"domain":"qa"}`,
+		usage: want,
+	}
+	profile, got := classifyWithUsage(context.Background(), p, "m", 256, llm.Message{Role: "user", Content: "hi"})
+	if profile.Difficulty != "low" || got != want {
+		t.Fatalf("profile=%+v usage=%+v", profile, got)
+	}
 }
 
 type errString2 string

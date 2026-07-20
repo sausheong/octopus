@@ -24,6 +24,10 @@ type Decision struct {
 	Reason     string
 	Reasoning  llm.ReasoningMode // recommended mode when an attempted candidate supports reasoning
 	NoEligible bool              // true when no catalog model passed the capability filter
+	// ClassifierModel and ClassifierUsage let Insights include routing overhead
+	// in request economics. They are empty when classification was skipped.
+	ClassifierModel string
+	ClassifierUsage *llm.Usage
 }
 
 // eligible applies the hard capability filter: a model survives only if it

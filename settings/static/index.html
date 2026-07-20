@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Octopus Settings</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Settings sections">
+      <div class="identity">
+        <div class="app-icon" aria-hidden="true">
+          <img src="/assets/octopus.png" alt="">
+        </div>
+        <div>
+          <strong>Octopus</strong>
+          <span>Settings</span>
+        </div>
+      </div>
+
+      <nav class="nav-list">
+        <button class="nav-item is-active" type="button" data-section="general" aria-current="page">
+          <span class="nav-symbol" aria-hidden="true">⚙︎</span> General
+        </button>
+        <button class="nav-item" type="button" data-section="providers">
+          <span class="nav-symbol" aria-hidden="true">⌁</span> Providers
+        </button>
+        <button class="nav-item" type="button" data-section="models">
+          <span class="nav-symbol" aria-hidden="true">◫</span> Models
+        </button>
+        <button class="nav-item" type="button" data-section="yaml">
+          <span class="nav-symbol" aria-hidden="true">⌘</span> Advanced YAML
+        </button>
+        <button class="nav-item" type="button" data-section="insights">
+          <span class="nav-symbol" aria-hidden="true">◷</span> Insights
+        </button>
+      </nav>
+
+      <div class="runtime-status" id="runtime-status" aria-live="polite">
+        <span class="status-dot"></span>
+        <span class="status-copy">Checking router…</span>
+      </div>
+      <div class="app-version" id="app-version">Version…</div>
+    </aside>
+
+    <main class="content">
+      <div class="content-scroll">
+        <header class="page-header">
+          <div>
+            <h1 id="page-title">General</h1>
+            <p id="page-description">Server, routing, and classifier behavior.</p>
+          </div>
+          <span class="file-state" id="file-state">Loading…</span>
+        </header>
+
+        <div class="notice is-hidden" id="notice" role="status" aria-live="polite"></div>
+
+        <form id="settings-form">
+          <section class="settings-page" data-page="insights" aria-labelledby="page-title">
+            <div class="insights-toolbar">
+              <p>Calculated from completed requests and the prices in your model catalog.</p>
+              <label for="insights-range"><span>Time range</span>
+                <select id="insights-range">
+                  <option value="7">Last 7 days</option>
+                  <option value="30" selected>Last 30 days</option>
+                  <option value="90">Last 90 days</option>
+                  <option value="365">Last year</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="empty-state is-hidden" id="insights-empty">
+              <strong>No completed requests in this range</strong>
+              <span>Insights will appear after Octopus receives provider-reported token usage.</span>
+            </div>
+
+            <div id="insights-content" class="is-hidden">
+              <div class="insights-caveat is-hidden" id="insights-pricing-note" role="status"></div>
+              <section class="insights-ledger" aria-label="Usage and savings summary">
+                <div class="insight-figure is-primary">
+                  <span>Net savings</span>
+                  <strong id="insight-net-savings">$0.00</strong>
+                  <small id="insight-savings-percent">0% of baseline</small>
+                </div>
+                <div class="insight-figure">
+                  <span>Actual cost</span>
+                  <strong id="insight-actual-cost">$0.00</strong>
+                  <small>Cache-adjusted plus classifier</small>
+                </div>
+                <div class="insight-figure">
+                  <span>Baseline cost</span>
+                  <strong id="insight-baseline-cost">$0.00</strong>
+                  <small>Highest-quality eligible model</small>
+                </div>
+                <div class="insight-figure">
+                  <span>Requests</span>
+                  <strong id="insight-requests">0</strong>
+                  <small id="insight-token-count">0 tokens</small>
+                </div>
+              </section>
+
+              <section class="group insights-chart-group" aria-labelledby="savings-over-time-title">
+                <div class="group-heading chart-heading">
+                  <div>
+                    <h2 id="savings-over-time-title">Savings over time</h2>
+                    <p>Cumulative actual cost and net savings.</p>
+                  </div>
+                  <div class="chart-legend" aria-hidden="true">
+                    <span><i class="legend-savings"></i>Savings</span>
+                    <span><i class="legend-cost"></i>Actual cost</span>
+                  </div>
+                </div>
+                <div class="chart-wrap" id="insights-chart"></div>
+                <div class="chart-axis"><span id="chart-start-date"></span><span id="chart-end-date"></span></div>
+              </section>
+
+              <section class="group savings-detail" aria-labelledby="savings-detail-title">
+                <div class="group-heading">
+                  <h2 id="savings-detail-title">What contributed</h2>
+                  <p>Routing and cache benefits, less the cost of classification.</p>
+                </div>
+                <div class="savings-row"><span>Model routing</span><strong id="insight-routing-savings">$0.00</strong></div>
+                <div class="savings-row"><span>Prompt caching</span><strong id="insight-cache-savings">$0.00</strong></div>
+                <div class="savings-row"><span>Classifier overhead</span><strong id="insight-classifier-cost">$0.00</strong></div>
+                <div class="savings-row"><span>Cache hit rate</span><strong id="insight-cache-hit">0%</strong></div>
+              </section>
+
+              <section class="group model-usage" aria-labelledby="model-usage-title">
+                <div class="group-heading">
+                  <h2 id="model-usage-title">Model usage</h2>
+                  <p>Completed requests attributed to the model that served them.</p>
+                </div>
+                <div class="table-scroll">
+                  <table>
+                    <thead><tr><th>Model</th><th>Requests</th><th>Tokens</th><th>Cost</th></tr></thead>
+                    <tbody id="insights-models"></tbody>
+                  </table>
+                </div>
+              </section>
+
+              <details class="methodology">
+                <summary>How savings are calculated</summary>
+                <p id="insights-methodology"></p>
+                <p>Routing savings compare uncached costs. Cache savings compare the chosen model’s uncached and measured cache-adjusted costs. Classifier usage is subtracted as overhead. Figures are estimates based on configured catalog prices and provider-reported tokens.</p>
+                <p>Only daily totals and per-model aggregates are stored in <code>~/.octopus/insights.json</code>. Prompts, responses, session identifiers, and credentials are never recorded.</p>
+              </details>
+            </div>
+          </section>
+
+          <section class="settings-page is-active" data-page="general" aria-labelledby="page-title">
+            <div class="group">
+              <div class="group-heading">
+                <h2>Server</h2>
+                <p>The local address used by Claude Code and other clients.</p>
+              </div>
+              <label class="setting-row" for="server-address">
+                <span><strong>Listen address</strong><small>Loopback addresses only</small></span>
+                <input id="server-address" name="server-address" required autocomplete="off" placeholder="127.0.0.1:8787">
+              </label>
+            </div>
+
+            <div class="group">
+              <div class="group-heading">
+                <h2>Routing</h2>
+                <p>Balance model quality, cost, and responsiveness.</p>
+              </div>
+              <label class="setting-row compact" for="weight-quality">
+                <span><strong>Quality weight</strong></span>
+                <input id="weight-quality" type="number" min="0" step="0.05" required>
+              </label>
+              <label class="setting-row compact" for="weight-cost">
+                <span><strong>Cost weight</strong></span>
+                <input id="weight-cost" type="number" min="0" step="0.05" required>
+              </label>
+              <label class="setting-row compact" for="weight-speed">
+                <span><strong>Speed weight</strong></span>
+                <input id="weight-speed" type="number" min="0" step="0.05" required>
+              </label>
+              <label class="setting-row" for="session-sticky">
+                <span><strong>Sticky sessions</strong><small>Keep conversations on the backend that owns their cache</small></span>
+                <input class="switch" id="session-sticky" type="checkbox">
+              </label>
+              <label class="setting-row compact" for="session-ttl">
+                <span><strong>Session lifetime</strong><small>Go duration, such as 30m or 1h</small></span>
+                <input id="session-ttl" required autocomplete="off" placeholder="1h">
+              </label>
+              <label class="setting-row" for="cache-aware">
+                <span><strong>Cache-aware scoring</strong><small>Price expected prompt cache reads and writes</small></span>
+                <input class="switch" id="cache-aware" type="checkbox">
+              </label>
+            </div>
+
+            <div class="group">
+              <div class="group-heading">
+                <h2>Classifier</h2>
+                <p>Use a small model to classify nontrivial requests before routing.</p>
+              </div>
+              <label class="setting-row" for="classifier-enabled">
+                <span><strong>Enable classifier</strong><small>Short, simple requests still skip this call</small></span>
+                <input class="switch" id="classifier-enabled" type="checkbox">
+              </label>
+              <div id="classifier-fields">
+                <label class="setting-row" for="classifier-model">
+                  <span><strong>Classifier model</strong><small>provider/model</small></span>
+                  <input id="classifier-model" autocomplete="off" placeholder="anthropic/claude-haiku">
+                </label>
+                <label class="setting-row compact" for="classifier-tokens">
+                  <span><strong>Maximum output tokens</strong></span>
+                  <input id="classifier-tokens" type="number" min="1" step="1">
+                </label>
+                <label class="setting-row compact" for="classifier-timeout">
+                  <span><strong>Timeout</strong><small>Go duration</small></span>
+                  <input id="classifier-timeout" autocomplete="off" placeholder="10s">
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-page" data-page="providers" aria-labelledby="page-title">
+            <div class="section-intro">
+              <p>Provider names become the prefix of model IDs. Prefer environment variables for credentials.</p>
+              <button class="button secondary" id="add-provider" type="button">Add Provider</button>
+            </div>
+            <div class="repeat-list" id="providers-list"></div>
+            <div class="empty-state is-hidden" id="providers-empty">
+              <strong>No providers configured</strong>
+              <span>Add a cloud provider or local inference server.</span>
+            </div>
+          </section>
+
+          <section class="settings-page" data-page="models" aria-labelledby="page-title">
+            <div class="section-intro">
+              <p>Catalog scores are relative. Prices are USD per million tokens.</p>
+              <button class="button secondary" id="add-model" type="button">Add Model</button>
+            </div>
+            <div class="repeat-list" id="models-list"></div>
+            <div class="empty-state is-hidden" id="models-empty">
+              <strong>No models in the catalog</strong>
+              <span>Add at least one model before saving.</span>
+            </div>
+          </section>
+
+          <section class="settings-page" data-page="yaml" aria-labelledby="page-title">
+            <div class="yaml-heading">
+              <div>
+                <h2>Configuration source</h2>
+                <p>This is the complete file. Saving validates it before replacing the current configuration.</p>
+              </div>
+              <code id="config-path">~/.octopus/config.yaml</code>
+            </div>
+            <label class="sr-only" for="yaml-editor">Octopus YAML configuration</label>
+            <textarea id="yaml-editor" class="yaml-editor" spellcheck="false" autocomplete="off"></textarea>
+          </section>
+        </form>
+      </div>
+
+      <footer class="save-bar">
+        <span id="save-hint">Changes reload the router immediately.</span>
+        <button class="button primary" id="save-button" type="button">Save &amp; Reload</button>
+      </footer>
+    </main>
+  </div>
+
+  <template id="provider-template">
+    <fieldset class="repeat-item provider-item">
+      <legend>Provider</legend>
+      <div class="item-heading">
+        <strong class="item-title">New provider</strong>
+        <button class="icon-button remove-item" type="button" aria-label="Remove provider">Remove</button>
+      </div>
+      <div class="field-grid two">
+        <label><span>Name</span><input data-field="name" required autocomplete="off" placeholder="anthropic"></label>
+        <label><span>Kind</span><select data-field="kind"><option value="anthropic">Anthropic</option><option value="openai">OpenAI compatible</option><option value="gemini">Gemini</option><option value="qwen">Qwen</option></select></label>
+        <label><span>API key environment</span><input data-field="api_key_env" autocomplete="off" placeholder="ANTHROPIC_API_KEY"></label>
+        <label><span>Base URL</span><input data-field="base_url" type="url" autocomplete="off" placeholder="https://api.example.com"></label>
+      </div>
+      <label class="full-field"><span>Inline API key <small>Stored in the local file</small></span><input data-field="api_key" type="password" autocomplete="new-password"></label>
+    </fieldset>
+  </template>
+
+  <template id="model-template">
+    <fieldset class="repeat-item model-item">
+      <legend>Model</legend>
+      <div class="item-heading">
+        <strong class="item-title">New model</strong>
+        <button class="icon-button remove-item" type="button" aria-label="Remove model">Remove</button>
+      </div>
+      <label class="full-field"><span>Model ID <small>provider/model</small></span><input data-field="id" required autocomplete="off" placeholder="anthropic/claude-sonnet"></label>
+      <div class="field-grid four">
+        <label><span>Quality</span><input data-field="quality" type="number" min="0" max="1" step="0.01" required></label>
+        <label><span>Speed</span><input data-field="speed" type="number" min="0" max="1" step="0.01" required></label>
+        <label><span>Input $/MTok</span><input data-field="cost_per_mtok_in" type="number" min="0" step="0.01" required></label>
+        <label><span>Output $/MTok</span><input data-field="cost_per_mtok_out" type="number" min="0" step="0.01" required></label>
+      </div>
+      <div class="capability-row">
+        <label><input data-field="tools" type="checkbox"> Tools</label>
+        <label><input data-field="vision" type="checkbox"> Vision</label>
+        <label><input data-field="reasoning" type="checkbox"> Reasoning</label>
+        <label class="context-field"><span>Context</span><input data-field="max_context" type="number" min="1" step="1" required></label>
+      </div>
+    </fieldset>
+  </template>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

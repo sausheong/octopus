@@ -12,6 +12,7 @@ import (
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/octopus/config"
+	"github.com/sausheong/octopus/insights"
 	"github.com/sausheong/octopus/registry"
 	"github.com/sausheong/octopus/router"
 )
@@ -128,6 +129,22 @@ func TestPrepareAttemptOnlyEnablesSupportedReasoning(t *testing.T) {
 	_, ordinary, err := s.prepareAttempt("p/ordinary", llm.ChatRequest{}, dec)
 	if err != nil || ordinary.Reasoning != llm.ReasoningOff {
 		t.Fatalf("ordinary attempt reasoning=%q err=%v", ordinary.Reasoning, err)
+	}
+}
+
+func TestObserveEventsReportsCompletedUsageToInsights(t *testing.T) {
+	var observed insights.Observation
+	s := New(nil, nil, []config.CatalogEntry{{ID: "local/model"}}, func(value insights.Observation) {
+		observed = value
+	})
+	usage := &llm.Usage{InputTokens: 12, OutputTokens: 4}
+	in := make(chan llm.ChatEvent, 1)
+	in <- llm.ChatEvent{Type: llm.EventDone, Usage: usage}
+	close(in)
+	for range s.observeEvents(llm.ChatRequest{}, "local/model", router.Decision{Chosen: "local/model"}, in) {
+	}
+	if observed.Model != "local/model" || observed.Usage != usage || len(observed.Catalog) != 1 {
+		t.Fatalf("observation = %+v", observed)
 	}
 }
 

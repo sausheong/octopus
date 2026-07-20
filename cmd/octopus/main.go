@@ -1,3 +1,5 @@
+//go:build !darwin
+
 // Command octopus runs the Anthropic- and OpenAI-compatible LLM routing server.
 package main
 

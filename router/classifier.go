@@ -24,6 +24,11 @@ Respond with the JSON object only.`
 // unparseable JSON) yields DefaultProfile() — a classifier hiccup must never
 // break routing, only make it conservative.
 func Classify(ctx context.Context, prov llm.LLMProvider, model string, maxTokens int, turn llm.Message) TaskProfile {
+	profile, _ := classifyWithUsage(ctx, prov, model, maxTokens, turn)
+	return profile
+}
+
+func classifyWithUsage(ctx context.Context, prov llm.LLMProvider, model string, maxTokens int, turn llm.Message) (TaskProfile, *llm.Usage) {
 	req := llm.ChatRequest{
 		Model:        model,
 		MaxTokens:    maxTokens,
@@ -32,22 +37,25 @@ func Classify(ctx context.Context, prov llm.LLMProvider, model string, maxTokens
 	}
 	ch, err := prov.ChatStream(ctx, req)
 	if err != nil {
-		return DefaultProfile()
+		return DefaultProfile(), nil
 	}
 	var sb strings.Builder
+	var usage *llm.Usage
 	for ev := range ch {
 		switch ev.Type {
 		case llm.EventTextDelta:
 			sb.WriteString(ev.Text)
+		case llm.EventDone:
+			usage = ev.Usage
 		case llm.EventError:
-			return DefaultProfile()
+			return DefaultProfile(), usage
 		}
 	}
 	prof, ok := parseProfile(sb.String())
 	if !ok {
-		return DefaultProfile()
+		return DefaultProfile(), usage
 	}
-	return prof
+	return prof, usage
 }
 
 // rawProfile is the wire type for classifier JSON — pointer fields let us

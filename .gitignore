@@ -15,3 +15,5 @@ go.work.sum
 # Local build artifacts.
 /octopus
 /llmrouter
+/dist/
+.DS_Store

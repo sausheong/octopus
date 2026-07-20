@@ -1,11 +1,37 @@
 package config
 
 import (
+	"bytes"
 	"math"
 	"os"
 	"testing"
 	"time"
 )
+
+func TestMarshalRoundTrip(t *testing.T) {
+	original := baseValid()
+	original.Routing = RoutingCfg{SessionSticky: true, SessionTTL: 45 * time.Minute, CacheAware: false}
+	data, err := Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Contains(data, []byte("session_ttl: 45m0s")) {
+		t.Fatalf("marshaled YAML missing duration: %s", data)
+	}
+	decoded, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse marshaled config: %v\n%s", err, data)
+	}
+	if decoded.ServerAddr != original.ServerAddr || decoded.Routing != original.Routing || len(decoded.Catalog) != 1 {
+		t.Fatalf("round trip mismatch: %#v", decoded)
+	}
+}
+
+func TestParseRejectsUnknownField(t *testing.T) {
+	if _, err := Parse([]byte("unknown: true\n")); err == nil {
+		t.Fatal("expected unknown field to fail")
+	}
+}
 
 func TestLoadValid(t *testing.T) {
 	c, err := Load("testdata/valid.yaml")

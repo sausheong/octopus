@@ -10,16 +10,16 @@ Measures:
   - Total latency for buffered requests
   - Tokens/second for streaming requests
   - Routing overhead (router total - direct provider total)
+  - Which model the router chose per prompt and how often
 """
 
 import argparse
 import json
 import statistics
-import sys
 import time
 import threading
 import urllib.request
-import urllib.error
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -50,15 +50,17 @@ DIRECT_MODEL   = "deepseek-chat"   # DeepSeek's current V3 model alias
 @dataclass
 class Sample:
     prompt_label: str
-    ttft_ms: Optional[float]       # time to first content token (streaming only)
+    ttft_ms: Optional[float]        # time to first content token (streaming only)
     total_ms: float
     tokens_out: int
     tokens_per_sec: Optional[float]
+    routed_model: Optional[str] = None  # model reported in the response body
     error: Optional[str] = None
 
 @dataclass
 class Result:
     label: str
+    is_router: bool = False
     samples: list[Sample] = field(default_factory=list)
 
     def good(self):
@@ -79,8 +81,9 @@ def _headers(api_key: str) -> dict:
         "Authorization": f"Bearer {api_key}",
     }
 
-def call_buffered(base: str, api_key: str, model: str, prompt: str) -> tuple[float, int, Optional[str]]:
-    """POST /v1/chat/completions (non-streaming). Returns (ms, output_tokens, error)."""
+def call_buffered(base: str, api_key: str, model: str, prompt: str
+                  ) -> tuple[float, int, Optional[str], Optional[str]]:
+    """Returns (ms, output_tokens, routed_model, error)."""
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -97,13 +100,15 @@ def call_buffered(base: str, api_key: str, model: str, prompt: str) -> tuple[flo
             body = json.loads(resp.read())
         ms = (time.perf_counter() - t0) * 1000
         tokens = body.get("usage", {}).get("completion_tokens", 0)
-        return ms, tokens, None
+        routed = body.get("model")
+        return ms, tokens, routed, None
     except Exception as e:
         ms = (time.perf_counter() - t0) * 1000
-        return ms, 0, str(e)
+        return ms, 0, None, str(e)
 
-def call_streaming(base: str, api_key: str, model: str, prompt: str) -> tuple[Optional[float], float, int, Optional[str]]:
-    """POST /v1/chat/completions (streaming). Returns (ttft_ms, total_ms, tokens, error)."""
+def call_streaming(base: str, api_key: str, model: str, prompt: str
+                   ) -> tuple[Optional[float], float, int, Optional[str], Optional[str]]:
+    """Returns (ttft_ms, total_ms, tokens, routed_model, error)."""
     payload = json.dumps({
         "model": model,
         "stream": True,
@@ -118,6 +123,7 @@ def call_streaming(base: str, api_key: str, model: str, prompt: str) -> tuple[Op
     t0 = time.perf_counter()
     ttft = None
     tokens = 0
+    routed = None
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             for raw_line in resp:
@@ -131,42 +137,46 @@ def call_streaming(base: str, api_key: str, model: str, prompt: str) -> tuple[Op
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if routed is None:
+                    routed = chunk.get("model")
                 delta = chunk.get("choices", [{}])[0].get("delta", {})
                 content = delta.get("content", "")
                 if content and ttft is None:
                     ttft = (time.perf_counter() - t0) * 1000
                 if content:
-                    # rough token estimate: split on spaces
                     tokens += max(1, len(content.split()))
         total_ms = (time.perf_counter() - t0) * 1000
-        return ttft, total_ms, tokens, None
+        return ttft, total_ms, tokens, routed, None
     except Exception as e:
         total_ms = (time.perf_counter() - t0) * 1000
-        return ttft, total_ms, tokens, str(e)
+        return ttft, total_ms, tokens, routed, str(e)
 
 # ── benchmark runners ─────────────────────────────────────────────────────────
 
-def run_one(label: str, base: str, api_key: str, model: str,
+def run_one(base: str, api_key: str, model: str,
             prompt_label: str, prompt: str, streaming: bool) -> Sample:
     if streaming:
-        ttft, total, tokens, err = call_streaming(base, api_key, model, prompt)
+        ttft, total, tokens, routed, err = call_streaming(base, api_key, model, prompt)
         tps = (tokens / (total / 1000)) if (total > 0 and tokens > 0 and not err) else None
-        return Sample(prompt_label, ttft, total, tokens, tps, err)
+        return Sample(prompt_label, ttft, total, tokens, tps, routed, err)
     else:
-        total, tokens, err = call_buffered(base, api_key, model, prompt)
-        return Sample(prompt_label, None, total, tokens, None, err)
+        total, tokens, routed, err = call_buffered(base, api_key, model, prompt)
+        return Sample(prompt_label, None, total, tokens, None, routed, err)
 
 def run_benchmark(label: str, base: str, api_key: str, model: str,
-                  runs: int, concurrency: int, streaming: bool) -> Result:
-    result = Result(label)
+                  runs: int, concurrency: int, streaming: bool,
+                  is_router: bool = False) -> Result:
+    result = Result(label, is_router)
     lock = threading.Lock()
     tasks = [(pl, p) for pl, p in PROMPTS for _ in range(runs)]
 
     def worker(prompt_label, prompt):
-        s = run_one(label, base, api_key, model, prompt_label, prompt, streaming)
+        s = run_one(base, api_key, model, prompt_label, prompt, streaming)
         with lock:
             result.samples.append(s)
-            status = f"{'✓' if not s.error else '✗'} {label:30s} [{prompt_label:7s}] {s.total_ms:6.0f}ms"
+            routed_info = f"  → {s.routed_model}" if s.routed_model and is_router else ""
+            status = (f"{'✓' if not s.error else '✗'} {label:30s} "
+                      f"[{prompt_label:7s}] {s.total_ms:6.0f}ms{routed_info}")
             if s.ttft_ms:
                 status += f"  ttft={s.ttft_ms:.0f}ms"
             if s.error:
@@ -190,15 +200,16 @@ def run_benchmark(label: str, base: str, api_key: str, model: str,
 
 def report(results: list[Result], streaming: bool, output: Optional[str]):
     lines = []
-    lines.append("\n" + "═" * 72)
+    lines.append("\n" + "═" * 76)
     lines.append(f"  BENCHMARK RESULTS  ({'streaming' if streaming else 'buffered'})")
-    lines.append("═" * 72)
+    lines.append("═" * 76)
 
     for r in results:
         good = r.good()
         errors = len(r.samples) - len(good)
         lines.append(f"\n── {r.label} ({'streaming' if streaming else 'buffered'}) ──")
-        lines.append(f"  Samples: {len(good)} ok, {errors} errors")
+        lines.append(f"  Samples: {len(good)} ok, {errors} errors  "
+                     f"({len(PROMPTS)} prompts × {len(good)//max(len(PROMPTS),1)} runs)")
 
         total_ms = [s.total_ms for s in good]
         lines.append(f"  Total latency (ms):   {r.stat(total_ms)}")
@@ -209,23 +220,43 @@ def report(results: list[Result], streaming: bool, output: Optional[str]):
             lines.append(f"  TTFT (ms):            {r.stat(ttft_ms)}")
             lines.append(f"  Throughput (tok/s):   {r.stat(tps, '.1f')}")
 
+        # Per-prompt breakdown with model chosen
         by_prompt = {}
         for s in good:
-            by_prompt.setdefault(s.prompt_label, []).append(s.total_ms)
-        lines.append("  Per-prompt p50 (ms):")
-        for pl, vals in sorted(by_prompt.items()):
-            lines.append(f"    {pl:10s}: {statistics.median(vals):.0f}ms  (n={len(vals)})")
+            by_prompt.setdefault(s.prompt_label, []).append(s)
+        lines.append("  Per-prompt breakdown:")
+        for pl, samples in sorted(by_prompt.items()):
+            ms_vals = [s.total_ms for s in samples]
+            model_counts = Counter(s.routed_model for s in samples if s.routed_model)
+            model_str = "  ".join(f"{m} ×{n}" for m, n in model_counts.most_common())
+            lines.append(f"    {pl:10s}: p50={statistics.median(ms_vals):.0f}ms  "
+                         f"n={len(samples)}  {model_str}")
 
+        # Overall model usage for router results
+        if r.is_router:
+            model_counts = Counter(s.routed_model for s in good if s.routed_model)
+            if model_counts:
+                lines.append("  Model selection (all prompts):")
+                total = sum(model_counts.values())
+                for m, n in model_counts.most_common():
+                    pct = n / total * 100
+                    lines.append(f"    {m}  ×{n}  ({pct:.0f}%)")
+
+    # Overhead comparison
     if len(results) == 2:
         r0, r1 = results
-        g0 = {s.prompt_label: s.total_ms for s in r0.good()}
-        g1 = {s.prompt_label: s.total_ms for s in r1.good()}
-        common = set(g0) & set(g1)
+        by_prompt0 = {}
+        for s in r0.good():
+            by_prompt0.setdefault(s.prompt_label, []).append(s.total_ms)
+        by_prompt1 = {}
+        for s in r1.good():
+            by_prompt1.setdefault(s.prompt_label, []).append(s.total_ms)
+        common = set(by_prompt0) & set(by_prompt1)
         if common:
             lines.append(f"\n── Routing overhead: {r1.label} vs {r0.label} ──")
             overheads = []
             for pl in sorted(common):
-                overhead = g1[pl] - g0[pl]
+                overhead = statistics.median(by_prompt1[pl]) - statistics.median(by_prompt0[pl])
                 overheads.append(overhead)
                 sign = "+" if overhead >= 0 else ""
                 lines.append(f"  {pl:10s}: {sign}{overhead:.0f}ms")
@@ -233,7 +264,7 @@ def report(results: list[Result], streaming: bool, output: Optional[str]):
             sign = "+" if avg >= 0 else ""
             lines.append(f"  Average:    {sign}{avg:.0f}ms")
 
-    lines.append("\n" + "═" * 72)
+    lines.append("\n" + "═" * 76)
     text = "\n".join(lines)
     print(text)
     if output:
@@ -271,6 +302,7 @@ def main():
             runs=args.runs,
             concurrency=args.concurrency,
             streaming=args.streaming,
+            is_router=False,
         ))
         print()
 
@@ -283,6 +315,7 @@ def main():
         runs=args.runs,
         concurrency=args.concurrency,
         streaming=args.streaming,
+        is_router=True,
     ))
 
     report(results, args.streaming, args.output)

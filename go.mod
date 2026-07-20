@@ -1,4 +1,4 @@
-module github.com/sausheong/llmrouter
+module github.com/sausheong/octopus
 
 go 1.25.1
 

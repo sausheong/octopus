@@ -1,157 +1,60 @@
-# llmrouter
+# Octopus
 
-A lightweight LLM routing proxy that runs locally on your machine. It exposes both Anthropic-compatible (`POST /v1/messages`) and OpenAI-compatible (`POST /v1/chat/completions`, `GET /v1/models`) endpoints, and automatically routes each request to the best available model based on task complexity, cost, and speed.
+![Octopus logo](octopus.png)
 
-Point Cursor, Continue.dev, Open WebUI, or any OpenAI-compatible client at `http://localhost:8787` and llmrouter handles the rest.
+Octopus is a local LLM routing gateway for coding agents and OpenAI-compatible applications. It exposes Anthropic and OpenAI APIs on one loopback-only server, classifies each request, filters models by capability and context size, and chooses a backend using configurable quality, cost, and speed weights.
 
----
+It is designed to work particularly well with Claude Code: Anthropic prompt-cache markers are preserved end to end, conversations remain on the backend that owns their cache, and cache creation/read usage is included in responses and logs.
 
-## How it works
+## Contents
 
-Every inbound request goes through several stages before a provider is called:
+- [Quick start](#quick-start)
+- [Claude Code setup](#claude-code-setup)
+- [Prompt caching](#prompt-caching)
+- [Routing behavior](#routing-behavior)
+- [API compatibility](#api-compatibility)
+- [Configuration reference](#configuration-reference)
+- [Deployment and security](#deployment-and-security)
+- [Observability and troubleshooting](#observability-and-troubleshooting)
+- [Local and mixed-provider recipes](#local-and-mixed-provider-recipes)
+- [Benchmarking](#benchmarking)
+- [Development](#development)
+- [Rename compatibility](#rename-compatibility)
 
-```
-Client request
-      │
-      ▼
-┌─────────────┐
-│   Decoder   │  Parse Anthropic or OpenAI wire format → internal types
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Classifier │  Ask a cheap model: how hard is this? needs vision/tools?
-│  (optional) │  Short single-turn requests skip this entirely.
-└──────┬──────┘
-       │  TaskProfile{difficulty, needs_vision, needs_tools, est_tokens}
-       ▼
-┌─────────────┐
-│   Scorer    │  Filter catalog by capability, rank by weighted score
-│             │  Cache-aware: adjusts cost for prompt cache hits/misses
-└──────┬──────┘
-       │  Decision{chosen, eligible[], scores}
-       ▼
-┌─────────────┐
-│  Session    │  Sticky affinity: keep long conversations on the same model
-│  Affinity   │  to preserve prompt cache warmth
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Registry   │  Resolve provider/model → harness LLMProvider
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Provider   │  ChatStream → SSE or buffered response (with fallback)
-└─────────────┘
-```
+## Highlights
 
-### Classifier
+- Anthropic-compatible `POST /v1/messages`, streaming and buffered.
+- OpenAI-compatible `POST /v1/chat/completions`, streaming and buffered.
+- OpenAI-compatible `GET /v1/models` generated from the configured catalog.
+- Routing across Anthropic, OpenAI, Gemini, Qwen, local models, and compatible gateways.
+- Optional low-cost classifier with a zero-call short circuit for trivial requests.
+- Hard tool, vision, and context-window eligibility checks.
+- Quality/cost/speed scoring with deterministic fallback order.
+- Sticky conversation routing for prompt-cache continuity.
+- Full Anthropic `cache_control` preservation, including `5m` and `1h` TTLs.
+- Extended-thinking/reasoning mapping and thinking-block round trips.
+- Tool calls, parallel tool results, images, streaming usage, and refusal propagation.
+- Loopback-only binding, bounded request bodies, transport timeouts, and graceful shutdown.
 
-The classifier is a cheap, fast model that reads a bounded window of recent conversation context and produces a `TaskProfile`:
+## Quick start
 
-- `difficulty`: trivial / low / medium / high
-- `needs_reasoning`: requires multi-step logic, math, or planning
-- `needs_vision`: request depends on understanding images
-- `needs_tools`: request expects function calling
-- `est_tokens_in` / `est_tokens_out`: estimated token footprint
+### Requirements
 
-Two cases skip the classifier entirely:
-- **Trivial short-circuit**: if the last user turn is under 500 bytes, has no images, and is single-turn (no prior assistant messages), a `TrivialProfile` is used immediately — no extra round-trip.
-- **No classifier configured**: if `classifier.model` is empty, `DefaultProfile` (conservative: high difficulty, needs reasoning) is always used. Safe for pure-local setups.
+- Go 1.25 or newer.
+- An API key for each configured cloud provider, or a running local inference server.
 
-Classifier failures (timeout, parse error, unresolvable provider) fall back to `DefaultProfile` — a classifier hiccup never breaks routing.
-
-### Scorer
-
-The scorer applies three stages to the catalog:
-
-1. **Hard capability filter**: eliminates models missing required tool or vision support, or whose context window is too small for the request. The context estimate is a deterministic lower bound from the full request (system prompt, messages, tool schemas, images) floored above the classifier's LLM-based guess.
-2. **Quality floor for hard tasks**: if difficulty is `high`, models below quality 0.85 are dropped — but only when at least one model clears the floor, so the set is never emptied on quality alone.
-3. **Weighted balanced score**: remaining models are ranked by `quality × wq + cost_efficiency × wc + speed × ws`, with a modest bonus for reasoning-capable models when the profile benefits from it.
-
-Free (zero-cost) models always receive the maximum cost score so they are genuinely preferred over paid models for cost-heavy weight configurations. The top-scoring model becomes `Decision.Chosen`; the full scored list is kept in `Decision.Eligible` for fallback.
-
-### Cache-aware scoring
-
-When `routing.cache_aware: true` (the default), the scorer adjusts the effective input cost for each model based on whether a prompt cache hit is expected:
-
-- **Cache read**: 0.10× input cost — a cached prefix is very cheap
-- **Cache write (5 min TTL)**: 1.25× input cost
-- **Cache write (1 hour TTL)**: 2.00× input cost
-
-This means a model that already has your conversation prefix cached scores as dramatically cheaper than one that doesn't, naturally routing follow-up turns to the same provider.
-
-### Session affinity
-
-When `routing.session_sticky: true` (the default), the router records which model handled each conversation and pins subsequent turns to the same model for the duration of `session_ttl` (default 1 hour). This keeps prompt caches warm across turns.
-
-Session identity is derived from `metadata.user_id` in the request, the `X-LLMRouter-Session-ID` HTTP header (takes precedence), or a deterministic SHA-256 hash of the conversation's stable prefix (system prompt + tools + first user turn).
-
-### Provider fallback
-
-If a provider returns an error — either immediately from `ChatStream` or as an `EventError` on the channel — the server walks `Decision.Eligible` in score order and retries each candidate. For buffered responses, the full collection must fail before falling back. Once SSE headers are written the client owns the stream and fallback is no longer possible.
-
-### Registry
-
-The registry maps provider names to `harness.LLMProvider` instances. Four wire protocols are supported:
-
-| `kind`      | Backend                                      |
-|-------------|----------------------------------------------|
-| `anthropic` | Anthropic Messages API (also DeepSeek, MiniMax, etc.) |
-| `openai`    | OpenAI Chat Completions API (also Ollama, LM Studio, mlx-lm) |
-| `gemini`    | Google Gemini                                |
-| `qwen`      | Qwen / Alibaba DashScope                     |
-
-Any provider name can be paired with any `kind`, which allows multiple backends to coexist under distinct names (e.g. several Anthropic-compatible APIs each with their own key and base URL).
-
----
-
-## Package structure
-
-```
-llmrouter/
-├── cmd/router/       Entry point — loads config, wires everything, starts HTTP server
-├── config/           YAML config: load, validate, types
-├── registry/         Builds one LLMProvider per configured provider; resolves provider/model IDs
-├── router/           Classifier, scorer, session affinity, routing decision
-│   ├── classifier.go   Calls classifier model, parses TaskProfile
-│   ├── profile.go      TaskProfile, profiles, EstimateRequestTokens
-│   ├── scorer.go       Capability filter, quality floor, cache-aware weighted scoring
-│   ├── router.go       Route() orchestration, session affinity, Observe()
-│   └── turn.go         LastUserTurn — finds the last genuine user message
-├── anthropicio/       Anthropic wire format: decode requests, encode SSE and buffered responses
-├── openaiio/          OpenAI wire format: decode requests, encode SSE chunks and completions
-├── server/            HTTP handlers for /v1/messages, /v1/chat/completions, /v1/models
-└── scripts/           Benchmark and utility scripts
-```
-
----
-
-## Setup
-
-### Prerequisites
-
-- Go 1.25+
-- API keys for any cloud providers you want to use
-- For local inference: mlx-lm, Ollama, or LM Studio running on your machine
-
-### Build
+### Install and build
 
 ```bash
-git clone https://github.com/sausheong/llmrouter
-cd llmrouter
-go build -o llmrouter ./cmd/router
+git clone https://github.com/sausheong/octopus.git
+cd octopus
+make build
 ```
 
-Or use make:
+This builds `./octopus` from `./cmd/octopus`. The equivalent Go command is:
 
 ```bash
-make build   # compile → ./llmrouter
-make test    # run all tests
-make run     # build and start with config.yaml
-make help    # list all targets
+GOWORK=off go build -o octopus ./cmd/octopus
 ```
 
 ### Configure
@@ -160,7 +63,7 @@ make help    # list all targets
 cp config.example.yaml config.yaml
 ```
 
-Edit `config.yaml`. The minimum working config is:
+`config.yaml` is ignored by Git. A minimal Anthropic configuration is:
 
 ```yaml
 server:
@@ -170,166 +73,474 @@ weights:
   quality: 0.5
   cost: 0.3
   speed: 0.2
+
+routing:
+  session_sticky: true
+  session_ttl: "1h"
+  cache_aware: true
 
 providers:
   anthropic:
     api_key_env: "ANTHROPIC_API_KEY"
 
 catalog:
-  - id: "anthropic/claude-haiku-3-5-20241022"
-    quality: 0.70
-    cost_per_mtok_in: 1.0
-    cost_per_mtok_out: 5.0
-    speed: 0.95
-    caps: { tools: true, vision: true, reasoning: false, max_context: 200000 }
+  - id: "anthropic/claude-sonnet"
+    quality: 0.90
+    cost_per_mtok_in: 3.0
+    cost_per_mtok_out: 15.0
+    speed: 0.75
+    caps:
+      tools: true
+      vision: true
+      reasoning: true
+      max_context: 200000
 ```
+
+Use a model ID accepted by your provider and current pricing for the catalog cost fields.
 
 ### Run
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-./llmrouter
+export ANTHROPIC_API_KEY="sk-ant-..."
+./octopus
 ```
 
-Or with a custom config path:
+Use another configuration file with:
 
 ```bash
-./llmrouter -config /path/to/config.yaml
+./octopus -config /path/to/config.yaml
 ```
 
----
+The process logs `octopus listening` when it is ready. It handles `SIGINT` and `SIGTERM` by draining in-flight requests for up to 30 seconds.
+
+## Claude Code setup
+
+Run Octopus and Claude Code in separate terminals so the upstream provider credential and Claude Code's local gateway token are not confused.
+
+Terminal 1 — start Octopus with the real provider key:
+
+```bash
+cd /path/to/octopus
+export ANTHROPIC_API_KEY="sk-ant-real-provider-key"
+./octopus
+```
+
+Terminal 2 — point Claude Code at Octopus:
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
+export ANTHROPIC_AUTH_TOKEN="local-octopus"
+claude
+```
+
+`ANTHROPIC_AUTH_TOKEN` can be any non-empty value because Octopus does not authenticate inbound loopback requests. It never forwards this client token: upstream requests are built with credentials from `config.yaml`.
+
+The `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` gateway configuration follows Anthropic's [Claude Code LLM gateway guidance](https://docs.anthropic.com/en/docs/claude-code/llm-gateway).
+
+Claude Code may request a specific model name, but Octopus intentionally treats the inbound model as advisory and selects a catalog model itself.
+
+### Verify Claude Code prompt caching
+
+1. Enable `routing.session_sticky` and `routing.cache_aware` or omit them to use their `true` defaults.
+2. Start a Claude Code session with a sufficiently large, stable prompt prefix.
+3. Send at least two turns within the cache TTL.
+4. Inspect the Octopus log for `prompt cache usage`.
+5. Confirm a later response reports a positive `cache_read_input_tokens` value.
+
+A zero cache count does not always mean forwarding failed. Providers impose minimum cacheable-prefix sizes, and a new or changed prefix may create a cache before it can be read.
+
+## Prompt caching
+
+Octopus preserves cache metadata rather than regenerating it. For Anthropic-shaped requests it supports:
+
+- Top-level `cache_control` for automatic caching.
+- Individual system text block markers without flattening the system array.
+- Tool-definition markers.
+- User and assistant content-block markers.
+- Tool-result markers.
+- `ephemeral` cache type.
+- Default/`5m` and `1h` TTL values.
+
+Invalid cache types or TTLs are rejected as invalid requests. Tool-schema normalization includes cache metadata in its deterministic cache key, so changing a cache TTL cannot reuse a stale normalized tool definition.
+
+Only providers implementing the harness prompt-caching capability are priced as cache-capable. Other provider kinds safely ignore the provider-neutral cache metadata.
+
+### Cache-aware cost model
+
+Anthropic cache pricing is represented with these input multipliers:
+
+| Operation | Input-price multiplier |
+|---|---:|
+| Cache read | `0.10×` |
+| Five-minute cache write | `1.25×` |
+| One-hour cache write | `2.00×` |
+| Uncached input | `1.00×` |
+
+After a successful response, Octopus records the reported ratio of cached to uncached input. Subsequent scores blend the cache-read and ordinary-input prices instead of assuming the entire request is cached.
+
+### Session affinity
+
+Sticky routing records the successful model for a conversation and selects it again while it remains eligible. Session identity is resolved in this order:
+
+1. `X-Octopus-Session-ID` HTTP header.
+2. Legacy `X-LLMRouter-Session-ID` header.
+3. Anthropic `metadata.user_id` or OpenAI `user` request field.
+4. A deterministic SHA-256 identifier derived from the system prompt, tools, and first genuine user turn.
+
+Explicit identifiers are hashed before being stored. The in-memory session table is concurrency-safe, expires entries, and has a hard size bound. Session state is process-local and is reset when Octopus restarts.
+
+If the sticky model is no longer eligible because of tools, vision, or context size, normal scoring selects another model. A successful fallback becomes the new sticky model.
+
+## Routing behavior
+
+Each request passes through the following pipeline:
+
+```text
+Anthropic/OpenAI request
+        │
+        ▼
+Decode and validate wire format
+        │
+        ▼
+Classify task or apply deterministic shortcut
+        │
+        ▼
+Enforce tools, vision, and context constraints
+        │
+        ▼
+Estimate request cost, including expected cache state
+        │
+        ▼
+Rank eligible catalog models
+        │
+        ▼
+Apply valid session affinity
+        │
+        ▼
+Normalize tools and call provider
+        │
+        ├── failure before response → next eligible model
+        ▼
+Encode response and observe usage/cache state
+```
+
+### Classification
+
+The classifier returns this task profile:
+
+- `difficulty`: `trivial`, `low`, `medium`, or `high`.
+- `needs_reasoning`.
+- `needs_vision`.
+- `needs_tools`.
+- `est_tokens_in` and `est_tokens_out`.
+- `domain`: `code`, `writing`, `qa`, `math`, or `other`.
+
+The classifier is skipped when either of these conditions applies:
+
+- The request is a short single-turn prompt of at most 500 bytes with no tools, images, or prior assistant turn.
+- `classifier.model` is omitted, in which case a conservative default profile is used.
+
+For nontrivial conversations, classification uses a bounded recent-context representation. Classification timeouts, malformed output, and unavailable classifier providers fall back to the conservative profile rather than failing the client request.
+
+Actual request contents override classifier guesses: images require vision and tools require tool support. A deterministic estimate of the complete system prompt, history, tool schemas, tool arguments/results, requested output, and images provides a context-size floor.
+
+### Eligibility and scoring
+
+Models are first filtered by hard requirements:
+
+- Vision support when images are present.
+- Tool support when tools are declared.
+- Enough context for estimated input plus output.
+
+For high-difficulty tasks, models below the `0.85` quality floor are removed when at least one otherwise-eligible model clears the floor. This floor never empties the eligible set by itself.
+
+Remaining models receive a normalized weighted score:
+
+```text
+quality × normalized_quality
++ cost × normalized_cost_efficiency
++ speed × normalized_speed
++ optional reasoning preference
+```
+
+Weights need not sum to one; Octopus normalizes them. Free models receive the maximum cost-efficiency score. Catalog order is the deterministic tie-breaker.
+
+### Reasoning
+
+When a task benefits from reasoning, the router recommends medium reasoning effort. The server applies it only to catalog entries with `caps.reasoning: true`. Harness providers map this to their native mechanism, including Anthropic adaptive/extended thinking and provider-specific reasoning settings. Thinking blocks and signatures are preserved for later turns.
+
+### Provider fallback
+
+Eligible models are attempted in score order, starting with the chosen model.
+
+- Failure while opening a stream triggers the next model.
+- A closed stream or `EventError` before the first meaningful event triggers fallback.
+- Buffered responses may fall back after a later collection failure because no client bytes have been written yet.
+- Once streaming response bytes have been sent, Octopus cannot transparently switch providers.
+
+If every eligible backend fails, Octopus maps rate-limit, overload, invalid-request, and generic backend failures into the appropriate endpoint-specific error shape.
+
+If no catalog entry can satisfy the request, the Anthropic endpoint returns an invalid-request error and the OpenAI endpoint returns HTTP `422`.
+
+## API compatibility
+
+### Endpoints
+
+| Method | Path | Shape |
+|---|---|---|
+| `POST` | `/v1/messages` | Anthropic Messages API |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions API |
+| `GET` | `/v1/models` | OpenAI model list generated from the catalog |
+
+Request bodies are limited to 32 MiB.
+
+### Anthropic example
+
+```bash
+curl http://127.0.0.1:8787/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'X-Octopus-Session-ID: demo-anthropic' \
+  -d '{
+    "model": "router",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Explain prompt caching briefly."}]
+  }'
+```
+
+Streaming uses the usual `"stream": true` request field and Anthropic SSE events.
+
+### OpenAI example
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local' \
+  -H 'X-Octopus-Session-ID: demo-openai' \
+  -d '{
+    "model": "router",
+    "messages": [{"role": "user", "content": "Hello from Octopus."}]
+  }'
+```
+
+OpenAI buffered usage includes `prompt_tokens_details.cached_tokens` when the provider reports cache reads.
+
+### Supported content
+
+- Text system, user, and assistant content.
+- Base64 images accepted by the Anthropic endpoint.
+- OpenAI text and data-URL image parts.
+- Tool definitions and assistant tool calls.
+- Parallel Anthropic tool results, including text and images.
+- Anthropic thinking blocks and signatures.
+- Streaming text and tool-input deltas, plus Anthropic terminal usage, stop reasons, and refusals.
+
+This is a compatibility gateway, not a claim of complete coverage of every field in either upstream API. Unsupported request content is rejected explicitly rather than silently reinterpreted.
 
 ## Configuration reference
 
+Octopus parses YAML with unknown-field rejection, so misspelled settings fail fast.
+
 ### `server`
 
-| Field  | Description                        |
-|--------|------------------------------------|
-| `addr` | Loopback listen address (e.g. `127.0.0.1:8787`). Non-loopback binding is rejected — inbound requests are unauthenticated. |
+| Field | Required | Description |
+|---|---:|---|
+| `addr` | Yes | Loopback `host:port`, such as `127.0.0.1:8787`, `localhost:8787`, or `[::1]:8787`. Non-loopback addresses are rejected. |
 
-### `classifier` (optional)
+### `classifier`
 
-| Field        | Description                                                        |
-|--------------|--------------------------------------------------------------------|
-| `model`      | Provider/model ID for the classifier. Empty = always use DefaultProfile (no cloud call). |
-| `max_tokens` | Max tokens for classifier response (256 is plenty).               |
-| `timeout`    | Per-request classifier timeout (e.g. `10s`).                     |
+The entire section is optional.
+
+| Field | Required when section is used | Description |
+|---|---:|---|
+| `model` | Yes | Catalog-style `provider/model` ID used for classification. |
+| `max_tokens` | Yes | Positive response-token limit; `256` is usually sufficient. |
+| `timeout` | Yes | Positive Go duration such as `10s`. |
+
+The classifier provider must resolve at runtime. Failure falls back to the default profile.
 
 ### `weights`
 
-Balanced-score knobs. Need not sum to 1 — the scorer normalises them.
+| Field | Range | Description |
+|---|---:|---|
+| `quality` | `>= 0` | Relative influence of catalog quality. |
+| `cost` | `>= 0` | Relative influence of request cost. |
+| `speed` | `>= 0` | Relative influence of catalog speed. |
 
-| Field     | Description                                       |
-|-----------|---------------------------------------------------|
-| `quality` | Weight for model quality score (0–1 in catalog).  |
-| `cost`    | Weight for cost efficiency (inverse of request $). |
-| `speed`   | Weight for model speed score (0–1 in catalog).     |
+Values must be finite and cannot all be zero.
 
-### `routing` (optional)
+### `routing`
 
-| Field            | Default | Description                                                        |
-|------------------|---------|--------------------------------------------------------------------|
-| `session_sticky` | `true`  | Pin conversation turns to the same model within the TTL.          |
-| `session_ttl`    | `1h`    | How long a session pin lasts (e.g. `30m`, `2h`).                 |
-| `cache_aware`    | `true`  | Adjust model cost scores based on expected prompt cache hits.      |
+The section is optional; these defaults are applied when it is omitted.
 
-Set both to `false` for minimum per-request overhead when you don't need conversation affinity.
+| Field | Default | Description |
+|---|---:|---|
+| `session_sticky` | `true` | Keep a conversation on its last successful eligible model. |
+| `session_ttl` | `1h` | Lifetime of model affinity. Must not be negative. |
+| `cache_aware` | `true` | Include expected cache writes/reads in cost scoring. |
 
 ### `providers`
 
-Each entry is a named provider. The name is the prefix of catalog IDs (e.g. provider `anthropic` → catalog ID `anthropic/claude-...`).
+Provider map keys are arbitrary names used as the prefix of catalog IDs. `kind` selects the harness client implementation.
 
-| Field         | Description                                                                 |
-|---------------|-----------------------------------------------------------------------------|
-| `kind`        | Wire protocol: `anthropic`, `openai`, `gemini`, `qwen`. Defaults to the provider name. |
-| `api_key`     | Literal API key (gitignored config only).                                   |
-| `api_key_env` | Name of env var holding the API key.                                        |
-| `base_url`    | Override endpoint URL. Required for local servers; optional for cloud providers. |
+| `kind` | Typical backends | Base URL support |
+|---|---|---|
+| `anthropic` | Anthropic and Anthropic-shaped gateways | Optional override |
+| `openai` | OpenAI, Ollama, LM Studio, mlx-lm, compatible servers | Optional override |
+| `gemini` | Google Gemini | Provider default |
+| `qwen` | Alibaba DashScope/Qwen | Optional override |
 
-At least one of `api_key`, `api_key_env`, or `base_url` must be set. Local servers that don't require authentication only need `base_url`.
+Each provider supports these fields:
+
+| Field | Description |
+|---|---|
+| `kind` | Client kind. When omitted, defaults to the provider map key. |
+| `api_key_env` | Environment variable containing the provider credential. |
+| `api_key` | Inline credential. Takes precedence; use only in ignored local configuration. |
+| `base_url` | Provider endpoint override. A local endpoint may use this without a key. |
+
+At least one of `api_key`, `api_key_env`, or `base_url` must be configured. If an environment variable is named but empty and there is no base URL, registry initialization fails.
+
+Examples:
+
+```yaml
+providers:
+  anthropic:
+    api_key_env: "ANTHROPIC_API_KEY"
+
+  openai:
+    api_key_env: "OPENAI_API_KEY"
+
+  local:
+    kind: openai
+    base_url: "http://127.0.0.1:8080/v1"
+
+  coding_gateway:
+    kind: anthropic
+    api_key_env: "CODING_GATEWAY_KEY"
+    base_url: "https://gateway.example.com/anthropic"
+```
+
+Octopus resolves configured provider credentials at startup and then removes ambient `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` from its process environment. This prevents an Anthropic SDK ambient token from leaking into requests for another Anthropic-shaped backend.
 
 ### `catalog`
 
-Ordered list of candidate models. The scorer considers them in order for tie-breaking.
+Every entry requires a unique `provider/model` ID. The provider prefix must exist in `providers`.
 
-| Field               | Description                                              |
-|---------------------|----------------------------------------------------------|
-| `id`                | `provider/model` — provider must be in `providers`.     |
-| `quality`           | Subjective quality score, 0–1.                          |
-| `cost_per_mtok_in`  | Cost per million input tokens (USD). 0 = free/local.   |
-| `cost_per_mtok_out` | Cost per million output tokens (USD).                   |
-| `speed`             | Relative speed score, 0–1.                              |
-| `caps.tools`        | Supports function/tool calling.                         |
-| `caps.vision`       | Supports image input.                                   |
-| `caps.reasoning`    | Supports extended thinking / reasoning mode.            |
-| `caps.max_context`  | Maximum context window in tokens (required, must be > 0). |
+| Field | Constraints | Description |
+|---|---:|---|
+| `id` | Unique `provider/model` | Routing and registry identifier. |
+| `quality` | `0..1` | Relative model quality. |
+| `cost_per_mtok_in` | `>= 0` | Input price per million tokens. |
+| `cost_per_mtok_out` | `>= 0` | Output price per million tokens. |
+| `speed` | `0..1` | Relative throughput/latency score. |
+| `caps.tools` | Boolean | Tool/function-call support. |
+| `caps.vision` | Boolean | Image-input support. |
+| `caps.reasoning` | Boolean | Native extended reasoning support. |
+| `caps.max_context` | Positive integer | Maximum combined context capacity. |
 
----
+Catalog prices and capabilities are operator-maintained. Keep them synchronized with provider documentation; Octopus does not fetch pricing or model metadata automatically.
 
-## Performance
+## Deployment and security
 
-Measured overhead vs calling DeepSeek directly (3 runs × 5 prompt types, buffered):
+Octopus intentionally has no inbound authentication. To reduce exposure:
 
-| Prompt type | Router overhead | Notes |
-|-------------|----------------|-------|
-| trivial     | ~300ms         | Short-circuit fires; no classifier call |
-| short       | ~300ms         | Classifier call adds ~200ms |
-| medium      | ~130ms         | Similar model chosen; minimal overhead |
-| code        | ~0ms           | Router often matches or beats direct |
-| long        | ~350ms         | Classifier latency dominates |
-| **average** | **~236ms**     | |
+- `server.addr` is validated as loopback-only.
+- Do not expose port `8787` through a public tunnel, container port, or reverse proxy without adding authentication at that boundary.
+- Keep provider keys in environment variables or an ignored `config.yaml`.
+- Never commit inline `api_key` values.
+- Rotate a provider key immediately if it appears in logs, shell history, or version control.
 
-Streaming TTFT overhead for trivial requests is typically **< 100ms**.
+The HTTP server uses:
 
-To minimise overhead set `routing.session_sticky: false` and `routing.cache_aware: false` — this removes the session hash, mutex, and goroutine from the hot path.
+- 10-second read-header timeout.
+- 60-second request read timeout.
+- 120-second idle timeout.
+- No write timeout, allowing long-lived SSE responses.
+- 32 MiB maximum inbound request body.
 
----
+For a persistent local installation, run the binary under your operating system's service manager and send `SIGTERM` during upgrades. Rebuilding alone does not replace an already-running process.
 
-## Recipes
+## Observability and troubleshooting
 
-### Pure-local with mlx-lm (macOS)
+Octopus emits structured `slog` text records to standard error. Useful entries include:
 
-Start mlx-lm:
-```bash
-mlx_lm.server --model mlx-community/Qwen3-8B-4bit --port 8080
-```
+- `octopus listening`: successful startup and bind address.
+- `routing decision`: chosen model, reason, inferred profile, and eligible models.
+- `provider ... failed`: candidate failure and fallback attempt.
+- `using fallback model`: successful alternate backend.
+- `tool schema normalized`: provider compatibility rewrite.
+- `prompt cache usage`: cache creation and cache-read input tokens.
+- `request handled`: endpoint, final model, requested model, stream mode, routing reason, and elapsed time.
 
-`config.yaml`:
+### Octopus does not start
+
+- Check that `server.addr` is loopback and in `host:port` form.
+- Check for unknown or misspelled YAML fields.
+- Ensure all catalog provider prefixes exist in `providers`.
+- Ensure every configured cloud-provider environment variable is set.
+- Check whether another process already owns port `8787`.
+
+### Claude Code cannot connect
+
+- Confirm `curl http://127.0.0.1:8787/v1/models` succeeds.
+- Set `ANTHROPIC_BASE_URL` without appending `/v1/messages`; Claude Code adds the API path.
+- Use a non-empty `ANTHROPIC_AUTH_TOKEN` in the Claude Code process.
+- Ensure Octopus is still running after rebuilding it.
+
+### Cache reads stay at zero
+
+- Use an Anthropic-kind backend that supports prompt caching.
+- Keep the same Claude Code conversation and backend.
+- Keep turns within the requested `5m` or `1h` TTL.
+- Avoid changing system blocks, tool schemas, or other content before the cache breakpoint.
+- Ensure the prefix meets the provider's minimum token requirement.
+- Check that fallback did not move the session to another provider.
+
+### Every request uses the same model
+
+- Sticky routing intentionally keeps a valid session on its successful model.
+- Use a different `X-Octopus-Session-ID`, wait for `session_ttl`, restart Octopus, or disable `routing.session_sticky` to compare fresh routes.
+
+## Local and mixed-provider recipes
+
+### Local OpenAI-compatible server
+
 ```yaml
 server:
   addr: "127.0.0.1:8787"
 
-# No classifier — no cloud call required
+weights:
+  quality: 0.4
+  cost: 0.4
+  speed: 0.2
+
 routing:
   session_sticky: false
   cache_aware: false
 
-weights:
-  quality: 0.5
-  cost: 0.3
-  speed: 0.2
-
 providers:
-  mlx:
+  local:
     kind: openai
-    base_url: "http://localhost:8080/v1"
+    base_url: "http://127.0.0.1:8080/v1"
 
 catalog:
-  - id: "mlx/Qwen3-8B-4bit"
+  - id: "local/my-model"
     quality: 0.60
-    cost_per_mtok_in: 0.0
-    cost_per_mtok_out: 0.0
+    cost_per_mtok_in: 0
+    cost_per_mtok_out: 0
     speed: 0.85
-    caps: { tools: false, vision: false, reasoning: false, max_context: 32768 }
+    caps: {tools: true, vision: false, reasoning: false, max_context: 32768}
 ```
 
-### Mixed local + cloud with smart routing
+Omit `classifier` to avoid any classification provider call.
 
-Use a cheap classifier, route trivial tasks to local MLX, hard tasks to a capable cloud model:
+### Mixed local and cloud routing
 
 ```yaml
 classifier:
-  model: "anthropic/claude-haiku-3-5-20241022"
+  model: "anthropic/claude-haiku"
   max_tokens: 256
   timeout: "10s"
 
@@ -341,85 +552,81 @@ weights:
 providers:
   anthropic:
     api_key_env: "ANTHROPIC_API_KEY"
-  mlx:
+  local:
     kind: openai
-    base_url: "http://localhost:8080/v1"
+    base_url: "http://127.0.0.1:8080/v1"
 
 catalog:
-  - id: "anthropic/claude-opus-4-0-20250514"
-    quality: 0.98
-    cost_per_mtok_in: 15.0
-    cost_per_mtok_out: 75.0
-    speed: 0.4
-    caps: { tools: true, vision: true, reasoning: true, max_context: 1000000 }
-  - id: "anthropic/claude-haiku-3-5-20241022"
-    quality: 0.70
-    cost_per_mtok_in: 1.0
-    cost_per_mtok_out: 5.0
-    speed: 0.95
-    caps: { tools: true, vision: true, reasoning: false, max_context: 200000 }
-  - id: "mlx/Qwen3-8B-4bit"
-    quality: 0.60
-    cost_per_mtok_in: 0.0
-    cost_per_mtok_out: 0.0
-    speed: 0.85
-    caps: { tools: false, vision: false, reasoning: false, max_context: 32768 }
+  - id: "anthropic/claude-capable"
+    quality: 0.95
+    cost_per_mtok_in: 5
+    cost_per_mtok_out: 25
+    speed: 0.55
+    caps: {tools: true, vision: true, reasoning: true, max_context: 200000}
+
+  - id: "local/fast-model"
+    quality: 0.65
+    cost_per_mtok_in: 0
+    cost_per_mtok_out: 0
+    speed: 0.90
+    caps: {tools: true, vision: false, reasoning: false, max_context: 32768}
 ```
 
-With `cost` weight at 0.4, the free MLX model wins for trivial tasks. Hard tasks (difficulty=high) apply the quality floor (≥0.85) and route to Opus or Haiku.
-
-### Connecting a client
-
-Any OpenAI-compatible client works. Set the base URL to `http://localhost:8787` and use any non-empty API key (llmrouter doesn't authenticate inbound requests).
-
-**curl:**
-```bash
-curl http://localhost:8787/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer local" \
-  -d '{"model":"any","messages":[{"role":"user","content":"hello"}]}'
-```
-
-**Session pinning** (keeps conversation on the same model):
-```bash
-curl http://localhost:8787/v1/chat/completions \
-  -H "Authorization: Bearer local" \
-  -H "X-LLMRouter-Session-ID: my-session-123" \
-  -d '{"model":"any","messages":[...]}'
-```
-
-**Cursor / VS Code Continue / Open WebUI:**
-Set the OpenAI base URL to `http://localhost:8787`. The model name you specify is ignored — llmrouter always routes to the best available model.
-
-**List available models:**
-```bash
-curl http://localhost:8787/v1/models
-```
-
----
+The free local model has the strongest cost score, while high-difficulty tasks can apply the quality floor and move to the cloud model.
 
 ## Benchmarking
 
+The included benchmark compares Octopus with a direct OpenAI-compatible provider call.
+
 ```bash
-python3 scripts/benchmark.py                          # buffered, 3 runs
-python3 scripts/benchmark.py --streaming              # streaming + TTFT
-python3 scripts/benchmark.py --runs 5 --concurrency 3 --output results.txt
-python3 scripts/benchmark.py --router-only            # skip direct comparison
+python3 scripts/benchmark.py
+python3 scripts/benchmark.py --streaming
+python3 scripts/benchmark.py --runs 5 --concurrency 3
+python3 scripts/benchmark.py --output results.txt
+python3 scripts/benchmark.py --router-only
 ```
 
-The script compares llmrouter against a direct provider call, reporting p50/p95 latency, TTFT (streaming), throughput, and which model the router chose for each prompt type.
-
-Edit `DIRECT_BASE`, `DIRECT_API_KEY`, and `DIRECT_MODEL` at the top of the script to benchmark against any OpenAI-compatible provider.
-
----
+Edit `DIRECT_BASE`, `DIRECT_API_KEY`, and `DIRECT_MODEL` near the top of the script for the direct comparison target. The report includes latency percentiles, time to first token for streaming, throughput, and the final routed model.
 
 ## Development
 
 ```bash
-make test        # run all tests (GOWORK=off)
-make test-race   # with race detector
-make vet         # go vet
-make tidy        # go mod tidy + verify
+make build       # build ./octopus
+make test        # GOWORK=off go test ./...
+make test-race   # race detector across all packages
+make vet         # go vet ./...
+make tidy        # go mod tidy and go mod verify
+make run         # build and run with ./config.yaml
+make clean       # remove the generated binary
 ```
 
-Tests are hermetic — no live API calls. Tests tagged `//go:build live` hit real providers and are excluded from the default run.
+Tests are hermetic and do not make live provider calls.
+
+### Repository layout
+
+```text
+octopus/
+├── cmd/octopus/       Process entry point and HTTP server lifecycle
+├── config/            YAML schema, loading, defaults, and validation
+├── registry/          Provider construction and provider/model resolution
+├── router/            Classification, token estimation, scoring, affinity
+├── anthropicio/       Anthropic request decoder and response encoders
+├── openaiio/          OpenAI request decoder and response encoders
+├── server/            HTTP endpoints, fallback, normalization, observation
+├── scripts/           Benchmark utility
+├── config.example.yaml
+├── Makefile
+└── octopus.png
+```
+
+The shared provider abstraction and implementations live in [`github.com/sausheong/harness`](https://github.com/sausheong/harness). Octopus currently requires harness `v0.3.4`.
+
+## Rename compatibility
+
+The project was previously named `llmrouter`.
+
+- The repository and Go module are now `github.com/sausheong/octopus`.
+- The executable is now `octopus`.
+- The command package is now `./cmd/octopus`.
+- `X-Octopus-Session-ID` replaces `X-LLMRouter-Session-ID`.
+- The legacy session header remains accepted for existing clients.

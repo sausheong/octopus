@@ -4,7 +4,7 @@ import (
 	"sort"
 
 	"github.com/sausheong/harness/llm"
-	"github.com/sausheong/llmrouter/config"
+	"github.com/sausheong/octopus/config"
 )
 
 // HighQualityFloor is the quality a "high"-difficulty task wants. For such

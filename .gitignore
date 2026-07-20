@@ -11,3 +11,7 @@ config.yaml
 # go.work is for local sibling-directory development only (../harness replace)
 go.work
 go.work.sum
+
+# Local build artifacts.
+/octopus
+/llmrouter

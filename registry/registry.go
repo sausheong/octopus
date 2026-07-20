@@ -12,7 +12,7 @@ import (
 	"github.com/sausheong/harness/providers/gemini"
 	"github.com/sausheong/harness/providers/openai"
 	"github.com/sausheong/harness/providers/qwen"
-	"github.com/sausheong/llmrouter/config"
+	"github.com/sausheong/octopus/config"
 )
 
 // Registry maps provider name -> constructed llm.LLMProvider.

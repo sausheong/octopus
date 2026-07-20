@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/sausheong/harness/llm"
-	"github.com/sausheong/llmrouter/anthropicio"
-	"github.com/sausheong/llmrouter/config"
-	"github.com/sausheong/llmrouter/openaiio"
-	"github.com/sausheong/llmrouter/registry"
-	"github.com/sausheong/llmrouter/router"
+	"github.com/sausheong/octopus/anthropicio"
+	"github.com/sausheong/octopus/config"
+	"github.com/sausheong/octopus/openaiio"
+	"github.com/sausheong/octopus/registry"
+	"github.com/sausheong/octopus/router"
 )
 
 // maxRequestBytes caps the body size for inbound requests (32 MiB).
@@ -330,7 +330,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, anthropicio.NewAPIError("invalid_request", err.Error()))
 		return
 	}
-	if sessionID := strings.TrimSpace(r.Header.Get("X-LLMRouter-Session-ID")); sessionID != "" {
+	if sessionID := sessionIDHeader(r); sessionID != "" {
 		dr.Chat.SessionID = sessionID
 	}
 
@@ -394,7 +394,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if sessionID := strings.TrimSpace(r.Header.Get("X-LLMRouter-Session-ID")); sessionID != "" {
+	if sessionID := sessionIDHeader(r); sessionID != "" {
 		chat.SessionID = sessionID
 	}
 
@@ -442,6 +442,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"requested_model", requestedModel, "stream", false,
 			"reason", dec.Reason, "elapsed_ms", time.Since(start).Milliseconds())
 	}
+}
+
+func sessionIDHeader(r *http.Request) string {
+	if sessionID := strings.TrimSpace(r.Header.Get("X-Octopus-Session-ID")); sessionID != "" {
+		return sessionID
+	}
+	return strings.TrimSpace(r.Header.Get("X-LLMRouter-Session-ID"))
 }
 
 // writeErrorStatus writes an Anthropic-shaped error with an explicit status

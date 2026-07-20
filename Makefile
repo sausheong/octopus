@@ -1,5 +1,5 @@
-BINARY    := llmrouter
-CMD       := ./cmd/router
+BINARY    := octopus
+CMD       := ./cmd/octopus
 GONOSUMDB := GONOSUMDB=github.com/sausheong/harness
 GOFLAGS   := GOWORK=off
 

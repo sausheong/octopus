@@ -3,7 +3,7 @@ package router
 import (
 	"testing"
 
-	"github.com/sausheong/llmrouter/config"
+	"github.com/sausheong/octopus/config"
 )
 
 func cat() []config.CatalogEntry {

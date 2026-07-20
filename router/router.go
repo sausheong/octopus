@@ -11,8 +11,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/sausheong/harness/llm"
-	"github.com/sausheong/llmrouter/config"
-	"github.com/sausheong/llmrouter/registry"
+	"github.com/sausheong/octopus/config"
+	"github.com/sausheong/octopus/registry"
 )
 
 // Router turns an inbound chat request into a routing Decision.

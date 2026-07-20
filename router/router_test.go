@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/sausheong/harness/llm"
-	"github.com/sausheong/llmrouter/config"
-	"github.com/sausheong/llmrouter/registry"
+	"github.com/sausheong/octopus/config"
+	"github.com/sausheong/octopus/registry"
 )
 
 func testCfg() *config.Config {

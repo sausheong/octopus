@@ -1,4 +1,4 @@
-# llmrouter configuration. Copy to config.yaml and edit.
+# Octopus configuration. Copy to config.yaml and edit.
 server:
   addr: "127.0.0.1:8787"
 

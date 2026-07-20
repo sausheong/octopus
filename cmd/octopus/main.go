@@ -1,4 +1,4 @@
-// Command router runs the Anthropic-compatible LLM routing server.
+// Command octopus runs the Anthropic- and OpenAI-compatible LLM routing server.
 package main
 
 import (
@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sausheong/llmrouter/config"
-	"github.com/sausheong/llmrouter/registry"
-	"github.com/sausheong/llmrouter/router"
-	"github.com/sausheong/llmrouter/server"
+	"github.com/sausheong/octopus/config"
+	"github.com/sausheong/octopus/registry"
+	"github.com/sausheong/octopus/router"
+	"github.com/sausheong/octopus/server"
 )
 
 func main() {
@@ -71,7 +71,7 @@ func main() {
 
 	// Start serving in a goroutine so the main goroutine can wait on signals.
 	go func() {
-		slog.Info("llmrouter listening", "addr", cfg.ServerAddr)
+		slog.Info("octopus listening", "addr", cfg.ServerAddr)
 		if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "err", err)
 			os.Exit(1)

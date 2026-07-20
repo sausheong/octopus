@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/sausheong/llmrouter/config"
+	"github.com/sausheong/octopus/config"
 )
 
 func TestNewAndResolve(t *testing.T) {

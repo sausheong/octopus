@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Benchmark llmrouter vs direct provider calls.
+Benchmark Octopus vs direct provider calls.
 
 Usage:
     python3 scripts/benchmark.py [--runs N] [--concurrency C] [--output FILE]
@@ -275,7 +275,7 @@ def report(results: list[Result], streaming: bool, output: Optional[str]):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark llmrouter vs direct provider")
+    parser = argparse.ArgumentParser(description="Benchmark Octopus vs direct provider")
     parser.add_argument("--runs",        type=int, default=3,    help="Runs per prompt (default: 3)")
     parser.add_argument("--concurrency", type=int, default=2,    help="Concurrent requests (default: 2)")
     parser.add_argument("--streaming",   action="store_true",    help="Use streaming mode (default: buffered)")
@@ -306,9 +306,9 @@ def main():
         ))
         print()
 
-    print("── Running llmrouter ──")
+    print("── Running Octopus ──")
     results.append(run_benchmark(
-        label="llmrouter (routed)",
+        label="Octopus (routed)",
         base=ROUTER_BASE,
         api_key=ROUTER_API_KEY,
         model="any",

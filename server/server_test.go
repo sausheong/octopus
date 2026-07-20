@@ -11,9 +11,9 @@ import (
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	"github.com/sausheong/harness/llm"
-	"github.com/sausheong/llmrouter/config"
-	"github.com/sausheong/llmrouter/registry"
-	"github.com/sausheong/llmrouter/router"
+	"github.com/sausheong/octopus/config"
+	"github.com/sausheong/octopus/registry"
+	"github.com/sausheong/octopus/router"
 )
 
 // anthErr builds a fully-populated *anthropic.Error so its Error() method (which
@@ -758,6 +758,19 @@ func TestHandlerFallbackOnEmptyBufferedStream(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "empty stream fallback") {
 		t.Errorf("expected fallback content: %s", rec.Body.String())
+	}
+}
+
+func TestSessionIDHeaderUsesOctopusNameAndSupportsLegacyAlias(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Header.Set("X-LLMRouter-Session-ID", "legacy")
+	if got := sessionIDHeader(req); got != "legacy" {
+		t.Fatalf("legacy session header = %q", got)
+	}
+
+	req.Header.Set("X-Octopus-Session-ID", "octopus")
+	if got := sessionIDHeader(req); got != "octopus" {
+		t.Fatalf("Octopus session header = %q, want preferred new name", got)
 	}
 }
 

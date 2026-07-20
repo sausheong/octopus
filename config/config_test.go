@@ -209,7 +209,7 @@ func TestValidateDuplicateCatalogIDIsError(t *testing.T) {
 
 func TestLoadUnknownFieldIsError(t *testing.T) {
 	// Write a temp YAML with an unknown key and verify Load rejects it.
-	f, err := os.CreateTemp("", "llmrouter-*.yaml")
+	f, err := os.CreateTemp("", "octopus-*.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

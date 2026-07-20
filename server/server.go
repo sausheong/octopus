@@ -195,6 +195,10 @@ func (s *Server) collectWithFallback(
 }
 
 func (s *Server) observeEvents(chat llm.ChatRequest, model string, in <-chan llm.ChatEvent) <-chan llm.ChatEvent {
+	// Skip the wrapper goroutine entirely when observation is a no-op.
+	if s.rt == nil || !s.rt.NeedsObservation() {
+		return in
+	}
 	out := make(chan llm.ChatEvent, 1)
 	go func() {
 		defer close(out)

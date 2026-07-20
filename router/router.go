@@ -24,6 +24,9 @@ type Router struct {
 	classifyFn func(ctx context.Context, prov llm.LLMProvider, model string, maxTokens int, turn llm.Message) TaskProfile
 	sessionsMu sync.Mutex
 	sessions   map[string]sessionState
+	// cachingModels is the set of catalog IDs that support prompt caching,
+	// computed once at build time to avoid per-request Resolve + type assertion.
+	cachingModels map[string]bool
 }
 
 type sessionState struct {
@@ -36,7 +39,23 @@ type sessionState struct {
 // NewRouter builds a Router. The classifier provider is resolved per request
 // from the registry using cfg.Classifier.Model.
 func NewRouter(cfg *config.Config, reg *registry.Registry) *Router {
-	return &Router{cfg: cfg, reg: reg, classifyFn: Classify, sessions: make(map[string]sessionState)}
+	caching := make(map[string]bool, len(cfg.Catalog))
+	for _, entry := range cfg.Catalog {
+		prov, _, err := reg.Resolve(entry.ID)
+		if err != nil {
+			continue
+		}
+		if p, ok := prov.(llm.PromptCachingProvider); ok && p.SupportsPromptCaching() {
+			caching[entry.ID] = true
+		}
+	}
+	return &Router{
+		cfg:           cfg,
+		reg:           reg,
+		classifyFn:    Classify,
+		sessions:      make(map[string]sessionState),
+		cachingModels: caching,
+	}
 }
 
 // shortCircuitTokens is the content-length threshold (in bytes, used as a
@@ -97,9 +116,14 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 		prof.EstTokensOut = detOut
 	}
 
-	multipliers := r.cacheInputMultipliers(chat)
+	// Compute session ID once; reuse for both sticky and cache multipliers.
+	sid := ""
+	if r.cfg.Routing.SessionSticky || r.cfg.Routing.CacheAware {
+		sid = SessionID(chat)
+	}
+	multipliers := r.cacheInputMultipliersForSession(chat, sid)
 	d := ScoreWithInputMultipliers(prof, r.cfg.Catalog, r.cfg.Weights, multipliers)
-	if sticky := r.stickyModel(chat); sticky != "" {
+	if sticky := r.stickyModelForSession(sid); sticky != "" {
 		for _, id := range d.Eligible {
 			if id == sticky {
 				d.Chosen = sticky
@@ -158,41 +182,34 @@ func SessionID(chat llm.ChatRequest) string {
 	return "derived:" + hex.EncodeToString(h.Sum(nil))
 }
 
-func (r *Router) stickyModel(chat llm.ChatRequest) string {
-	if !r.cfg.Routing.SessionSticky {
+func (r *Router) stickyModelForSession(sid string) string {
+	if !r.cfg.Routing.SessionSticky || sid == "" {
 		return ""
 	}
 	now := time.Now()
-	id := SessionID(chat)
 	r.sessionsMu.Lock()
 	defer r.sessionsMu.Unlock()
-	state, ok := r.sessions[id]
+	state, ok := r.sessions[sid]
 	if !ok || !state.ExpiresAt.After(now) {
-		delete(r.sessions, id)
+		delete(r.sessions, sid)
 		return ""
 	}
 	return state.Model
 }
 
-func (r *Router) cacheInputMultipliers(chat llm.ChatRequest) map[string]float64 {
+func (r *Router) cacheInputMultipliersForSession(chat llm.ChatRequest, sid string) map[string]float64 {
 	ttl := cacheTTL(chat)
-	if !r.cfg.Routing.CacheAware || ttl == 0 {
+	if !r.cfg.Routing.CacheAware || ttl == 0 || sid == "" {
 		return nil
 	}
 	now := time.Now()
-	id := SessionID(chat)
 	r.sessionsMu.Lock()
-	state := r.sessions[id]
+	state := r.sessions[sid]
 	r.sessionsMu.Unlock()
 
 	multipliers := make(map[string]float64)
 	for _, entry := range r.cfg.Catalog {
-		prov, _, err := r.reg.Resolve(entry.ID)
-		if err != nil {
-			continue
-		}
-		capable, ok := prov.(llm.PromptCachingProvider)
-		if !ok || !capable.SupportsPromptCaching() {
+		if !r.cachingModels[entry.ID] {
 			continue
 		}
 		multipliers[entry.ID] = cacheWrite5mInputMultiplier
@@ -359,6 +376,13 @@ func requestHasImages(chat llm.ChatRequest) bool {
 		}
 	}
 	return false
+}
+
+// NeedsObservation reports whether the router requires post-request observation
+// (session affinity or cache-aware scoring). When false the server can skip the
+// observeEvents wrapper goroutine entirely, reducing per-request overhead.
+func (r *Router) NeedsObservation() bool {
+	return r.cfg.Routing.SessionSticky || r.cfg.Routing.CacheAware
 }
 
 // SetClassifier overrides the classification function (test seam).

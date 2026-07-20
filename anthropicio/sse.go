@@ -25,9 +25,9 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 	}
 	for ev := range events {
 		switch ev.Type {
-		case eventThinkingBlock:
-			if thinking, signature, ok := eventThinking(ev); ok {
-				if err := enc.thinkingBlock(thinking, signature); err != nil {
+		case llm.EventThinkingBlock:
+			if ev.ThinkingBlock != nil {
+				if err := enc.thinkingBlock(ev.ThinkingBlock.Thinking, ev.ThinkingBlock.Signature); err != nil {
 					return err
 				}
 			}
@@ -59,9 +59,9 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 			return enc.done(ev.StopReason, ev.Usage)
 		}
 	}
-	// Channel closed without an explicit EventDone (e.g. provider closed
-	// early): finish cleanly with end_turn and zero usage.
-	return enc.done("end_turn", nil)
+	// A provider channel must end with EventDone or EventError. Treat an
+	// unannounced closure as truncation rather than fabricating a clean result.
+	return enc.errorEvent(errString("provider stream closed without terminal event"))
 }
 
 // sseState tracks block indices and the currently-open block so the emitted

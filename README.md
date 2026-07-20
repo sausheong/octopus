@@ -58,7 +58,7 @@ Classifier failures (timeout, parse error, unresolvable provider) fall back to `
 
 ### Scorer
 
-The scorer applies two passes to the catalog:
+The scorer applies three stages to the catalog:
 
 1. **Hard capability filter**: eliminates models missing required tool or vision support, or whose context window is too small. Reasoning support is a preference, so a classifier failure cannot make ordinary local models unavailable.
 2. **Quality floor for hard tasks**: if difficulty is `high`, models below quality 0.85 are dropped — but only when at least one model clears the floor, so the set is never emptied on quality alone.
@@ -138,6 +138,11 @@ weights:
   cost: 0.3
   speed: 0.2
 
+routing:
+  session_sticky: true
+  session_ttl: "1h"
+  cache_aware: true
+
 providers:
   anthropic:
     api_key_env: "ANTHROPIC_API_KEY"
@@ -150,6 +155,15 @@ catalog:
     speed: 0.95
     caps: { tools: true, vision: true, reasoning: false, max_context: 200000 }
 ```
+
+Prompt caching is transparent to Claude Code: Anthropic `cache_control`
+markers and their `5m`/`1h` TTLs are preserved on system blocks, tools,
+messages, and the top-level request. Conversation affinity uses
+`metadata.user_id`; clients may override it with the
+`X-LLMRouter-Session-ID` header. If neither is present, the router derives a
+stable ID from the conversation's initial cacheable prefix. Cache creation and
+read token counts are returned in Anthropic usage responses and written to the
+request log.
 
 ### Run
 
@@ -172,7 +186,7 @@ Or with a custom config path:
 
 | Field  | Description                        |
 |--------|------------------------------------|
-| `addr` | Listen address (e.g. `127.0.0.1:8787`) |
+| `addr` | Loopback listen address (e.g. `127.0.0.1:8787`). Non-loopback binding is rejected because inbound requests are unauthenticated. |
 
 ### `classifier` (optional)
 

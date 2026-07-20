@@ -35,10 +35,10 @@ func DefaultProfile() TaskProfile {
 // Routes toward cheap/fast models; no special capabilities assumed.
 func TrivialProfile() TaskProfile {
 	return TaskProfile{
-		Difficulty:  "trivial",
-		EstTokensIn: 100,
+		Difficulty:   "trivial",
+		EstTokensIn:  100,
 		EstTokensOut: 200,
-		Domain:      "other",
+		Domain:       "other",
 	}
 }
 

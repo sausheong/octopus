@@ -2,8 +2,12 @@ package router
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/sausheong/harness/llm"
@@ -18,12 +22,21 @@ type Router struct {
 	// classifyFn is the classification seam; defaults to Classify. Tests
 	// override it to avoid real provider calls.
 	classifyFn func(ctx context.Context, prov llm.LLMProvider, model string, maxTokens int, turn llm.Message) TaskProfile
+	sessionsMu sync.Mutex
+	sessions   map[string]sessionState
+}
+
+type sessionState struct {
+	Model         string
+	ExpiresAt     time.Time
+	CacheUntil    time.Time
+	CacheFraction float64
 }
 
 // NewRouter builds a Router. The classifier provider is resolved per request
 // from the registry using cfg.Classifier.Model.
 func NewRouter(cfg *config.Config, reg *registry.Registry) *Router {
-	return &Router{cfg: cfg, reg: reg, classifyFn: Classify}
+	return &Router{cfg: cfg, reg: reg, classifyFn: Classify, sessions: make(map[string]sessionState)}
 }
 
 // shortCircuitTokens is the content-length threshold (in bytes, used as a
@@ -84,7 +97,17 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 		prof.EstTokensOut = detOut
 	}
 
-	d := Score(prof, r.cfg.Catalog, r.cfg.Weights)
+	multipliers := r.cacheInputMultipliers(chat)
+	d := ScoreWithInputMultipliers(prof, r.cfg.Catalog, r.cfg.Weights, multipliers)
+	if sticky := r.stickyModel(chat); sticky != "" {
+		for _, id := range d.Eligible {
+			if id == sticky {
+				d.Chosen = sticky
+				d.Reason = "sticky session affinity"
+				break
+			}
+		}
+	}
 	// If the profile benefits from reasoning, recommend medium effort. The
 	// server applies it only to candidates that advertise reasoning support.
 	if prof.NeedsReasoning {
@@ -102,13 +125,183 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 	return d
 }
 
+const (
+	cacheReadInputMultiplier       = 0.10
+	cacheWrite5mInputMultiplier    = 1.25
+	cacheWrite1HourInputMultiplier = 2.00
+)
+
+// SessionID returns an explicit client session ID, or a deterministic fallback
+// based on the stable conversation prefix used by prompt caching.
+func SessionID(chat llm.ChatRequest) string {
+	if chat.SessionID != "" {
+		sum := sha256.Sum256([]byte(chat.SessionID))
+		return "explicit:" + hex.EncodeToString(sum[:])
+	}
+	h := sha256.New()
+	h.Write([]byte(chat.SystemPrompt))
+	for _, part := range chat.SystemPromptParts {
+		h.Write([]byte(part.Text))
+		h.Write([]byte{0})
+	}
+	for _, tool := range chat.Tools {
+		h.Write([]byte(tool.Name))
+		h.Write(tool.Parameters)
+		h.Write([]byte{0})
+	}
+	for _, msg := range chat.Messages {
+		if msg.Role == "user" && msg.ToolCallID == "" {
+			h.Write([]byte(msg.Content))
+			break
+		}
+	}
+	return "derived:" + hex.EncodeToString(h.Sum(nil))
+}
+
+func (r *Router) stickyModel(chat llm.ChatRequest) string {
+	if !r.cfg.Routing.SessionSticky {
+		return ""
+	}
+	now := time.Now()
+	id := SessionID(chat)
+	r.sessionsMu.Lock()
+	defer r.sessionsMu.Unlock()
+	state, ok := r.sessions[id]
+	if !ok || !state.ExpiresAt.After(now) {
+		delete(r.sessions, id)
+		return ""
+	}
+	return state.Model
+}
+
+func (r *Router) cacheInputMultipliers(chat llm.ChatRequest) map[string]float64 {
+	ttl := cacheTTL(chat)
+	if !r.cfg.Routing.CacheAware || ttl == 0 {
+		return nil
+	}
+	now := time.Now()
+	id := SessionID(chat)
+	r.sessionsMu.Lock()
+	state := r.sessions[id]
+	r.sessionsMu.Unlock()
+
+	multipliers := make(map[string]float64)
+	for _, entry := range r.cfg.Catalog {
+		prov, _, err := r.reg.Resolve(entry.ID)
+		if err != nil {
+			continue
+		}
+		capable, ok := prov.(llm.PromptCachingProvider)
+		if !ok || !capable.SupportsPromptCaching() {
+			continue
+		}
+		multipliers[entry.ID] = cacheWrite5mInputMultiplier
+		if ttl == time.Hour {
+			multipliers[entry.ID] = cacheWrite1HourInputMultiplier
+		}
+		if state.Model == entry.ID && state.CacheUntil.After(now) {
+			fraction := state.CacheFraction
+			if fraction <= 0 || fraction > 1 {
+				fraction = 1
+			}
+			multipliers[entry.ID] = 1 - fraction + fraction*cacheReadInputMultiplier
+		}
+	}
+	return multipliers
+}
+
+// Observe records the provider that completed a turn and any prompt cache it
+// created or read. It is safe to call concurrently from streaming requests.
+func (r *Router) Observe(chat llm.ChatRequest, model string, usage *llm.Usage) {
+	if !r.cfg.Routing.SessionSticky && !r.cfg.Routing.CacheAware {
+		return
+	}
+	now := time.Now()
+	ttl := r.cfg.Routing.SessionTTL
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	id := SessionID(chat)
+	r.sessionsMu.Lock()
+	previous := r.sessions[id]
+	r.sessionsMu.Unlock()
+	state := sessionState{Model: model, ExpiresAt: now.Add(ttl)}
+	if previous.Model == model && previous.CacheUntil.After(now) {
+		state.CacheUntil = previous.CacheUntil
+		state.CacheFraction = previous.CacheFraction
+	}
+	if usage != nil && (usage.CacheCreationInputTokens > 0 || usage.CacheReadInputTokens > 0) {
+		if cacheDuration := cacheTTL(chat); cacheDuration > 0 {
+			state.CacheUntil = now.Add(cacheDuration)
+			cached := usage.CacheCreationInputTokens + usage.CacheReadInputTokens
+			total := cached + usage.InputTokens
+			if total > 0 {
+				state.CacheFraction = float64(cached) / float64(total)
+			}
+		}
+	}
+	r.sessionsMu.Lock()
+	const maxSessionEntries = 4096
+	if _, exists := r.sessions[id]; !exists && len(r.sessions) >= maxSessionEntries {
+		for key, candidate := range r.sessions {
+			if !candidate.ExpiresAt.After(now) {
+				delete(r.sessions, key)
+			}
+		}
+		for len(r.sessions) >= maxSessionEntries {
+			for key := range r.sessions {
+				delete(r.sessions, key)
+				break
+			}
+		}
+	}
+	r.sessions[id] = state
+	r.sessionsMu.Unlock()
+	if usage != nil {
+		slog.Info("prompt cache usage", "model", model,
+			"cache_creation_input_tokens", usage.CacheCreationInputTokens,
+			"cache_read_input_tokens", usage.CacheReadInputTokens)
+	}
+}
+
+func cacheTTL(chat llm.ChatRequest) time.Duration {
+	var controls []*llm.CacheControl
+	controls = append(controls, chat.CacheControl)
+	for _, part := range chat.SystemPromptParts {
+		controls = append(controls, part.CacheControl)
+		if part.Cache {
+			controls = append(controls, &llm.CacheControl{Type: "ephemeral"})
+		}
+	}
+	for i := range chat.Tools {
+		controls = append(controls, chat.Tools[i].CacheControl)
+	}
+	for i := range chat.Messages {
+		controls = append(controls, chat.Messages[i].CacheControl)
+	}
+	if chat.CacheLastMessage {
+		controls = append(controls, &llm.CacheControl{Type: "ephemeral"})
+	}
+	var ttl time.Duration
+	for _, control := range controls {
+		if control == nil {
+			continue
+		}
+		if control.TTL == "1h" {
+			return time.Hour
+		}
+		ttl = 5 * time.Minute
+	}
+	return ttl
+}
+
 const maxClassifierContextBytes = 12 << 10
 
 // classificationTurn gives the classifier enough recent conversation to
 // understand replies such as "continue" while bounding classifier cost. A
 // genuinely single-turn request is passed through unchanged.
 func classificationTurn(chat llm.ChatRequest, turn llm.Message) llm.Message {
-	if chat.SystemPrompt == "" && len(chat.Messages) == 1 {
+	if chat.SystemPrompt == "" && len(chat.Messages) == 1 && len(turn.Content) <= maxClassifierContextBytes {
 		return turn
 	}
 
@@ -139,35 +332,23 @@ func classificationTurn(chat llm.ChatRequest, turn llm.Message) llm.Message {
 		chunks = append(chunks, b.String())
 	}
 
-	// Retain whole recent turns where possible; only an individually oversized
-	// latest turn is truncated, at a UTF-8 boundary.
-	selected := make([]string, 0, len(chunks))
-	used := 0
-	for i := len(chunks) - 1; i >= 0; i-- {
-		need := len(chunks[i])
-		if len(selected) > 0 {
-			need++
+	content := strings.Join(chunks, "\n")
+	if len(content) > maxClassifierContextBytes {
+		const marker = "\n...[middle context omitted]...\n"
+		available := maxClassifierContextBytes - len(marker)
+		headBytes := available / 2
+		tailBytes := available - headBytes
+		head := content[:headBytes]
+		for !utf8.ValidString(head) {
+			head = head[:len(head)-1]
 		}
-		if used+need > maxClassifierContextBytes {
-			if len(selected) == 0 {
-				s := chunks[i]
-				if len(s) > maxClassifierContextBytes {
-					s = s[len(s)-maxClassifierContextBytes:]
-					for !utf8.ValidString(s) {
-						s = s[1:]
-					}
-				}
-				selected = append(selected, s)
-			}
-			break
+		tail := content[len(content)-tailBytes:]
+		for !utf8.ValidString(tail) {
+			tail = tail[1:]
 		}
-		selected = append(selected, chunks[i])
-		used += need
+		content = head + marker + tail
 	}
-	for i, j := 0, len(selected)-1; i < j; i, j = i+1, j-1 {
-		selected[i], selected[j] = selected[j], selected[i]
-	}
-	return llm.Message{Role: "user", Content: strings.Join(selected, "\n")}
+	return llm.Message{Role: "user", Content: content, Images: turn.Images}
 }
 
 // requestHasImages reports whether any message carries image content.

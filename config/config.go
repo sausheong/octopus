@@ -6,6 +6,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -77,11 +78,19 @@ type ClassifierCfg struct {
 	Timeout   time.Duration `yaml:"timeout"`
 }
 
+// RoutingCfg controls conversation affinity and cache-aware request pricing.
+type RoutingCfg struct {
+	SessionSticky bool          `yaml:"session_sticky"`
+	SessionTTL    time.Duration `yaml:"session_ttl"`
+	CacheAware    bool          `yaml:"cache_aware"`
+}
+
 // Config is the full router configuration.
 type Config struct {
 	ServerAddr string        `yaml:"-"`
 	Classifier ClassifierCfg `yaml:"classifier"`
 	Weights    Weights       `yaml:"weights"`
+	Routing    RoutingCfg    `yaml:"routing"`
 	// DefaultModel is accepted for compatibility with older configuration
 	// files. It is deprecated and ignored; an empty eligible set is an error.
 	DefaultModel string                   `yaml:"default_model"`
@@ -95,8 +104,13 @@ type yamlConfig struct {
 	Server struct {
 		Addr string `yaml:"addr"`
 	} `yaml:"server"`
-	Classifier   ClassifierCfg            `yaml:"classifier"`
-	Weights      Weights                  `yaml:"weights"`
+	Classifier ClassifierCfg `yaml:"classifier"`
+	Weights    Weights       `yaml:"weights"`
+	Routing    struct {
+		SessionSticky *bool         `yaml:"session_sticky"`
+		SessionTTL    time.Duration `yaml:"session_ttl"`
+		CacheAware    *bool         `yaml:"cache_aware"`
+	} `yaml:"routing"`
 	DefaultModel string                   `yaml:"default_model"`
 	Providers    map[string]ProviderCreds `yaml:"providers"`
 	Catalog      []CatalogEntry           `yaml:"catalog"`
@@ -114,10 +128,26 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(&yc); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	sticky, cacheAware := true, true
+	if yc.Routing.SessionSticky != nil {
+		sticky = *yc.Routing.SessionSticky
+	}
+	if yc.Routing.CacheAware != nil {
+		cacheAware = *yc.Routing.CacheAware
+	}
+	sessionTTL := yc.Routing.SessionTTL
+	if sessionTTL == 0 {
+		sessionTTL = time.Hour
+	}
 	c := &Config{
-		ServerAddr:   yc.Server.Addr,
-		Classifier:   yc.Classifier,
-		Weights:      yc.Weights,
+		ServerAddr: yc.Server.Addr,
+		Classifier: yc.Classifier,
+		Weights:    yc.Weights,
+		Routing: RoutingCfg{
+			SessionSticky: sticky,
+			SessionTTL:    sessionTTL,
+			CacheAware:    cacheAware,
+		},
 		DefaultModel: yc.DefaultModel,
 		Providers:    yc.Providers,
 		Catalog:      yc.Catalog,
@@ -144,6 +174,16 @@ func (c *Config) Validate() error {
 	if c.ServerAddr == "" {
 		return fmt.Errorf("server.addr is required")
 	}
+	host, _, err := net.SplitHostPort(c.ServerAddr)
+	if err != nil {
+		return fmt.Errorf("server.addr must be in host:port form: %w", err)
+	}
+	if !strings.EqualFold(host, "localhost") {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("server.addr must use a loopback host because inbound requests are unauthenticated")
+		}
+	}
 	finite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 	if !finite(c.Weights.Quality) || !finite(c.Weights.Cost) || !finite(c.Weights.Speed) {
 		return fmt.Errorf("weights must be finite numbers")
@@ -153,6 +193,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Weights.Quality+c.Weights.Cost+c.Weights.Speed == 0 {
 		return fmt.Errorf("weights must not all be zero")
+	}
+	if c.Routing.SessionTTL < 0 {
+		return fmt.Errorf("routing.session_ttl must not be negative")
+	}
+	if c.Routing.SessionSticky && c.Routing.SessionTTL == 0 {
+		c.Routing.SessionTTL = time.Hour
 	}
 	if len(c.Catalog) == 0 {
 		return fmt.Errorf("catalog must have at least one entry")

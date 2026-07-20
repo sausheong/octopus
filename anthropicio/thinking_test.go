@@ -2,7 +2,6 @@ package anthropicio
 
 import (
 	"encoding/json"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -11,16 +10,9 @@ import (
 
 func thinkingEvent(t *testing.T, thinking, signature string) llm.ChatEvent {
 	t.Helper()
-	ev := llm.ChatEvent{Type: eventThinkingBlock}
-	f := reflect.ValueOf(&ev).Elem().FieldByName("ThinkingBlock")
-	if !f.IsValid() {
-		t.Skip("thinking-block API requires the post-v0.3.2 harness workspace")
-	}
-	block := reflect.New(f.Type().Elem())
-	block.Elem().FieldByName("Thinking").SetString(thinking)
-	block.Elem().FieldByName("Signature").SetString(signature)
-	f.Set(block)
-	return ev
+	return llm.ChatEvent{Type: llm.EventThinkingBlock, ThinkingBlock: &llm.ThinkingBlock{
+		Thinking: thinking, Signature: signature,
+	}}
 }
 
 func TestThinkingBlockRoundTripsThroughAnthropicEncoders(t *testing.T) {
@@ -48,21 +40,15 @@ func TestThinkingBlockRoundTripsThroughAnthropicEncoders(t *testing.T) {
 }
 
 func TestDecodePreservesThinkingBlock(t *testing.T) {
-	// Skip cleanly against the last tagged harness; the workspace harness has
-	// the field and exercises the full inbound continuation path.
-	probe := reflect.ValueOf(llm.Message{}).FieldByName("ThinkingBlocks")
-	if !probe.IsValid() {
-		t.Skip("thinking-block API requires the post-v0.3.2 harness workspace")
-	}
 	dr, err := Decode([]byte(`{"max_tokens":1,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"why","signature":"sig"},{"type":"text","text":"answer"}]}]}`))
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	blocks := reflect.ValueOf(dr.Chat.Messages[0]).FieldByName("ThinkingBlocks")
-	if blocks.Len() != 1 {
-		t.Fatalf("thinking blocks=%d", blocks.Len())
+	blocks := dr.Chat.Messages[0].ThinkingBlocks
+	if len(blocks) != 1 {
+		t.Fatalf("thinking blocks=%d", len(blocks))
 	}
-	got, _ := json.Marshal(blocks.Interface())
+	got, _ := json.Marshal(blocks)
 	if !strings.Contains(string(got), `"thinking":"why"`) || !strings.Contains(string(got), `"signature":"sig"`) {
 		t.Fatalf("thinking block not preserved: %s", got)
 	}

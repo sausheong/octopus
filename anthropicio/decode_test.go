@@ -48,6 +48,49 @@ func TestDecodeSystemArray(t *testing.T) {
 	}
 }
 
+func TestDecodePreservesPromptCacheControls(t *testing.T) {
+	body := []byte(`{
+		"model":"m","max_tokens":10,
+		"metadata":{"user_id":"claude-session-1"},
+		"cache_control":{"type":"ephemeral","ttl":"1h"},
+		"system":[
+			{"type":"text","text":"stable","cache_control":{"type":"ephemeral","ttl":"1h"}},
+			{"type":"text","text":"dynamic"}
+		],
+		"tools":[{"name":"get","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"prefix","cache_control":{"type":"ephemeral","ttl":"5m"}},
+			{"type":"text","text":"suffix"}
+		]}]
+	}`)
+	dr, err := Decode(body)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if dr.Chat.SessionID != "claude-session-1" {
+		t.Fatalf("SessionID = %q", dr.Chat.SessionID)
+	}
+	if dr.Chat.CacheControl == nil || dr.Chat.CacheControl.TTL != "1h" {
+		t.Fatalf("top-level CacheControl = %+v", dr.Chat.CacheControl)
+	}
+	if len(dr.Chat.SystemPromptParts) != 2 || dr.Chat.SystemPromptParts[0].CacheControl == nil || dr.Chat.SystemPromptParts[0].CacheControl.TTL != "1h" {
+		t.Fatalf("SystemPromptParts = %+v", dr.Chat.SystemPromptParts)
+	}
+	if dr.Chat.Tools[0].CacheControl == nil || dr.Chat.Tools[0].CacheControl.Type != "ephemeral" {
+		t.Fatalf("tool CacheControl = %+v", dr.Chat.Tools[0].CacheControl)
+	}
+	if len(dr.Chat.Messages) != 2 || dr.Chat.Messages[0].Content != "prefix" || dr.Chat.Messages[0].CacheControl == nil || dr.Chat.Messages[1].Content != "suffix" {
+		t.Fatalf("Messages = %+v", dr.Chat.Messages)
+	}
+}
+
+func TestDecodeRejectsInvalidCacheControl(t *testing.T) {
+	body := []byte(`{"model":"m","max_tokens":1,"cache_control":{"type":"persistent"},"messages":[{"role":"user","content":"x"}]}`)
+	if _, err := Decode(body); err == nil || !strings.Contains(err.Error(), "cache_control") {
+		t.Fatalf("Decode error = %v, want invalid cache_control", err)
+	}
+}
+
 func TestDecodeImageBlock(t *testing.T) {
 	// "aGk=" is base64 for "hi".
 	body := []byte(`{
@@ -109,6 +152,30 @@ func TestDecodeToolUseAndResult(t *testing.T) {
 	tr := dr.Chat.Messages[2]
 	if tr.Role != "user" || tr.ToolCallID != "toolu_1" || tr.Content != "42" {
 		t.Errorf("tool_result message = %+v", tr)
+	}
+}
+
+func TestDecodeToolResultWithImage(t *testing.T) {
+	body := []byte(`{
+		"model":"m","max_tokens":1,
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"screenshot","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},
+				{"type":"text","text":"captured"}
+			]}]}
+		]
+	}`)
+	dr, err := Decode(body)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	result := dr.Chat.Messages[1]
+	if result.Content != "captured" || len(result.Images) != 1 {
+		t.Fatalf("tool result = %+v", result)
+	}
+	if result.Images[0].MimeType != "image/png" || string(result.Images[0].Data) != "hi" {
+		t.Fatalf("tool result image = %+v", result.Images[0])
 	}
 }
 

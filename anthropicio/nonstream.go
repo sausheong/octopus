@@ -26,13 +26,15 @@ func CollectMessage(model string, events <-chan llm.ChatEvent) ([]byte, error) {
 	}
 	var thinking []thinkingBlock
 	stopReason := "end_turn"
-	in, out := 0, 0
+	in, out, cacheCreation, cacheRead := 0, 0, 0, 0
+	done := false
 
+eventLoop:
 	for ev := range events {
 		switch ev.Type {
-		case eventThinkingBlock:
-			if body, signature, ok := eventThinking(ev); ok {
-				thinking = append(thinking, thinkingBlock{Type: "thinking", Thinking: body, Signature: signature})
+		case llm.EventThinkingBlock:
+			if ev.ThinkingBlock != nil {
+				thinking = append(thinking, thinkingBlock{Type: "thinking", Thinking: ev.ThinkingBlock.Thinking, Signature: ev.ThinkingBlock.Signature})
 			}
 		case llm.EventTextDelta:
 			text.WriteString(ev.Text)
@@ -52,14 +54,21 @@ func CollectMessage(model string, events <-chan llm.ChatEvent) ([]byte, error) {
 			}
 			return nil, errString("stream error")
 		case llm.EventDone:
+			done = true
 			if ev.StopReason != "" {
 				stopReason = ev.StopReason
 			}
 			if ev.Usage != nil {
 				in = ev.Usage.InputTokens
 				out = ev.Usage.OutputTokens
+				cacheCreation = ev.Usage.CacheCreationInputTokens
+				cacheRead = ev.Usage.CacheReadInputTokens
 			}
+			break eventLoop
 		}
+	}
+	if !done {
+		return nil, errString("provider stream closed without terminal event")
 	}
 
 	var content []any
@@ -76,6 +85,13 @@ func CollectMessage(model string, events <-chan llm.ChatEvent) ([]byte, error) {
 		content = []any{}
 	}
 
+	usage := map[string]any{"input_tokens": in, "output_tokens": out}
+	if cacheCreation > 0 {
+		usage["cache_creation_input_tokens"] = cacheCreation
+	}
+	if cacheRead > 0 {
+		usage["cache_read_input_tokens"] = cacheRead
+	}
 	msg := map[string]any{
 		"id":            newMessageID(),
 		"type":          "message",
@@ -84,7 +100,7 @@ func CollectMessage(model string, events <-chan llm.ChatEvent) ([]byte, error) {
 		"content":       content,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
-		"usage":         map[string]any{"input_tokens": in, "output_tokens": out},
+		"usage":         usage,
 	}
 	return json.Marshal(msg)
 }

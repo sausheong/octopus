@@ -26,7 +26,7 @@ func Decode(body []byte) (llm.ChatRequest, bool, string, error) {
 		return llm.ChatRequest{}, false, "", fmt.Errorf("temperature must be a finite number in [0,2]")
 	}
 
-	chat := llm.ChatRequest{Model: wr.Model}
+	chat := llm.ChatRequest{Model: wr.Model, SessionID: wr.User}
 	if wr.MaxTokens != nil {
 		chat.MaxTokens = *wr.MaxTokens
 	}

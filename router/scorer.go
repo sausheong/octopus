@@ -44,7 +44,11 @@ func eligible(p TaskProfile, e config.CatalogEntry) bool {
 
 // reqCost estimates the dollar cost of the request on a given model.
 func reqCost(p TaskProfile, e config.CatalogEntry) float64 {
-	return float64(p.EstTokensIn)/1e6*e.CostPerMTokIn +
+	return reqCostWithInputMultiplier(p, e, 1)
+}
+
+func reqCostWithInputMultiplier(p TaskProfile, e config.CatalogEntry, inputMultiplier float64) float64 {
+	return float64(p.EstTokensIn)/1e6*e.CostPerMTokIn*inputMultiplier +
 		float64(p.EstTokensOut)/1e6*e.CostPerMTokOut
 }
 
@@ -75,6 +79,12 @@ func normalize(vals []float64) []float64 {
 // not a hard requirement: ordinary models can still serve a request when no
 // reasoning-capable model is available.
 func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights) Decision {
+	return ScoreWithInputMultipliers(p, catalog, w, nil)
+}
+
+// ScoreWithInputMultipliers applies per-model input-token price multipliers.
+// Missing entries use ordinary uncached pricing (1x).
+func ScoreWithInputMultipliers(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, multipliers map[string]float64) Decision {
 	var elig []config.CatalogEntry
 	for _, e := range catalog {
 		if eligible(p, e) {
@@ -118,7 +128,11 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights) Decis
 	for i, e := range elig {
 		qualities[i] = e.Quality
 		speeds[i] = e.Speed
-		c := reqCost(p, e)
+		multiplier := multipliers[e.ID]
+		if multiplier == 0 {
+			multiplier = 1
+		}
+		c := reqCostWithInputMultiplier(p, e, multiplier)
 		if c > 0 {
 			paidInvCosts = append(paidInvCosts, 1/c)
 			paidIdx = append(paidIdx, i)
@@ -140,7 +154,11 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights) Decis
 	}
 	for i := range elig {
 		// Free model: cost score is 1.0, beating every paid model.
-		if costScores[i] == 0 && reqCost(p, elig[i]) <= 0 {
+		multiplier := multipliers[elig[i].ID]
+		if multiplier == 0 {
+			multiplier = 1
+		}
+		if costScores[i] == 0 && reqCostWithInputMultiplier(p, elig[i], multiplier) <= 0 {
 			costScores[i] = 1.0
 		}
 	}

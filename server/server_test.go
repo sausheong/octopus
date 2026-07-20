@@ -53,6 +53,21 @@ func (p *errProv) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan l
 	return nil, p.err
 }
 
+// partialProv emits content but violates the stream contract by closing before
+// EventDone. Buffered handlers must reject it and try the next candidate.
+type partialProv struct{}
+
+func (p *partialProv) Models() []llm.ModelInfo { return nil }
+func (p *partialProv) NormalizeToolSchema(t []llm.ToolDef) ([]llm.ToolDef, []llm.Diagnostic) {
+	return t, nil
+}
+func (p *partialProv) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	ch := make(chan llm.ChatEvent, 1)
+	ch <- llm.ChatEvent{Type: llm.EventTextDelta, Text: "truncated"}
+	close(ch)
+	return ch, nil
+}
+
 // buildServerWithProv wires a Server whose registry + router use the supplied
 // provider for the "anthropic" backend.
 func buildServerWithProv(t *testing.T, prov llm.LLMProvider) *Server {
@@ -281,6 +296,33 @@ func TestHandlerFallbackOnProviderError(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "fallback response") {
 		t.Errorf("expected fallback response in body: %s", rec.Body.String())
+	}
+}
+
+func TestHandlerFallbackOnPrematureProviderClosure(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr: "127.0.0.1:8787",
+		Weights:    config.Weights{Quality: 1},
+		Providers: map[string]config.ProviderCreds{
+			"partial": {APIKeyEnv: "X"},
+			"good":    {APIKeyEnv: "X"},
+		},
+		Catalog: []config.CatalogEntry{
+			{ID: "partial/model", Quality: 0.9, Caps: config.Caps{MaxContext: 200000}},
+			{ID: "good/model", Quality: 0.7, Caps: config.Caps{MaxContext: 200000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{
+		"partial": &partialProv{},
+		"good":    &fakeProv{text: "complete fallback"},
+	})
+	s := New(router.NewRouter(cfg, reg), reg, cfg.Catalog)
+	body := `{"model":"any","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "complete fallback") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

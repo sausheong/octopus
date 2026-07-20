@@ -13,6 +13,7 @@ type wireRequest struct {
 	Temperature *float64      `json:"temperature"`
 	Messages    []wireMessage `json:"messages"`
 	Tools       []wireTool    `json:"tools"`
+	User        string        `json:"user"`
 }
 
 type wireMessage struct {
@@ -24,9 +25,9 @@ type wireMessage struct {
 }
 
 type contentPart struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text"`
-	ImageURL *imageURL       `json:"image_url"`
+	Type     string    `json:"type"`
+	Text     string    `json:"text"`
+	ImageURL *imageURL `json:"image_url"`
 }
 
 type imageURL struct {

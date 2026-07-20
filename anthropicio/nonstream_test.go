@@ -86,3 +86,10 @@ func TestCollectError(t *testing.T) {
 		t.Fatal("expected error from EventError")
 	}
 }
+
+func TestCollectRejectsMissingDone(t *testing.T) {
+	_, err := CollectMessage("m", feed(llm.ChatEvent{Type: llm.EventTextDelta, Text: "partial"}))
+	if err == nil {
+		t.Fatal("expected premature channel closure to fail")
+	}
+}

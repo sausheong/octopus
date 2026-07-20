@@ -16,6 +16,15 @@ weights:
   cost: 0.3
   speed: 0.2
 
+# Keep a conversation on the same backend so provider prompt-cache entries
+# remain reusable. Cache-aware scoring uses 0.1x input pricing for known reads,
+# 1.25x for 5-minute writes, and 2x for 1-hour writes. These are enabled by
+# default when omitted.
+routing:
+  session_sticky: true
+  session_ttl: "1h"
+  cache_aware: true
+
 # Backend credentials: api_key_env names the env var holding the key.
 providers:
   anthropic:

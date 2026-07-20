@@ -137,7 +137,7 @@ func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, ch
 		if id != dec.Chosen {
 			slog.Info("using fallback model", "model", id, "original", dec.Chosen)
 		}
-		return out, id, nil
+		return s.observeEvents(chat, id, out), id, nil
 	}
 	return nil, "", lastErr
 }
@@ -179,7 +179,7 @@ func (s *Server) collectWithFallback(
 			continue
 		}
 
-		out, err := collect(id, peeked)
+		out, err := collect(id, s.observeEvents(chat, id, peeked))
 		if err != nil {
 			lastErr = err
 			slog.Warn("provider collection failed, trying fallback", "model", id, "err", err)
@@ -192,6 +192,20 @@ func (s *Server) collectWithFallback(
 		return out, id, nil
 	}
 	return nil, "", lastErr
+}
+
+func (s *Server) observeEvents(chat llm.ChatRequest, model string, in <-chan llm.ChatEvent) <-chan llm.ChatEvent {
+	out := make(chan llm.ChatEvent, 1)
+	go func() {
+		defer close(out)
+		for ev := range in {
+			if ev.Type == llm.EventDone {
+				s.rt.Observe(chat, model, ev.Usage)
+			}
+			out <- ev
+		}
+	}()
+	return out
 }
 
 type errString string
@@ -312,6 +326,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, anthropicio.NewAPIError("invalid_request", err.Error()))
 		return
 	}
+	if sessionID := strings.TrimSpace(r.Header.Get("X-LLMRouter-Session-ID")); sessionID != "" {
+		dr.Chat.SessionID = sessionID
+	}
 
 	ctx := r.Context()
 	dec := s.rt.Route(ctx, dr.Chat)
@@ -372,6 +389,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeOAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
+	}
+	if sessionID := strings.TrimSpace(r.Header.Get("X-LLMRouter-Session-ID")); sessionID != "" {
+		chat.SessionID = sessionID
 	}
 
 	systemPrompt, msgs := openaiio.ExtractSystem(chat.Messages)

@@ -14,7 +14,9 @@ func CollectCompletion(model string, events <-chan llm.ChatEvent) ([]byte, error
 	var toolCalls []oaiToolCall
 	finishReason := "stop"
 	var usage *llm.Usage
+	done := false
 
+eventLoop:
 	for ev := range events {
 		switch ev.Type {
 		case llm.EventTextDelta:
@@ -40,11 +42,16 @@ func CollectCompletion(model string, events <-chan llm.ChatEvent) ([]byte, error
 			}
 			return nil, errString("stream error")
 		case llm.EventDone:
+			done = true
 			if ev.StopReason != "" {
 				finishReason = mapStopReason(ev.StopReason)
 			}
 			usage = ev.Usage
+			break eventLoop
 		}
+	}
+	if !done {
+		return nil, errString("provider stream closed without terminal event")
 	}
 
 	if len(toolCalls) > 0 {
@@ -69,11 +76,16 @@ func CollectCompletion(model string, events <-chan llm.ChatEvent) ([]byte, error
 		"choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finishReason}},
 	}
 	if usage != nil {
-		resp["usage"] = map[string]any{
-			"prompt_tokens":     usage.InputTokens,
+		promptTokens := usage.InputTokens + usage.CacheCreationInputTokens + usage.CacheReadInputTokens
+		usageObj := map[string]any{
+			"prompt_tokens":     promptTokens,
 			"completion_tokens": usage.OutputTokens,
-			"total_tokens":      usage.InputTokens + usage.OutputTokens,
+			"total_tokens":      promptTokens + usage.OutputTokens,
 		}
+		if usage.CacheReadInputTokens > 0 {
+			usageObj["prompt_tokens_details"] = map[string]any{"cached_tokens": usage.CacheReadInputTokens}
+		}
+		resp["usage"] = usageObj
 	}
 	return json.Marshal(resp)
 }

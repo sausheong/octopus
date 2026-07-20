@@ -416,3 +416,21 @@ func TestEncodeSSEError(t *testing.T) {
 		t.Errorf("missing [DONE] after error: %s", out)
 	}
 }
+
+func TestCollectCompletionRejectsMissingDone(t *testing.T) {
+	_, err := CollectCompletion("m", events(llm.ChatEvent{Type: llm.EventTextDelta, Text: "partial"}))
+	if err == nil {
+		t.Fatal("expected premature channel closure to fail")
+	}
+}
+
+func TestEncodeSSEPrematureClosureEmitsError(t *testing.T) {
+	w := &bufWriter{}
+	if err := EncodeSSE(w, "m", events(llm.ChatEvent{Type: llm.EventTextDelta, Text: "partial"})); err != nil {
+		t.Fatalf("EncodeSSE: %v", err)
+	}
+	out := w.String()
+	if !strings.Contains(out, "provider stream closed without terminal event") || !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("premature closure was not surfaced as an error: %s", out)
+	}
+}

@@ -30,6 +30,9 @@ func TestLoadValid(t *testing.T) {
 	if !c.Catalog[0].Caps.Vision {
 		t.Errorf("Catalog[0] vision should be true")
 	}
+	if !c.Routing.SessionSticky || !c.Routing.CacheAware || c.Routing.SessionTTL != time.Hour {
+		t.Errorf("Routing defaults = %+v", c.Routing)
+	}
 }
 
 func TestValidateMissingCredsForCatalogProvider(t *testing.T) {
@@ -51,6 +54,26 @@ func TestValidateNegativeWeight(t *testing.T) {
 	c.Weights.Cost = -0.1
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected error for negative weight")
+	}
+}
+
+func TestValidateRejectsNonLoopbackServerAddr(t *testing.T) {
+	c := baseValid()
+	for _, addr := range []string{"0.0.0.0:8787", ":8787", "192.168.1.20:8787", "example.com:8787"} {
+		c.ServerAddr = addr
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected non-loopback server.addr %q to be rejected", addr)
+		}
+	}
+}
+
+func TestValidateAcceptsLoopbackServerAddr(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:8787", "localhost:8787", "[::1]:8787"} {
+		c := baseValid()
+		c.ServerAddr = addr
+		if err := c.Validate(); err != nil {
+			t.Errorf("loopback server.addr %q rejected: %v", addr, err)
+		}
 	}
 }
 

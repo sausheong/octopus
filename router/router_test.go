@@ -18,6 +18,7 @@ func testCfg() *config.Config {
 		ServerAddr:   "x",
 		Classifier:   config.ClassifierCfg{Model: "anthropic/haiku", MaxTokens: 256, Timeout: time.Second},
 		Weights:      config.Weights{Quality: 0.5, Cost: 0.3, Speed: 0.2},
+		Routing:      config.RoutingCfg{SessionSticky: true, SessionTTL: time.Hour, CacheAware: true},
 		DefaultModel: "anthropic/haiku",
 		Providers:    map[string]config.ProviderCreds{"anthropic": {APIKeyEnv: "RT_ANTHROPIC"}},
 		Catalog: []config.CatalogEntry{
@@ -26,6 +27,51 @@ func testCfg() *config.Config {
 			{ID: "anthropic/haiku", Quality: 0.70, CostPerMTokIn: 1, CostPerMTokOut: 5, Speed: 0.95,
 				Caps: config.Caps{Tools: true, Vision: true, Reasoning: false, MaxContext: 200000}},
 		},
+	}
+}
+
+func TestRouteKeepsStickySessionOnSuccessfulModel(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	chat := llm.ChatRequest{SessionID: "session-a", MaxTokens: 1, Messages: []llm.Message{{Role: "user", Content: "hi"}}}
+	r.Observe(chat, "anthropic/opus", &llm.Usage{})
+	d := r.Route(context.Background(), chat)
+	if d.Chosen != "anthropic/opus" || d.Reason != "sticky session affinity" {
+		t.Fatalf("decision = %+v", d)
+	}
+}
+
+func TestRoutePricesKnownCacheReadBelowNewCacheWrite(t *testing.T) {
+	cfg := testCfg()
+	cfg.Routing.SessionSticky = false
+	cfg.Weights = config.Weights{Cost: 1}
+	cfg.Catalog = []config.CatalogEntry{
+		{ID: "anthropic/cached", Quality: 0.5, CostPerMTokIn: 10, Speed: 0.5, Caps: config.Caps{MaxContext: 100000}},
+		{ID: "anthropic/uncached", Quality: 0.5, CostPerMTokIn: 2, Speed: 0.5, Caps: config.Caps{MaxContext: 100000}},
+	}
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	chat := llm.ChatRequest{
+		SessionID:    "session-cache",
+		MaxTokens:    1,
+		CacheControl: &llm.CacheControl{Type: "ephemeral"},
+		Messages:     []llm.Message{{Role: "user", Content: strings.Repeat("x", 300)}},
+	}
+	r.Observe(chat, "anthropic/cached", &llm.Usage{CacheCreationInputTokens: 100})
+	d := r.Route(context.Background(), chat)
+	if d.Chosen != "anthropic/cached" {
+		t.Fatalf("chosen = %q, scores = %+v", d.Chosen, d.Scores)
+	}
+}
+
+func TestSessionIDStableAcrossGrowingConversation(t *testing.T) {
+	base := llm.ChatRequest{SystemPrompt: "system", Messages: []llm.Message{{Role: "user", Content: "first"}}}
+	grown := base
+	grown.Messages = append(append([]llm.Message(nil), base.Messages...),
+		llm.Message{Role: "assistant", Content: "answer"}, llm.Message{Role: "user", Content: "next"})
+	if SessionID(base) != SessionID(grown) {
+		t.Fatalf("derived session changed as conversation grew")
 	}
 }
 
@@ -192,6 +238,54 @@ func TestRouteClassifierReceivesRecentConversation(t *testing.T) {
 		if !strings.Contains(classified, want) {
 			t.Errorf("classifier context missing %q: %q", want, classified)
 		}
+	}
+}
+
+func TestRouteClassifierContextKeepsBeginningAndLatestAfterLongTurn(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	var classified string
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		classified = turn.Content
+		return TaskProfile{Difficulty: "medium", EstTokensIn: 100, EstTokensOut: 100}
+	}
+	chat := llm.ChatRequest{
+		SystemPrompt: "Preserve the parser API.",
+		Messages: []llm.Message{
+			{Role: "user", Content: "Refactor the original parser task."},
+			{Role: "assistant", Content: strings.Repeat("long implementation detail ", 1000)},
+			{Role: "user", Content: "continue with the original task"},
+		},
+	}
+	r.Route(context.Background(), chat)
+	for _, want := range []string{"Preserve the parser API", "original parser task", "continue with the original task"} {
+		if !strings.Contains(classified, want) {
+			t.Errorf("bounded classifier context missing %q", want)
+		}
+	}
+	if len(classified) > maxClassifierContextBytes {
+		t.Errorf("classifier context has %d bytes, limit is %d", len(classified), maxClassifierContextBytes)
+	}
+}
+
+func TestRouteClassifierBoundsLongSingleTurn(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	var classified llm.Message
+	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
+		classified = turn
+		return TaskProfile{Difficulty: "medium", EstTokensIn: 100, EstTokensOut: 100}
+	}
+	content := "important instruction at start\n" + strings.Repeat("payload ", 3000) + "\nlatest constraint at end"
+	image := llm.ImageContent{MimeType: "image/png", Data: []byte("x")}
+	r.Route(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: content, Images: []llm.ImageContent{image}}}})
+	if len(classified.Content) > maxClassifierContextBytes || !strings.Contains(classified.Content, "important instruction") || !strings.Contains(classified.Content, "latest constraint") {
+		t.Fatalf("bounded classifier content is incorrect: len=%d", len(classified.Content))
+	}
+	if len(classified.Images) != 1 {
+		t.Fatal("latest-turn images were not preserved for classification")
 	}
 }
 

@@ -72,6 +72,25 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 		w.Flush()
 		return nil
 	}
+	emitError := func(msg string) error {
+		errChunk := map[string]any{
+			"id": id, "object": "chat.completion.chunk", "model": model,
+			"error": map[string]any{"message": msg, "type": "api_error"},
+		}
+		data, err := json.Marshal(errChunk)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			return err
+		}
+		w.Flush()
+		if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err != nil {
+			return err
+		}
+		w.Flush()
+		return nil
+	}
 
 	// role header chunk
 	if err := emit(map[string]any{"role": "assistant", "content": ""}, nil); err != nil {
@@ -177,18 +196,7 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 			if ev.Error != nil {
 				msg = ev.Error.Error()
 			}
-			errChunk := map[string]any{
-				"id":     id,
-				"object": "chat.completion.chunk",
-				"model":  model,
-				"error":  map[string]any{"message": msg, "type": "api_error"},
-			}
-			data, _ := json.Marshal(errChunk)
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
-			w.Flush()
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			w.Flush()
-			return nil
+			return emitError(msg)
 
 		case llm.EventDone:
 			fr := mapStopReason(ev.StopReason)
@@ -204,10 +212,5 @@ func EncodeSSE(w SSEWriter, model string, events <-chan llm.ChatEvent) error {
 		}
 	}
 
-	// Channel closed without EventDone.
-	fr := "stop"
-	_ = emit(map[string]any{}, &fr)
-	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-	w.Flush()
-	return nil
+	return emitError("provider stream closed without terminal event")
 }

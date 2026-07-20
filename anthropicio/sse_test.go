@@ -117,3 +117,14 @@ func TestEncodeErrorMidStream(t *testing.T) {
 		t.Errorf("expected message_stop after error in:\n%s", out)
 	}
 }
+
+func TestEncodePrematureClosureEmitsError(t *testing.T) {
+	w := &bufWriter{}
+	if err := EncodeSSE(w, "m", feed(llm.ChatEvent{Type: llm.EventTextDelta, Text: "partial"})); err != nil {
+		t.Fatalf("EncodeSSE: %v", err)
+	}
+	out := w.b.String()
+	if !strings.Contains(out, "event: error") || strings.Contains(out, `"stop_reason":"end_turn"`) {
+		t.Fatalf("premature closure was not surfaced as an error: %s", out)
+	}
+}

@@ -29,18 +29,37 @@ func Decode(body []byte) (DecodedRequest, error) {
 	if err != nil {
 		return DecodedRequest{}, err
 	}
+	var systemTexts []string
+	var mergedSystemParts []llm.SystemPromptPart
+	structuredSystem := false
+	appendSystem := func(text string, parts []llm.SystemPromptPart) {
+		if text == "" {
+			return
+		}
+		if len(parts) > 0 {
+			if !structuredSystem {
+				for _, previous := range systemTexts {
+					mergedSystemParts = append(mergedSystemParts, llm.SystemPromptPart{Text: previous})
+				}
+				structuredSystem = true
+			}
+			mergedSystemParts = append(mergedSystemParts, parts...)
+		} else if structuredSystem {
+			mergedSystemParts = append(mergedSystemParts, llm.SystemPromptPart{Text: text})
+		}
+		systemTexts = append(systemTexts, text)
+	}
+	appendSystem(system, systemParts)
 	cacheControl, err := decodeCacheControl(wr.CacheControl)
 	if err != nil {
 		return DecodedRequest{}, fmt.Errorf("invalid top-level cache_control: %w", err)
 	}
 
 	chat := llm.ChatRequest{
-		Model:             wr.Model,
-		MaxTokens:         wr.MaxTokens,
-		SystemPrompt:      system,
-		SystemPromptParts: systemParts,
-		CacheControl:      cacheControl,
-		SessionID:         wr.Metadata.UserID,
+		Model:        wr.Model,
+		MaxTokens:    wr.MaxTokens,
+		CacheControl: cacheControl,
+		SessionID:    wr.Metadata.UserID,
 	}
 	if wr.Temperature != nil {
 		chat.Temperature = *wr.Temperature
@@ -67,6 +86,14 @@ func Decode(body []byte) (DecodedRequest, error) {
 		})
 	}
 	for _, wm := range wr.Messages {
+		if wm.Role == "system" {
+			messageSystem, messageParts, err := decodeSystemDetails(wm.Content)
+			if err != nil {
+				return DecodedRequest{}, fmt.Errorf("invalid system message: %w", err)
+			}
+			appendSystem(messageSystem, messageParts)
+			continue
+		}
 		if wm.Role != "user" && wm.Role != "assistant" {
 			return DecodedRequest{}, fmt.Errorf("invalid message role %q", wm.Role)
 		}
@@ -75,6 +102,13 @@ func Decode(body []byte) (DecodedRequest, error) {
 			return DecodedRequest{}, err
 		}
 		chat.Messages = append(chat.Messages, msgs...)
+	}
+	if len(chat.Messages) == 0 {
+		return DecodedRequest{}, fmt.Errorf("messages must include a user or assistant message")
+	}
+	chat.SystemPrompt = strings.Join(systemTexts, "\n")
+	if structuredSystem {
+		chat.SystemPromptParts = mergedSystemParts
 	}
 
 	return DecodedRequest{

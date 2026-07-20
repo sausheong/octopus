@@ -353,6 +353,8 @@ The `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` gateway configuration follow
 
 Claude Code may request a specific model name, but Octopus intentionally treats the inbound model as advisory and selects a catalog model itself.
 
+The model label in Claude Code describes the client-side model name, not necessarily the backend Octopus selected. A launcher can pass `--model octopus` to make that distinction visible; the routed provider and model remain available in Octopus logs and Insights.
+
 ### Verify Claude Code prompt caching
 
 1. Enable `routing.session_sticky` and `routing.cache_aware` or omit them to use their `true` defaults.

@@ -48,6 +48,63 @@ func TestDecodeSystemArray(t *testing.T) {
 	}
 }
 
+func TestDecodeSystemMessageCompatibility(t *testing.T) {
+	body := []byte(`{
+		"model":"octopus","max_tokens":1,
+		"system":"top-level",
+		"messages":[
+			{"role":"system","content":"client compatibility prompt"},
+			{"role":"user","content":"hello"}
+		]
+	}`)
+	dr, err := Decode(body)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if dr.Chat.SystemPrompt != "top-level\nclient compatibility prompt" {
+		t.Fatalf("SystemPrompt = %q", dr.Chat.SystemPrompt)
+	}
+	if len(dr.Chat.SystemPromptParts) != 0 {
+		t.Fatalf("SystemPromptParts = %+v, want unstructured prompt", dr.Chat.SystemPromptParts)
+	}
+	if len(dr.Chat.Messages) != 1 || dr.Chat.Messages[0].Role != "user" {
+		t.Fatalf("Messages = %+v", dr.Chat.Messages)
+	}
+}
+
+func TestDecodeStructuredSystemMessagePreservesCacheControl(t *testing.T) {
+	body := []byte(`{
+		"model":"octopus","max_tokens":1,
+		"system":"top-level",
+		"messages":[
+			{"role":"system","content":[
+				{"type":"text","text":"cached compatibility prompt","cache_control":{"type":"ephemeral","ttl":"1h"}}
+			]},
+			{"role":"user","content":"hello"}
+		]
+	}`)
+	dr, err := Decode(body)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if dr.Chat.SystemPrompt != "top-level\ncached compatibility prompt" {
+		t.Fatalf("SystemPrompt = %q", dr.Chat.SystemPrompt)
+	}
+	if len(dr.Chat.SystemPromptParts) != 2 {
+		t.Fatalf("SystemPromptParts = %+v", dr.Chat.SystemPromptParts)
+	}
+	if dr.Chat.SystemPromptParts[1].CacheControl == nil || dr.Chat.SystemPromptParts[1].CacheControl.TTL != "1h" {
+		t.Fatalf("cached SystemPromptPart = %+v", dr.Chat.SystemPromptParts[1])
+	}
+}
+
+func TestDecodeRejectsSystemOnlyMessages(t *testing.T) {
+	body := []byte(`{"model":"octopus","max_tokens":1,"messages":[{"role":"system","content":"only"}]}`)
+	if _, err := Decode(body); err == nil || !strings.Contains(err.Error(), "user or assistant") {
+		t.Fatalf("Decode error = %v", err)
+	}
+}
+
 func TestDecodePreservesPromptCacheControls(t *testing.T) {
 	body := []byte(`{
 		"model":"m","max_tokens":10,
@@ -195,7 +252,7 @@ func TestDecodeRejectsInvalidRequests(t *testing.T) {
 	tests := []string{
 		`{"max_tokens":0,"messages":[{"role":"user","content":"x"}]}`,
 		`{"max_tokens":1,"temperature":1.1,"messages":[{"role":"user","content":"x"}]}`,
-		`{"max_tokens":1,"messages":[{"role":"system","content":"x"}]}`,
+		`{"max_tokens":1,"messages":[{"role":"developer","content":"x"}]}`,
 		`{"max_tokens":1,"system":{"bad":true},"messages":[{"role":"user","content":"x"}]}`,
 		`{"max_tokens":1,"tools":[{"name":"","input_schema":{}}],"messages":[{"role":"user","content":"x"}]}`,
 		`{"max_tokens":1,"messages":[{"role":"user","content":[{"type":"audio"}]}]}`,

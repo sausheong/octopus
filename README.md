@@ -226,15 +226,12 @@ Settings has five sections:
 - **General** controls the router address, classifier, scoring weights, session/cache behavior, and the fallback attempt limit.
 - **Providers** configures provider kinds, endpoints, environment-variable names, and optional inline credentials. Inline credentials are stored locally in the YAML file; prefer environment variables when practical.
 - **Models** edits the routing catalog, pricing, capabilities, and context and output limits.
-- **Advanced YAML** edits the complete configuration directly, unless the file sets an inline `api_key` — see below.
+- **Advanced YAML** edits the complete configuration directly.
 - **Insights** shows request volume, token usage, estimated spend, savings over time, cache efficiency, and model usage.
 
 Saving requires a CSRF token that is generated fresh each time Octopus starts and embedded in the page when it loads. A settings page left open across a restart therefore holds a token the new process will not accept, and must be reopened from the menu bar before it can save.
 
-Settings never sends a stored inline `api_key` to the browser. The page must load before it can hold a CSRF token, so the endpoint serving it cannot be restricted to the real local UI, and a hostile page that resolves its own hostname to `127.0.0.1` can read whatever that endpoint returns. It cannot read `~/.octopus/config.yaml`, so an inline key in the response would be a genuine disclosure. Two consequences follow:
-
-- On **Providers**, the inline key field shows a placeholder rather than the stored key. Leaving it untouched keeps the existing key; typing a new value replaces it; clearing the field removes it.
-- **Advanced YAML** is unavailable while any provider sets an inline `api_key`, because the raw file cannot show the key and still be saved back intact. Edit the key on Providers — or the file directly — and the tab returns. Configurations that use `api_key_env` throughout, which is the recommended form, are unaffected.
+Settings shows the configuration in full, inline `api_key` values included, on both the Providers form and the Advanced YAML tab. An editor that hides part of the file cannot show you what you are about to change, and the file is yours on your own machine. The protection is on writes rather than reads: a save is accepted only from a request whose `Host` header is literally loopback and that carries the current CSRF token, so a web page that resolves its own hostname to `127.0.0.1` cannot alter the configuration or repoint a provider. Such a page can read what Settings serves, so treat the settings port as it is treated here — anything in `~/.octopus/config.yaml` is readable by anything running on, or reaching, your machine.
 
 Every save is parsed and validated before replacing the existing file. A valid save reloads the router immediately without restarting the menu-bar app. If validation fails, the existing file and running router remain unchanged and the settings page shows the error. If a newly saved configuration cannot start—for example because a credential environment variable is absent—the file remains saved, the previous working router stays active when possible, and the status area reports the problem.
 

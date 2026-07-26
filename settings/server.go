@@ -162,49 +162,35 @@ func loadLogo() []byte {
 }
 
 type stateResponse struct {
-	Document Document `json:"document"`
-	YAML     string   `json:"yaml"`
-	// YAMLWithheld reports that YAML above is empty because serving it would
-	// disclose an inline provider key, as distinct from a genuinely empty file.
-	// The editor is read-only while it is set, so a save cannot write the blank
-	// back over the real configuration.
-	YAMLWithheld bool                 `json:"yaml_withheld"`
-	Exists       bool                 `json:"exists"`
-	Version      string               `json:"version"`
-	LoadError    string               `json:"load_error,omitempty"`
-	Router       desktop.RouterStatus `json:"router"`
+	Document  Document             `json:"document"`
+	YAML      string               `json:"yaml"`
+	Exists    bool                 `json:"exists"`
+	Version   string               `json:"version"`
+	LoadError string               `json:"load_error,omitempty"`
+	Router    desktop.RouterStatus `json:"router"`
 }
 
-// newStateResponse builds the client's view of the stored configuration with
-// every inline provider key withheld.
+// newStateResponse builds the client's view of the stored configuration.
 //
-// GET /api/state is deliberately not gated by the loopback Host check: the page
-// must load before it can hold a CSRF token. A DNS-rebinding page therefore
-// reaches this response same-origin, and unlike a local process it cannot read
-// config.yaml — so an inline key served here is a real escalation rather than a
-// restatement of what the attacker already holds.
+// It serves the configuration verbatim, inline provider keys included. An
+// earlier version substituted a placeholder for every inline api_key and
+// withheld the Advanced YAML tab entirely whenever one was present, to keep a
+// DNS-rebinding page from reading a credential out of this ungated response.
+// That traded away the thing the editor is for: a settings screen that hides
+// part of the file cannot show the user what they are about to change, and
+// Octopus is a local tool whose configuration the user owns outright.
 //
-// Two channels carry the key and both must be closed: Document feeds the
-// provider form, and YAML feeds the Advanced editor.
+// What still stands between a hostile page and the configuration is write
+// access: POST is gated by the loopback Host check and the per-process CSRF
+// token, so a rebinding page can read this state but cannot alter the router.
 func (s *Server) newStateResponse(doc Document, raw []byte, exists bool) stateResponse {
-	response := stateResponse{
-		Document: redactDocument(doc),
+	return stateResponse{
+		Document: doc,
+		YAML:     string(raw),
 		Exists:   exists,
 		Version:  buildinfo.Version,
 		Router:   s.routerStatus(),
 	}
-	// The raw file cannot be redacted usefully: a placeholder substituted into
-	// the text would be saved back as the literal key, and there is no second
-	// sentinel channel for a free-form editor to carry "unchanged" through. So
-	// the whole tab is withheld while an inline key is present. The trade-off
-	// is deliberate — Advanced YAML is unavailable to the minority who inline a
-	// key, and they retain both the structured form and the file itself.
-	if !rawHasInlineKey(raw) && !documentHasInlineKey(doc) {
-		response.YAML = string(raw)
-	} else {
-		response.YAMLWithheld = true
-	}
-	return response
 }
 
 func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {
@@ -228,23 +214,6 @@ func (s *Server) handleStructured(w http.ResponseWriter, r *http.Request) {
 	if err := decoder.Decode(&doc); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid settings document: " + err.Error()})
 		return
-	}
-	// The form was served a placeholder in place of each inline key, so restore
-	// the stored values before writing. Skipping this would blank on save every
-	// credential the user had inlined. The load error is ignored: a file that
-	// does not parse yields the default document, which carries no key and so
-	// was never rendered with a placeholder — a save that nonetheless sends one
-	// came from a stale page, and the mismatch is reported below.
-	if usesRedactedKey(doc) {
-		stored, _, _, _ := s.store.Load()
-		resolved, err := resolveRedactedKeys(doc, stored)
-		if err != nil {
-			// Refusing is the whole point: the alternative is writing an empty
-			// key over a live credential and reporting success.
-			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-			return
-		}
-		doc = resolved
 	}
 	raw, err := s.store.SaveDocument(doc)
 	if err != nil {
@@ -284,9 +253,8 @@ func (s *Server) finishSave(w http.ResponseWriter, r *http.Request, doc Document
 		reloadErr = s.reload(reloadCtx)
 		cancel()
 	}
-	// The save response is the next render's state, so it must be redacted on
-	// exactly the same terms as GET /api/state — otherwise a save hands back
-	// the very key that endpoint withholds.
+	// The save response is the next render's state, so it goes through the same
+	// builder as GET /api/state rather than being assembled separately.
 	response := s.newStateResponse(doc, raw, true)
 	if reloadErr != nil {
 		response.LoadError = "Saved, but the router could not reload: " + reloadErr.Error()

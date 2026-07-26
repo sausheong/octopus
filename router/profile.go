@@ -65,7 +65,10 @@ const msgOverheadBytes = 12
 //
 // This is an approximation — accurate only within a factor of ~2 without
 // provider tokenizers — but it is intentionally conservative (over-estimates)
-// to serve as a reliable lower bound for context-window filtering.
+// to serve as a reliable lower bound for context-window filtering. The one
+// exception is the separator bytes joining SystemPromptParts, which are not
+// counted; at 3 bytes/token that only erodes the margin if the mean part is
+// under ~3 bytes long, which no real system prompt is.
 func EstimateRequestTokens(chat llm.ChatRequest) int {
 	var totalBytes int
 

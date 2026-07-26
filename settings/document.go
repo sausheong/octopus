@@ -28,6 +28,7 @@ type RoutingDocument struct {
 	SessionSticky bool   `json:"session_sticky"`
 	SessionTTL    string `json:"session_ttl"`
 	CacheAware    bool   `json:"cache_aware"`
+	MaxAttempts   int    `json:"max_attempts"`
 }
 
 type ProviderDocument struct {
@@ -51,7 +52,7 @@ func defaultDocument() Document {
 	return Document{
 		ServerAddr: "127.0.0.1:8787",
 		Weights:    config.Weights{Quality: 0.5, Cost: 0.3, Speed: 0.2},
-		Routing:    RoutingDocument{SessionSticky: true, SessionTTL: "1h", CacheAware: true},
+		Routing:    RoutingDocument{SessionSticky: true, SessionTTL: "1h", CacheAware: true, MaxAttempts: 3},
 		Providers: []ProviderDocument{{
 			Name: "anthropic", Kind: "anthropic", APIKeyEnv: "ANTHROPIC_API_KEY",
 		}},
@@ -74,6 +75,7 @@ func documentFromConfig(cfg *config.Config) Document {
 			SessionSticky: cfg.Routing.SessionSticky,
 			SessionTTL:    cfg.Routing.SessionTTL.String(),
 			CacheAware:    cfg.Routing.CacheAware,
+			MaxAttempts:   cfg.Routing.MaxAttempts,
 		},
 		Catalog: make([]CatalogDocument, 0, len(cfg.Catalog)),
 	}
@@ -104,6 +106,7 @@ func (d Document) config() (*config.Config, error) {
 			SessionSticky: d.Routing.SessionSticky,
 			SessionTTL:    ttl,
 			CacheAware:    d.Routing.CacheAware,
+			MaxAttempts:   d.Routing.MaxAttempts,
 		},
 		Providers: make(map[string]config.ProviderCreds, len(d.Providers)),
 		Catalog:   make([]config.CatalogEntry, 0, len(d.Catalog)),

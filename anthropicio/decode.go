@@ -59,7 +59,12 @@ func Decode(body []byte) (DecodedRequest, error) {
 		Model:        wr.Model,
 		MaxTokens:    wr.MaxTokens,
 		CacheControl: cacheControl,
-		SessionID:    wr.Metadata.UserID,
+	}
+	// metadata.user_id identifies a user, not a conversation. Tagging it keeps
+	// it out of the explicit-session path, where it would otherwise collapse
+	// all of one user's conversations onto a single sticky model and cache.
+	if wr.Metadata.UserID != "" {
+		chat.SessionID = "user:" + wr.Metadata.UserID
 	}
 	if wr.Temperature != nil {
 		chat.Temperature = *wr.Temperature

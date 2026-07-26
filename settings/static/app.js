@@ -52,6 +52,7 @@ function renderState() {
   setValue("#weight-speed", doc.weights.speed);
   setChecked("#session-sticky", doc.routing.session_sticky);
   setValue("#session-ttl", doc.routing.session_ttl);
+  setValue("#max-attempts", doc.routing.max_attempts);
   setChecked("#cache-aware", doc.routing.cache_aware);
   setChecked("#classifier-enabled", doc.classifier_enabled);
   setValue("#classifier-model", doc.classifier.model);
@@ -276,6 +277,9 @@ function addModel(model = {}, markDirty = true) {
     cost_per_mtok_in: model.cost_per_mtok_in ?? 0,
     cost_per_mtok_out: model.cost_per_mtok_out ?? 0,
     max_context: model.caps?.max_context ?? 200000,
+    // Zero means unconstrained, so show it as an empty field with the "No limit"
+    // placeholder rather than a bare 0. collectDocument maps it back to 0.
+    max_output_tokens: model.caps?.max_output_tokens || "",
   };
   Object.entries(scalarValues).forEach(([field, value]) => {
     $(`[data-field="${field}"]`, item).value = value;
@@ -308,6 +312,7 @@ function collectDocument() {
       vision: $('[data-field="vision"]', item).checked,
       reasoning: $('[data-field="reasoning"]', item).checked,
       max_context: Number($('[data-field="max_context"]', item).value),
+      max_output_tokens: Number($('[data-field="max_output_tokens"]', item).value || 0),
     },
   }));
   return {
@@ -319,7 +324,7 @@ function collectDocument() {
       timeout: $("#classifier-timeout").value.trim(),
     },
     weights: {quality: numberValue("#weight-quality"), cost: numberValue("#weight-cost"), speed: numberValue("#weight-speed")},
-    routing: {session_sticky: $("#session-sticky").checked, session_ttl: $("#session-ttl").value.trim(), cache_aware: $("#cache-aware").checked},
+    routing: {session_sticky: $("#session-sticky").checked, session_ttl: $("#session-ttl").value.trim(), cache_aware: $("#cache-aware").checked, max_attempts: Number($("#max-attempts").value.trim() || 3)},
     providers,
     catalog,
   };

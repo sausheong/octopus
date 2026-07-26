@@ -28,6 +28,8 @@ type Decision struct {
 	// in request economics. They are empty when classification was skipped.
 	ClassifierModel string
 	ClassifierUsage *llm.Usage
+	// MaxAttempts bounds provider fallback for this request.
+	MaxAttempts int
 }
 
 // eligible applies the hard capability filter: a model survives only if it
@@ -41,6 +43,12 @@ func eligible(p TaskProfile, e config.CatalogEntry) bool {
 		return false
 	}
 	if p.EstTokensIn+p.EstTokensOut > e.Caps.MaxContext {
+		return false
+	}
+	// A model whose output limit is below the expected response would reject
+	// the request outright, so filter it out here rather than discovering it
+	// at the backend. Zero means the catalog entry declares no output limit.
+	if e.Caps.MaxOutputTokens > 0 && p.EstTokensOut > e.Caps.MaxOutputTokens {
 		return false
 	}
 	return true

@@ -65,11 +65,23 @@ const msgOverheadBytes = 12
 //
 // This is an approximation — accurate only within a factor of ~2 without
 // provider tokenizers — but it is intentionally conservative (over-estimates)
-// to serve as a reliable lower bound for context-window filtering.
+// to serve as a reliable lower bound for context-window filtering. The one
+// exception is the separator bytes joining SystemPromptParts, which are not
+// counted; at 3 bytes/token that only erodes the margin if the mean part is
+// under ~3 bytes long, which no real system prompt is.
 func EstimateRequestTokens(chat llm.ChatRequest) int {
 	var totalBytes int
 
-	totalBytes += len(chat.SystemPrompt)
+	// SystemPromptParts, when non-empty, replaces SystemPrompt in harness
+	// semantics — and anthropicio.Decode populates both for a structured
+	// prompt, so counting each unconditionally would double the estimate.
+	if len(chat.SystemPromptParts) > 0 {
+		for _, part := range chat.SystemPromptParts {
+			totalBytes += len(part.Text)
+		}
+	} else {
+		totalBytes += len(chat.SystemPrompt)
+	}
 
 	for _, m := range chat.Messages {
 		totalBytes += msgOverheadBytes

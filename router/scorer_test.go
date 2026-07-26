@@ -174,3 +174,32 @@ func TestScoreEligibleSortedByScore(t *testing.T) {
 		}
 	}
 }
+
+func TestEligibilityRespectsMaxOutputTokens(t *testing.T) {
+	catalog := []config.CatalogEntry{
+		{ID: "p/small", Quality: 0.9, Speed: 0.9,
+			Caps: config.Caps{MaxContext: 200000, MaxOutputTokens: 4096}},
+		{ID: "p/large", Quality: 0.8, Speed: 0.5,
+			Caps: config.Caps{MaxContext: 200000, MaxOutputTokens: 64000}},
+		{ID: "p/unset", Quality: 0.7, Speed: 0.5,
+			Caps: config.Caps{MaxContext: 200000}},
+	}
+	w := config.Weights{Quality: 1}
+
+	// Within every limit: all three eligible.
+	small := Score(TaskProfile{EstTokensIn: 100, EstTokensOut: 1000}, catalog, w)
+	if len(small.Eligible) != 3 {
+		t.Errorf("small request eligible = %v, want all 3", small.Eligible)
+	}
+
+	// Exceeds p/small's output limit only.
+	big := Score(TaskProfile{EstTokensIn: 100, EstTokensOut: 30000}, catalog, w)
+	for _, id := range big.Eligible {
+		if id == "p/small" {
+			t.Errorf("p/small (4096 output cap) eligible for a 30000-token output request")
+		}
+	}
+	if len(big.Eligible) != 2 {
+		t.Errorf("big request eligible = %v, want p/large and p/unset", big.Eligible)
+	}
+}

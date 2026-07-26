@@ -388,3 +388,136 @@ func TestRouteNoUserTurnUsesDefaultProfile(t *testing.T) {
 		t.Errorf("Chosen = %q, want anthropic/opus", d.Chosen)
 	}
 }
+
+func TestRouteCarriesMaxAttempts(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr: "x",
+		Weights:    config.Weights{Quality: 1},
+		Routing:    config.RoutingCfg{MaxAttempts: 2},
+		Catalog: []config.CatalogEntry{
+			{ID: "p/m", Quality: 0.9, Speed: 0.5, Caps: config.Caps{MaxContext: 100000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"p": &fakeProvider{}})
+	rt := NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, _ llm.LLMProvider, _ string, _ int, _ llm.Message) TaskProfile {
+		return TrivialProfile()
+	})
+	dec := rt.Route(context.Background(), llm.ChatRequest{
+		Messages: []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if dec.MaxAttempts != 2 {
+		t.Errorf("Decision.MaxAttempts = %d, want 2", dec.MaxAttempts)
+	}
+}
+
+func TestEstimateRequestTokensCountsSystemPromptParts(t *testing.T) {
+	big := strings.Repeat("x", 60000)
+
+	partsOnly := EstimateRequestTokens(llm.ChatRequest{
+		SystemPromptParts: []llm.SystemPromptPart{{Text: big}},
+		Messages:          []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if partsOnly < 15000 {
+		t.Errorf("parts-only estimate = %d, want >= 15000 (60KB / 3 bytes per token)", partsOnly)
+	}
+
+	// Decode sets both fields for a structured prompt. Parts replace
+	// SystemPrompt in harness semantics, so the bytes must be counted once.
+	both := EstimateRequestTokens(llm.ChatRequest{
+		SystemPrompt:      big,
+		SystemPromptParts: []llm.SystemPromptPart{{Text: big}},
+		Messages:          []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if both != partsOnly {
+		t.Errorf("double counted: both = %d, parts-only = %d", both, partsOnly)
+	}
+
+	promptOnly := EstimateRequestTokens(llm.ChatRequest{
+		SystemPrompt: big,
+		Messages:     []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if promptOnly != partsOnly {
+		t.Errorf("prompt-only = %d, parts-only = %d; equivalent input should estimate equally", promptOnly, partsOnly)
+	}
+}
+
+func TestSessionIDDoesNotCollapseConversationsPerUser(t *testing.T) {
+	poem := llm.ChatRequest{
+		SessionID: "user:alice", SystemPrompt: "sysA",
+		Messages: []llm.Message{{Role: "user", Content: "write a poem"}},
+	}
+	debug := llm.ChatRequest{
+		SessionID: "user:alice", SystemPrompt: "sysB",
+		Messages: []llm.Message{{Role: "user", Content: "debug this kernel panic"}},
+	}
+	if SessionID(poem) == SessionID(debug) {
+		t.Error("one user's two conversations still collapse to a single session")
+	}
+	if !strings.HasPrefix(SessionID(poem), "derived:") {
+		t.Errorf("SessionID = %q, want derived: prefix", SessionID(poem))
+	}
+}
+
+func TestSessionIDSeparatesUsersWithIdenticalPrompts(t *testing.T) {
+	base := llm.ChatRequest{
+		SystemPrompt: "sys",
+		Messages:     []llm.Message{{Role: "user", Content: "hello"}},
+	}
+	alice, bob, anon := base, base, base
+	alice.SessionID = "user:alice"
+	bob.SessionID = "user:bob"
+	if SessionID(alice) == SessionID(bob) {
+		t.Error("two users sending identical prompts share a session")
+	}
+	// An identified user must also be distinct from an anonymous caller
+	// sending the same prompt, or the tag is not reaching the hash at all.
+	if SessionID(alice) == SessionID(anon) {
+		t.Error("identified and anonymous callers share a session")
+	}
+}
+
+func TestSessionIDExplicitHeaderStillWins(t *testing.T) {
+	a := llm.ChatRequest{
+		SessionID: "hdr-1", SystemPrompt: "sysA",
+		Messages: []llm.Message{{Role: "user", Content: "totally different"}},
+	}
+	b := llm.ChatRequest{
+		SessionID: "hdr-1", SystemPrompt: "sysB",
+		Messages: []llm.Message{{Role: "user", Content: "also different"}},
+	}
+	if SessionID(a) != SessionID(b) {
+		t.Error("an explicit session header must pin both requests to one session")
+	}
+	if !strings.HasPrefix(SessionID(a), "explicit:") {
+		t.Errorf("SessionID = %q, want explicit: prefix", SessionID(a))
+	}
+}
+
+// Route and Observe must agree on what a session is: Observe recording one
+// conversation must not make a different conversation from the same user
+// inherit its sticky model.
+func TestObserveDoesNotPinOtherConversationsOfSameUser(t *testing.T) {
+	cfg := testCfg()
+	reg, err := registry.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	r := NewRouter(cfg, reg)
+	poem := llm.ChatRequest{
+		SessionID: "user:alice", MaxTokens: 1, SystemPrompt: "sysA",
+		Messages: []llm.Message{{Role: "user", Content: "write a poem"}},
+	}
+	debug := llm.ChatRequest{
+		SessionID: "user:alice", MaxTokens: 1, SystemPrompt: "sysB",
+		Messages: []llm.Message{{Role: "user", Content: "debug this kernel panic"}},
+	}
+	r.Observe(poem, "anthropic/opus", &llm.Usage{})
+	if d := r.Route(context.Background(), debug); d.Reason == "sticky session affinity" {
+		t.Fatalf("unrelated conversation inherited sticky affinity: %+v", d)
+	}
+	// The same conversation must still stick, or the test above proves nothing.
+	if d := r.Route(context.Background(), poem); d.Reason != "sticky session affinity" || d.Chosen != "anthropic/opus" {
+		t.Fatalf("same conversation lost sticky affinity: %+v", d)
+	}
+}

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/octopus/config"
 	"github.com/sausheong/octopus/insights"
@@ -792,3 +794,334 @@ func TestSessionIDHeaderUsesOctopusNameAndSupportsLegacyAlias(t *testing.T) {
 }
 
 var _ = io.Discard // keep io imported if unused above
+
+// countingErrProv records how many times ChatStream was called and always
+// fails with a scripted error.
+type countingErrProv struct {
+	calls int
+	err   error
+}
+
+func (p *countingErrProv) Models() []llm.ModelInfo { return nil }
+func (p *countingErrProv) NormalizeToolSchema(t []llm.ToolDef) ([]llm.ToolDef, []llm.Diagnostic) {
+	return t, nil
+}
+func (p *countingErrProv) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	p.calls++
+	return nil, p.err
+}
+
+// buildFanoutServer wires a Server over an eight-model catalog served by one
+// counting provider, so a test can assert exactly how many backends were tried.
+func buildFanoutServer(t *testing.T, prov llm.LLMProvider, maxAttempts int) *Server {
+	t.Helper()
+	var catalog []config.CatalogEntry
+	for _, name := range []string{"m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"} {
+		catalog = append(catalog, config.CatalogEntry{
+			ID: "anthropic/" + name, Quality: 0.9, CostPerMTokIn: 1, CostPerMTokOut: 1, Speed: 0.5,
+			Caps: config.Caps{Tools: true, Vision: true, MaxContext: 200000},
+		})
+	}
+	cfg := &config.Config{
+		ServerAddr: "x",
+		Weights:    config.Weights{Quality: 1},
+		Routing:    config.RoutingCfg{MaxAttempts: maxAttempts},
+		Providers:  map[string]config.ProviderCreds{"anthropic": {APIKeyEnv: "X"}},
+		Catalog:    catalog,
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"anthropic": prov})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
+	})
+	return New(rt, reg, cfg.Catalog)
+}
+
+const fanoutBody = `{"model":"x","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`
+const fanoutStreamBody = `{"model":"x","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`
+
+func TestPermanent400StopsAfterOneAttempt(t *testing.T) {
+	prov := &countingErrProv{err: anthErr(400)}
+	s := buildFanoutServer(t, prov, 3)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutBody)))
+	if prov.calls != 1 {
+		t.Errorf("ChatStream calls = %d, want 1 (400 is not retryable)", prov.calls)
+	}
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400 (real backend error, not a masked 502)", rec.Code)
+	}
+}
+
+func TestRateLimitStopsAtAttemptCap(t *testing.T) {
+	prov := &countingErrProv{err: anthErr(429)}
+	s := buildFanoutServer(t, prov, 3)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutBody)))
+	if prov.calls != 3 {
+		t.Errorf("ChatStream calls = %d, want 3 (cap), catalog has 8", prov.calls)
+	}
+	if rec.Code != 429 {
+		t.Errorf("status = %d, want 429", rec.Code)
+	}
+}
+
+func TestMaxAttemptsOneDisablesFallback(t *testing.T) {
+	prov := &countingErrProv{err: anthErr(429)}
+	s := buildFanoutServer(t, prov, 1)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutBody)))
+	if prov.calls != 1 {
+		t.Errorf("ChatStream calls = %d, want 1", prov.calls)
+	}
+}
+
+func TestCancelledRequestStopsAndWritesNothing(t *testing.T) {
+	prov := &countingErrProv{err: context.Canceled}
+	s := buildFanoutServer(t, prov, 3)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutBody)))
+	if prov.calls != 1 {
+		t.Errorf("ChatStream calls = %d, want 1 (client is gone)", prov.calls)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("wrote %d bytes to a disconnected client, want 0", rec.Body.Len())
+	}
+}
+
+func TestCancelledStreamingRequestStopsAndWritesNothing(t *testing.T) {
+	prov := &countingErrProv{err: context.Canceled}
+	s := buildFanoutServer(t, prov, 3)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutStreamBody)))
+	if prov.calls != 1 {
+		t.Errorf("ChatStream calls = %d, want 1 (client is gone)", prov.calls)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("wrote %d bytes to a disconnected client, want 0", rec.Body.Len())
+	}
+}
+
+// The OpenAI endpoint must hang up as silently as the Anthropic one; before
+// this fix its default branch turned a client disconnect into a 502.
+func TestOpenAICancelledRequestStopsAndWritesNothing(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"buffered", `{"model":"x","messages":[{"role":"user","content":"hi"}]}`},
+		{"streaming", `{"model":"x","stream":true,"messages":[{"role":"user","content":"hi"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingErrProv{err: context.Canceled}
+			s := buildFanoutServer(t, prov, 3)
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(tc.body)))
+			if prov.calls != 1 {
+				t.Errorf("ChatStream calls = %d, want 1 (client is gone)", prov.calls)
+			}
+			if rec.Body.Len() != 0 {
+				t.Errorf("wrote %d bytes to a disconnected client, want 0", rec.Body.Len())
+			}
+		})
+	}
+}
+
+// A hang-up is not a server fault, so it must not raise a warning: operators
+// page on those, and the pre-fix loop emitted one per catalog entry.
+func TestCancellationIsNotLoggedAsAWarning(t *testing.T) {
+	var buf strings.Builder
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	s := buildFanoutServer(t, &countingErrProv{err: context.Canceled}, 3)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutBody)))
+	if got := buf.String(); got != "" {
+		t.Errorf("cancellation emitted warn-level logs:\n%s", got)
+	}
+
+	// Guard against the test passing because nothing is logged at all: a real
+	// backend failure must still warn.
+	buf.Reset()
+	s = buildFanoutServer(t, &countingErrProv{err: anthErr(429)}, 3)
+	s.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutBody)))
+	if !strings.Contains(buf.String(), "trying fallback") {
+		t.Errorf("a genuine backend failure should still warn, got:\n%s", buf.String())
+	}
+}
+
+// A Decision built before routing.max_attempts existed carries 0, which must
+// mean "use the default" rather than "make no attempts at all".
+func TestAttemptCapTreatsZeroAsDefault(t *testing.T) {
+	if got := attemptCap(router.Decision{}); got != 3 {
+		t.Errorf("attemptCap(zero Decision) = %d, want default 3", got)
+	}
+	if got := attemptCap(router.Decision{MaxAttempts: 5}); got != 5 {
+		t.Errorf("attemptCap(5) = %d, want 5", got)
+	}
+}
+
+func TestStreamingPathRespectsAttemptCap(t *testing.T) {
+	prov := &countingErrProv{err: anthErr(429)}
+	s := buildFanoutServer(t, prov, 3)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutStreamBody)))
+	if prov.calls != 3 {
+		t.Errorf("streaming ChatStream calls = %d, want 3", prov.calls)
+	}
+}
+
+func TestOpenAIPathRespectsAttemptCap(t *testing.T) {
+	prov := &countingErrProv{err: anthErr(429)}
+	s := buildFanoutServer(t, prov, 3)
+	rec := httptest.NewRecorder()
+	body := `{"model":"x","messages":[{"role":"user","content":"hi"}]}`
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if prov.calls != 3 {
+		t.Errorf("openai ChatStream calls = %d, want 3", prov.calls)
+	}
+	if rec.Code != 429 {
+		t.Errorf("status = %d, want 429", rec.Code)
+	}
+}
+
+// The 400 arm of oaiBackendError is the path a local mlx/Ollama/LM Studio
+// rejection takes: the backend's own complaint has to reach the caller intact
+// instead of being retried across the catalog and masked as a 502.
+func TestOpenAIInvalidRequestStopsAfterOneAttempt(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"buffered", `{"model":"x","messages":[{"role":"user","content":"hi"}]}`},
+		{"streaming", `{"model":"x","stream":true,"messages":[{"role":"user","content":"hi"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingErrProv{err: &openai.APIError{HTTPStatusCode: 400, Message: "bad max_tokens"}}
+			s := buildFanoutServer(t, prov, 3)
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(tc.body)))
+			if prov.calls != 1 {
+				t.Errorf("ChatStream calls = %d, want 1 (400 is not retryable)", prov.calls)
+			}
+			if rec.Code != 400 {
+				t.Errorf("status = %d, want 400 (real backend error, not a masked 502)", rec.Code)
+			}
+			if !strings.Contains(rec.Body.String(), "bad max_tokens") {
+				t.Errorf("backend message lost from response body: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// countingScriptProv counts calls and returns a scripted event sequence, so a
+// test can bound the fallback sites that fail via the channel rather than via
+// the ChatStream error return.
+type countingScriptProv struct {
+	calls  int
+	events []llm.ChatEvent
+}
+
+func (p *countingScriptProv) Models() []llm.ModelInfo { return nil }
+func (p *countingScriptProv) NormalizeToolSchema(t []llm.ToolDef) ([]llm.ToolDef, []llm.Diagnostic) {
+	return t, nil
+}
+func (p *countingScriptProv) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	p.calls++
+	ch := make(chan llm.ChatEvent, len(p.events))
+	for _, ev := range p.events {
+		ch <- ev
+	}
+	close(ch)
+	return ch, nil
+}
+
+// Each fallback loop has three backend-failure exits, and only the ChatStream
+// error return is covered above. These pin the channel-side exits: a stream
+// that closes empty, one whose first event is an error, and one that fails
+// only part-way through collection.
+func TestChannelSideFailuresRespectAttemptBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		body      string
+		events    []llm.ChatEvent
+		wantCalls int
+	}{
+		{"streaming empty stream stops at cap", fanoutStreamBody, nil, 3},
+		{"streaming first-event error is retryable to the cap", fanoutStreamBody,
+			[]llm.ChatEvent{{Type: llm.EventError, Error: anthErr(429)}}, 3},
+		{"streaming first-event 400 stops immediately", fanoutStreamBody,
+			[]llm.ChatEvent{{Type: llm.EventError, Error: anthErr(400)}}, 1},
+		{"buffered peek failure stops at cap", fanoutBody, nil, 3},
+		// First event is the error, so this stops at the peekForContent break
+		// site rather than the collect one the two cases below reach.
+		{"buffered peek 400 stops immediately", fanoutBody,
+			[]llm.ChatEvent{{Type: llm.EventError, Error: anthErr(400)}}, 1},
+		{"buffered collection error stops at cap", fanoutBody,
+			[]llm.ChatEvent{{Type: llm.EventTextDelta, Text: "partial"}, {Type: llm.EventError, Error: anthErr(429)}}, 3},
+		{"buffered collection 400 stops immediately", fanoutBody,
+			[]llm.ChatEvent{{Type: llm.EventTextDelta, Text: "partial"}, {Type: llm.EventError, Error: anthErr(400)}}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingScriptProv{events: tc.events}
+			s := buildFanoutServer(t, prov, 3)
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(tc.body)))
+			if prov.calls != tc.wantCalls {
+				t.Errorf("ChatStream calls = %d, want %d (catalog has 8)", prov.calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+// A resolve failure must not merely fall through — it must leave the whole
+// attempt budget available to the backends that follow it.
+func TestUnresolvableModelLeavesFullAttemptBudget(t *testing.T) {
+	catalog := []config.CatalogEntry{
+		{ID: "missing/m1", Quality: 0.99, Speed: 0.5, Caps: config.Caps{Tools: true, Vision: true, MaxContext: 200000}},
+		{ID: "anthropic/m2", Quality: 0.9, Speed: 0.5, Caps: config.Caps{Tools: true, Vision: true, MaxContext: 200000}},
+		{ID: "anthropic/m3", Quality: 0.8, Speed: 0.5, Caps: config.Caps{Tools: true, Vision: true, MaxContext: 200000}},
+	}
+	prov := &countingErrProv{err: anthErr(429)}
+	cfg := &config.Config{
+		ServerAddr: "x",
+		Weights:    config.Weights{Quality: 1},
+		Routing:    config.RoutingCfg{MaxAttempts: 2},
+		Providers:  map[string]config.ProviderCreds{"anthropic": {APIKeyEnv: "X"}},
+		Catalog:    catalog,
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"anthropic": prov})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
+	})
+	s := New(rt, reg, catalog)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutBody)))
+	if prov.calls != 2 {
+		t.Errorf("ChatStream calls = %d, want 2 (the unresolvable entry must not eat an attempt)", prov.calls)
+	}
+}
+
+// A resolve failure means a catalog entry names an unconfigured provider. That
+// is a config error, not a backend failure, so it must not consume an attempt.
+func TestUnresolvableModelDoesNotConsumeAttempt(t *testing.T) {
+	catalog := []config.CatalogEntry{
+		{ID: "missing/m1", Quality: 0.95, Speed: 0.5, Caps: config.Caps{Tools: true, Vision: true, MaxContext: 200000}},
+		{ID: "anthropic/m2", Quality: 0.9, Speed: 0.5, Caps: config.Caps{Tools: true, Vision: true, MaxContext: 200000}},
+	}
+	cfg := &config.Config{
+		ServerAddr: "x",
+		Weights:    config.Weights{Quality: 1},
+		Routing:    config.RoutingCfg{MaxAttempts: 1},
+		Providers:  map[string]config.ProviderCreds{"anthropic": {APIKeyEnv: "X"}},
+		Catalog:    catalog,
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"anthropic": &fakeProv{text: "ok"}})
+	rt := router.NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) router.TaskProfile {
+		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
+	})
+	s := New(rt, reg, catalog)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutBody)))
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200 (unresolvable first entry must not burn the single attempt)", rec.Code)
+	}
+}

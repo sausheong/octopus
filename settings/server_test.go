@@ -36,6 +36,41 @@ func TestSettingsHandlerCreatesConfigFromStructuredForm(t *testing.T) {
 	}
 }
 
+// A structured save must round-trip every routing and capability field the
+// browser sends. Both fields below silently collapse to a default if dropped:
+// max_attempts is re-defaulted to 3 by Validate, and max_output_tokens to 0
+// (unconstrained), so neither loss surfaces as an error.
+func TestSettingsStructuredSavePreservesAttemptsAndOutputCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	store := NewStore(path)
+	server := NewServer(store, func(_ context.Context) error { return nil }, nil)
+	doc := defaultDocument()
+	doc.Routing.MaxAttempts = 7
+	doc.Catalog[0].Caps.MaxOutputTokens = 8192
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/structured", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Octopus-Settings", "1")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	saved, _, exists, err := store.Load()
+	if err != nil || !exists {
+		t.Fatalf("reload saved config exists=%v err=%v", exists, err)
+	}
+	if saved.Routing.MaxAttempts != 7 {
+		t.Errorf("routing.max_attempts = %d after save, want 7", saved.Routing.MaxAttempts)
+	}
+	if saved.Catalog[0].Caps.MaxOutputTokens != 8192 {
+		t.Errorf("caps.max_output_tokens = %d after save, want 8192", saved.Catalog[0].Caps.MaxOutputTokens)
+	}
+}
+
 func TestSettingsStateUsesBrowserFieldNames(t *testing.T) {
 	server := NewServer(NewStore(filepath.Join(t.TempDir(), "config.yaml")), nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
@@ -60,6 +95,15 @@ func TestSettingsStateUsesBrowserFieldNames(t *testing.T) {
 	caps := catalog[0].(map[string]any)["caps"].(map[string]any)
 	if caps["tools"] != true || caps["max_context"] != float64(200000) {
 		t.Fatalf("unexpected browser capabilities: %#v", caps)
+	}
+	// The form reads these two keys by name to populate its inputs; a rename
+	// would leave both fields blank on load and then zero them on save.
+	if _, ok := caps["max_output_tokens"]; !ok {
+		t.Errorf("caps is missing max_output_tokens: %#v", caps)
+	}
+	routing := document["routing"].(map[string]any)
+	if routing["max_attempts"] != float64(3) {
+		t.Errorf("routing.max_attempts = %#v, want 3", routing["max_attempts"])
 	}
 }
 

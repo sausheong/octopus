@@ -368,3 +368,52 @@ func TestValidateDefaultsZeroMaxAttempts(t *testing.T) {
 		t.Errorf("MaxAttempts = %d, want defaulted to 3", cfg.Routing.MaxAttempts)
 	}
 }
+
+// Zero (or an absent key) means "unconstrained" so configs written before this
+// field keep working; negative is the only invalid value.
+func TestValidateRejectsNegativeMaxOutputTokens(t *testing.T) {
+	cfg := &Config{
+		ServerAddr: "127.0.0.1:8787",
+		Weights:    Weights{Quality: 1},
+		Providers:  map[string]ProviderCreds{"p": {Kind: "anthropic", APIKeyEnv: "K"}},
+		Catalog: []CatalogEntry{
+			{ID: "p/m", Quality: 0.5, Speed: 0.5, Caps: Caps{MaxContext: 1000, MaxOutputTokens: -1}},
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("want error for negative max_output_tokens, got nil")
+	}
+}
+
+// A config file that omits max_output_tokens must still parse and leave the
+// field zero — the installed base ships configs without this key.
+func TestParseAcceptsAbsentAndExplicitMaxOutputTokens(t *testing.T) {
+	cfg, err := Parse([]byte(`
+server:
+  addr: "127.0.0.1:8787"
+weights:
+  quality: 1
+catalog:
+  - id: "p/omitted"
+    quality: 0.5
+    speed: 0.5
+    caps: { max_context: 1000 }
+  - id: "p/explicit"
+    quality: 0.5
+    speed: 0.5
+    caps: { max_context: 1000, max_output_tokens: 8192 }
+providers:
+  p:
+    kind: "anthropic"
+    api_key_env: "K"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.Catalog[0].Caps.MaxOutputTokens; got != 0 {
+		t.Errorf("omitted max_output_tokens = %d, want 0 (unconstrained)", got)
+	}
+	if got := cfg.Catalog[1].Caps.MaxOutputTokens; got != 8192 {
+		t.Errorf("explicit max_output_tokens = %d, want 8192", got)
+	}
+}

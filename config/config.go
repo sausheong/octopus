@@ -29,6 +29,9 @@ type Caps struct {
 	Vision     bool `yaml:"vision" json:"vision"`
 	Reasoning  bool `yaml:"reasoning" json:"reasoning"`
 	MaxContext int  `yaml:"max_context" json:"max_context"`
+	// MaxOutputTokens is the model's output limit. Zero means unconstrained,
+	// so configs written before this field keep working unchanged.
+	MaxOutputTokens int `yaml:"max_output_tokens" json:"max_output_tokens"`
 }
 
 // CatalogEntry is one candidate model. ID is "provider/model".
@@ -297,6 +300,11 @@ func (c *Config) Validate() error {
 		}
 		if e.Caps.MaxContext <= 0 {
 			return fmt.Errorf("catalog id %q: caps.max_context must be > 0", e.ID)
+		}
+		// Zero is legal and means unconstrained; only a negative limit is a
+		// configuration mistake.
+		if e.Caps.MaxOutputTokens < 0 {
+			return fmt.Errorf("catalog id %q: caps.max_output_tokens must not be negative", e.ID)
 		}
 	}
 	// classifier.model is optional. When empty the router always uses

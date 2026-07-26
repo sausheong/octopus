@@ -66,27 +66,13 @@ function renderState() {
 
   renderProviders(doc.providers || []);
   renderModels(doc.catalog || []);
-  renderYAMLTab();
+  setValue("#yaml-editor", state.yaml);
   $("#config-path").textContent = state.router.config_path || "~/.octopus/config.yaml";
   $("#file-state").textContent = state.exists ? "Saved configuration" : "New configuration";
   $("#app-version").textContent = state.version === "dev" ? "Development build" : `Version ${state.version}`;
   updateStatus(state.router);
   if (state.load_error) showNotice(state.load_error, false);
   dirty = false;
-}
-
-// The server withholds the raw file whenever it holds an inline API key, so the
-// editor must not offer to save what it was not given: an empty textarea posted
-// back would replace the real configuration with nothing.
-function renderYAMLTab() {
-  const editor = $("#yaml-editor");
-  const withheld = Boolean(state.yaml_withheld);
-  setValue("#yaml-editor", withheld ? "" : state.yaml);
-  editor.readOnly = withheld;
-  editor.placeholder = withheld
-    ? "Hidden because a provider has an inline API key in this file. Editing it here would expose the key to any page that can reach this port, so use the Providers tab, or edit the file directly."
-    : "";
-  $("#yaml-withheld").classList.toggle("is-hidden", !withheld);
 }
 
 function updateStatus(router) {
@@ -361,11 +347,6 @@ async function save() {
   const form = $("#settings-form");
   if (activeSection !== "yaml" && !form.reportValidity()) return;
   const isYAML = activeSection === "yaml";
-  // Nothing was loaded into the editor, so there is nothing to save from it.
-  if (isYAML && state?.yaml_withheld) {
-    showNotice("Advanced YAML is hidden while a provider has an inline API key. Edit that provider on the Providers tab instead.", false);
-    return;
-  }
   const body = isYAML ? {yaml: $("#yaml-editor").value} : collectDocument();
   const button = $("#save-button");
   button.disabled = true;

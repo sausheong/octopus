@@ -83,6 +83,9 @@ type RoutingCfg struct {
 	SessionSticky bool          `yaml:"session_sticky"`
 	SessionTTL    time.Duration `yaml:"session_ttl"`
 	CacheAware    bool          `yaml:"cache_aware"`
+	// MaxAttempts bounds how many backends one request may try. Without it,
+	// worst-case latency and spend grow with catalog size.
+	MaxAttempts int `yaml:"max_attempts"`
 }
 
 // Config is the full router configuration.
@@ -116,6 +119,7 @@ type yamlRoutingCfg struct {
 	SessionSticky *bool         `yaml:"session_sticky"`
 	SessionTTL    time.Duration `yaml:"session_ttl"`
 	CacheAware    *bool         `yaml:"cache_aware"`
+	MaxAttempts   *int          `yaml:"max_attempts"`
 }
 
 // Load reads, parses, and validates the config at path.
@@ -146,6 +150,10 @@ func Parse(data []byte) (*Config, error) {
 	if sessionTTL == 0 {
 		sessionTTL = time.Hour
 	}
+	maxAttempts := 3
+	if yc.Routing.MaxAttempts != nil {
+		maxAttempts = *yc.Routing.MaxAttempts
+	}
 	c := &Config{
 		ServerAddr: yc.Server.Addr,
 		Classifier: yc.Classifier,
@@ -154,6 +162,7 @@ func Parse(data []byte) (*Config, error) {
 			SessionSticky: sticky,
 			SessionTTL:    sessionTTL,
 			CacheAware:    cacheAware,
+			MaxAttempts:   maxAttempts,
 		},
 		DefaultModel: yc.DefaultModel,
 		Providers:    yc.Providers,
@@ -179,7 +188,7 @@ func Marshal(c *Config) ([]byte, error) {
 	yc := yamlConfig{
 		Classifier:   copyCfg.Classifier,
 		Weights:      copyCfg.Weights,
-		Routing:      yamlRoutingCfg{SessionSticky: &sticky, SessionTTL: copyCfg.Routing.SessionTTL, CacheAware: &cacheAware},
+		Routing:      yamlRoutingCfg{SessionSticky: &sticky, SessionTTL: copyCfg.Routing.SessionTTL, CacheAware: &cacheAware, MaxAttempts: &copyCfg.Routing.MaxAttempts},
 		DefaultModel: copyCfg.DefaultModel,
 		Providers:    copyCfg.Providers,
 		Catalog:      copyCfg.Catalog,
@@ -233,6 +242,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Routing.SessionSticky && c.Routing.SessionTTL == 0 {
 		c.Routing.SessionTTL = time.Hour
+	}
+	if c.Routing.MaxAttempts < 0 {
+		return fmt.Errorf("routing.max_attempts must not be negative")
+	}
+	if c.Routing.MaxAttempts == 0 {
+		c.Routing.MaxAttempts = 3
 	}
 	if len(c.Catalog) == 0 {
 		return fmt.Errorf("catalog must have at least one entry")

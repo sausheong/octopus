@@ -10,7 +10,9 @@ import (
 
 func TestMarshalRoundTrip(t *testing.T) {
 	original := baseValid()
-	original.Routing = RoutingCfg{SessionSticky: true, SessionTTL: 45 * time.Minute, CacheAware: false}
+	// Every defaulted field is set explicitly: Marshal validates a copy, so an
+	// unset field would come back defaulted and not match the original.
+	original.Routing = RoutingCfg{SessionSticky: true, SessionTTL: 45 * time.Minute, CacheAware: false, MaxAttempts: 5}
 	data, err := Marshal(original)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -283,5 +285,86 @@ func baseValid() *Config {
 		DefaultModel: "anthropic/m",
 		Providers:    map[string]ProviderCreds{"anthropic": {APIKeyEnv: "TEST_KEY"}},
 		Catalog:      []CatalogEntry{{ID: "anthropic/m", Quality: 0.7, Speed: 0.9, Caps: Caps{Tools: true, MaxContext: 200000}}},
+	}
+}
+
+func TestParseDefaultsMaxAttempts(t *testing.T) {
+	cfg, err := Parse([]byte(`
+server:
+  addr: "127.0.0.1:8787"
+weights:
+  quality: 1
+catalog:
+  - id: "p/m"
+    quality: 0.5
+    speed: 0.5
+    caps: { max_context: 1000 }
+providers:
+  p:
+    kind: "anthropic"
+    api_key_env: "K"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Routing.MaxAttempts != 3 {
+		t.Errorf("MaxAttempts = %d, want default 3", cfg.Routing.MaxAttempts)
+	}
+}
+
+func TestParseHonoursExplicitMaxAttempts(t *testing.T) {
+	cfg, err := Parse([]byte(`
+server:
+  addr: "127.0.0.1:8787"
+weights:
+  quality: 1
+routing:
+  max_attempts: 1
+catalog:
+  - id: "p/m"
+    quality: 0.5
+    speed: 0.5
+    caps: { max_context: 1000 }
+providers:
+  p:
+    kind: "anthropic"
+    api_key_env: "K"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Routing.MaxAttempts != 1 {
+		t.Errorf("MaxAttempts = %d, want 1", cfg.Routing.MaxAttempts)
+	}
+}
+
+// Zero means "unset, use the default" because settings builds Config values by
+// hand and would otherwise trip on the zero value. Negative is the error case.
+func TestValidateRejectsNegativeMaxAttempts(t *testing.T) {
+	cfg := &Config{
+		ServerAddr: "127.0.0.1:8787",
+		Weights:    Weights{Quality: 1},
+		Routing:    RoutingCfg{MaxAttempts: -1, SessionTTL: time.Hour},
+		Providers:  map[string]ProviderCreds{"p": {Kind: "anthropic", APIKeyEnv: "K"}},
+		Catalog:    []CatalogEntry{{ID: "p/m", Quality: 0.5, Speed: 0.5, Caps: Caps{MaxContext: 1000}}},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("want error for max_attempts = -1, got nil")
+	}
+}
+
+func TestValidateDefaultsZeroMaxAttempts(t *testing.T) {
+	cfg := &Config{
+		ServerAddr: "127.0.0.1:8787",
+		Weights:    Weights{Quality: 1},
+		Routing:    RoutingCfg{MaxAttempts: 0, SessionTTL: time.Hour},
+		Providers:  map[string]ProviderCreds{"p": {Kind: "anthropic", APIKeyEnv: "K"}},
+		Catalog:    []CatalogEntry{{ID: "p/m", Quality: 0.5, Speed: 0.5, Caps: Caps{MaxContext: 1000}}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("zero max_attempts should default, got error: %v", err)
+	}
+	if cfg.Routing.MaxAttempts != 3 {
+		t.Errorf("MaxAttempts = %d, want defaulted to 3", cfg.Routing.MaxAttempts)
 	}
 }

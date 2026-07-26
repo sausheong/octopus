@@ -130,6 +130,7 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 	d := ScoreWithInputMultipliers(prof, r.cfg.Catalog, r.cfg.Weights, multipliers)
 	d.ClassifierModel = r.cfg.Classifier.Model
 	d.ClassifierUsage = classifierUsage
+	d.MaxAttempts = r.cfg.Routing.MaxAttempts
 	if sticky := r.stickyModelForSession(sid); sticky != "" {
 		for _, id := range d.Eligible {
 			if id == sticky {

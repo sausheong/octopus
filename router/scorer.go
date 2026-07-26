@@ -28,6 +28,8 @@ type Decision struct {
 	// in request economics. They are empty when classification was skipped.
 	ClassifierModel string
 	ClassifierUsage *llm.Usage
+	// MaxAttempts bounds provider fallback for this request.
+	MaxAttempts int
 }
 
 // eligible applies the hard capability filter: a model survives only if it

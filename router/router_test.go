@@ -388,3 +388,25 @@ func TestRouteNoUserTurnUsesDefaultProfile(t *testing.T) {
 		t.Errorf("Chosen = %q, want anthropic/opus", d.Chosen)
 	}
 }
+
+func TestRouteCarriesMaxAttempts(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr: "x",
+		Weights:    config.Weights{Quality: 1},
+		Routing:    config.RoutingCfg{MaxAttempts: 2},
+		Catalog: []config.CatalogEntry{
+			{ID: "p/m", Quality: 0.9, Speed: 0.5, Caps: config.Caps{MaxContext: 100000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"p": &fakeProvider{}})
+	rt := NewRouter(cfg, reg)
+	rt.SetClassifier(func(ctx context.Context, _ llm.LLMProvider, _ string, _ int, _ llm.Message) TaskProfile {
+		return TrivialProfile()
+	})
+	dec := rt.Route(context.Background(), llm.ChatRequest{
+		Messages: []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if dec.MaxAttempts != 2 {
+		t.Errorf("Decision.MaxAttempts = %d, want 2", dec.MaxAttempts)
+	}
+}

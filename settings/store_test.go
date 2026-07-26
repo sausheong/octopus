@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/sausheong/octopus/config"
 )
 
 func TestStoreCreatesSecureConfigAndRoundTrips(t *testing.T) {
@@ -47,5 +50,24 @@ func TestStoreRejectsInvalidYAMLWithoutReplacingFile(t *testing.T) {
 	}
 	if string(after) != string(original) {
 		t.Fatal("invalid save replaced valid config")
+	}
+}
+
+func TestDocumentRoundTripPreservesMaxAttempts(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr: "127.0.0.1:8787",
+		Weights:    config.Weights{Quality: 1},
+		Routing:    config.RoutingCfg{SessionSticky: true, SessionTTL: time.Hour, CacheAware: true, MaxAttempts: 5},
+		Providers:  map[string]config.ProviderCreds{"p": {Kind: "anthropic", APIKeyEnv: "K"}},
+		Catalog: []config.CatalogEntry{
+			{ID: "p/m", Quality: 0.5, Speed: 0.5, Caps: config.Caps{MaxContext: 1000}},
+		},
+	}
+	back, err := documentFromConfig(cfg).config()
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if back.Routing.MaxAttempts != 5 {
+		t.Errorf("MaxAttempts = %d after round trip, want 5", back.Routing.MaxAttempts)
 	}
 }

@@ -1,6 +1,7 @@
 package anthropicio
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 
@@ -17,6 +18,10 @@ type APIError struct {
 }
 
 func (e APIError) Error() string { return e.Message }
+
+// KindCanceled marks client-side cancellation: the caller went away, so there
+// is no point trying another backend and no client left to write a response to.
+const KindCanceled = "canceled"
 
 // NewAPIError builds an APIError.
 func NewAPIError(kind, msg string) APIError { return APIError{Kind: kind, Message: msg} }
@@ -55,6 +60,18 @@ func MapError(err error) (int, []byte) {
 // right Kind, inspecting typed SDK errors via errors.As. Falls back to
 // "upstream" (502) for unrecognized errors.
 func MapBackendError(err error) APIError {
+	// Checked first, before the SDK type switches: some SDKs wrap cancellation
+	// inside their own error types, so an errors.As match on a provider error
+	// would otherwise shadow it and misreport a hang-up as a retryable 502.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return NewAPIError(KindCanceled, err.Error())
+	}
+	// An already-classified error keeps its Kind: re-deriving it here would fall
+	// through to "upstream" and turn a terminal failure back into a retryable one.
+	var already APIError
+	if errors.As(err, &already) {
+		return already
+	}
 	// anthropic 429 -> rate_limit, 529 -> overloaded
 	var anthErr *anthropic.Error
 	if errors.As(err, &anthErr) {
@@ -101,4 +118,16 @@ func MapBackendError(err error) APIError {
 		}
 	}
 	return NewAPIError("upstream", err.Error())
+}
+
+// Retryable reports whether trying a different backend could plausibly help.
+// A malformed request fails identically everywhere, and a cancelled request
+// has no one waiting for it; everything else is worth another candidate.
+func Retryable(err error) bool {
+	switch MapBackendError(err).Kind {
+	case "invalid_request", KindCanceled:
+		return false
+	default:
+		return true
+	}
 }

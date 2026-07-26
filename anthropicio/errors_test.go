@@ -1,8 +1,10 @@
 package anthropicio
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"testing"
@@ -81,6 +83,60 @@ func TestMapBackendError(t *testing.T) {
 			status, _ := MapError(ae)
 			if status != c.wantStatus {
 				t.Errorf("MapError status = %d, want %d", status, c.wantStatus)
+			}
+		})
+	}
+}
+
+// cancelWrapper mimics an SDK that wraps context cancellation inside its own
+// error type. MapBackendError must detect the wrapped cancellation before it
+// reaches the SDK type switches, or cancellation is misclassified as a
+// retryable upstream failure and the fan-out defect persists.
+type cancelWrapper struct{ inner error }
+
+func (c cancelWrapper) Error() string { return "sdk: " + c.inner.Error() }
+func (c cancelWrapper) Unwrap() error { return c.inner }
+
+func TestMapBackendErrorClassifiesCancellation(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"bare canceled", context.Canceled},
+		{"bare deadline", context.DeadlineExceeded},
+		{"wrapped canceled", cancelWrapper{inner: context.Canceled}},
+		{"wrapped in fmt.Errorf", fmt.Errorf("stream open: %w", context.Canceled)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := MapBackendError(c.err).Kind; got != KindCanceled {
+				t.Errorf("Kind = %q, want %q", got, KindCanceled)
+			}
+		})
+	}
+}
+
+func TestRetryable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"rate limit", NewAPIError("rate_limit", "slow down"), true},
+		{"overloaded", NewAPIError("overloaded", "busy"), true},
+		{"upstream", NewAPIError("upstream", "boom"), true},
+		{"invalid request", NewAPIError("invalid_request", "bad max_tokens"), false},
+		{"canceled", NewAPIError(KindCanceled, "gone"), false},
+		{"anthropic 429", anthErr(429), true},
+		{"anthropic 400", anthErr(400), false},
+		{"anthropic 529", anthErr(529), true},
+		{"raw context cancel", context.Canceled, false},
+		{"unknown error", errors.New("mystery"), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Retryable(c.err); got != c.want {
+				t.Errorf("Retryable(%v) = %v, want %v", c.err, got, c.want)
 			}
 		})
 	}

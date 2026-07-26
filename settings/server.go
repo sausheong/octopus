@@ -228,7 +228,27 @@ func (s *Server) routerStatus() desktop.RouterStatus {
 	return s.status()
 }
 
+// loopbackHost reports whether the Host header names this machine by address.
+// A DNS-rebinding attack arrives with an attacker-controlled hostname that
+// resolves to 127.0.0.1, so comparing Origin against Host proves nothing —
+// both are attacker-controlled and agree with each other. Only the literal
+// address distinguishes the real local UI from a hostile page.
+func loopbackHost(host string) bool {
+	name, _, err := net.SplitHostPort(host)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(name, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(name)
+	return ip != nil && ip.IsLoopback()
+}
+
 func validWriteRequest(r *http.Request) bool {
+	if !loopbackHost(r.Host) {
+		return false
+	}
 	if r.Header.Get("X-Octopus-Settings") != "1" || !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		return false
 	}

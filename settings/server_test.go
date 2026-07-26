@@ -24,6 +24,7 @@ func TestSettingsHandlerCreatesConfigFromStructuredForm(t *testing.T) {
 	doc := defaultDocument()
 	body, _ := json.Marshal(doc)
 	req := httptest.NewRequest(http.MethodPost, "/api/structured", bytes.NewReader(body))
+	req.Host = "127.0.0.1:8787"
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Octopus-Settings", "1")
 	rec := httptest.NewRecorder()
@@ -52,6 +53,7 @@ func TestSettingsStructuredSavePreservesAttemptsAndOutputCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/structured", bytes.NewReader(body))
+	req.Host = "127.0.0.1:8787"
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Octopus-Settings", "1")
 	rec := httptest.NewRecorder()
@@ -111,6 +113,7 @@ func TestSettingsHandlerRejectsCrossOriginWrite(t *testing.T) {
 	store := NewStore(filepath.Join(t.TempDir(), "config.yaml"))
 	server := NewServer(store, nil, nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/yaml", strings.NewReader(`{"yaml":"x"}`))
+	req.Host = "127.0.0.1:8787"
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Octopus-Settings", "1")
 	req.Header.Set("Origin", "https://attacker.example")
@@ -166,5 +169,65 @@ func TestSettingsServesInsightsRange(t *testing.T) {
 	}
 	if report.RangeDays != 7 || report.Summary.Requests != 12 {
 		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestLoopbackHost(t *testing.T) {
+	for _, c := range []struct {
+		host string
+		want bool
+	}{
+		{"127.0.0.1:8787", true},
+		{"[::1]:8787", true},
+		{"localhost:8787", true},
+		{"LocalHost:8787", true},
+		{"127.0.0.2:8787", true},
+		{"evil.example.com:8787", false},
+		{"127.0.0.1.evil.com:8787", false},
+		{"127.0.0.1", false},
+		{"localhost", false},
+		{"[::1]", false},
+		{"", false},
+		{"192.168.1.5:8787", false},
+		{"10.0.0.1:8787", false},
+		{"localhost.:8787", false},
+		{"127.0.0.1:notaport", true},
+	} {
+		if got := loopbackHost(c.host); got != c.want {
+			t.Errorf("loopbackHost(%q) = %v, want %v", c.host, got, c.want)
+		}
+	}
+}
+
+// The demonstrated attack: a page on evil.example.com whose DNS resolves to
+// 127.0.0.1. Host and Origin agree with each other, so the old Origin-vs-Host
+// comparison accepted it; only the literal address rejects it.
+func TestRebindingWriteIsRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".octopus", "config.yaml")
+	server := NewServer(NewStore(path), nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/yaml",
+		strings.NewReader(`{"yaml":"server:\n  addr: \"127.0.0.1:8787\"\n"}`))
+	req.Host = "evil.example.com:54321"
+	req.Header.Set("Origin", "http://evil.example.com:54321")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Octopus-Settings", "1")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (rebinding must be rejected)", rec.Code)
+	}
+}
+
+// Reads are deliberately not gated: the page must load before it can hold a
+// token, and /api/state carries no secret a local process cannot already read.
+func TestStateReadIsNotHostGated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".octopus", "config.yaml")
+	server := NewServer(NewStore(path), nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	req.Host = "evil.example.com:54321"
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 }

@@ -321,6 +321,10 @@ function collectDocument() {
   }));
   return {
     server_addr: $("#server-address").value.trim(),
+    // No form control edits the auth token env name, so echo back whatever the
+    // server sent. Omitting it would decode as "" and silently turn off
+    // authentication on every save.
+    auth_token_env: state.document.auth_token_env || "",
     classifier_enabled: $("#classifier-enabled").checked,
     classifier: {
       model: $("#classifier-model").value.trim(),

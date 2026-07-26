@@ -9,7 +9,12 @@ import (
 )
 
 type Document struct {
-	ServerAddr        string             `json:"server_addr"`
+	ServerAddr string `json:"server_addr"`
+	// AuthTokenEnv must round-trip even though no form control edits it.
+	// config() rebuilds config.Config field by field, so a field the Document
+	// does not carry is zeroed on every structured save — and zeroing this one
+	// silently turns authentication off.
+	AuthTokenEnv      string             `json:"auth_token_env"`
 	ClassifierEnabled bool               `json:"classifier_enabled"`
 	Classifier        ClassifierDocument `json:"classifier"`
 	Weights           config.Weights     `json:"weights"`
@@ -66,6 +71,7 @@ func defaultDocument() Document {
 func documentFromConfig(cfg *config.Config) Document {
 	doc := Document{
 		ServerAddr:        cfg.ServerAddr,
+		AuthTokenEnv:      cfg.AuthTokenEnv,
 		ClassifierEnabled: cfg.Classifier.Model != "",
 		Classifier: ClassifierDocument{
 			Model: cfg.Classifier.Model, MaxTokens: cfg.Classifier.MaxTokens, Timeout: cfg.Classifier.Timeout.String(),
@@ -100,8 +106,9 @@ func (d Document) config() (*config.Config, error) {
 		return nil, fmt.Errorf("routing session TTL: %w", err)
 	}
 	cfg := &config.Config{
-		ServerAddr: d.ServerAddr,
-		Weights:    d.Weights,
+		ServerAddr:   d.ServerAddr,
+		AuthTokenEnv: d.AuthTokenEnv,
+		Weights:      d.Weights,
 		Routing: config.RoutingCfg{
 			SessionSticky: d.Routing.SessionSticky,
 			SessionTTL:    ttl,

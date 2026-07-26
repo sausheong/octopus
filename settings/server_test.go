@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -335,5 +336,73 @@ func TestTokensArePerProcess(t *testing.T) {
 	b := NewServer(NewStore(filepath.Join(t.TempDir(), "b.yaml")), nil, nil)
 	if a.csrf == b.csrf {
 		t.Fatal("two servers generated the same CSRF token")
+	}
+}
+
+// The browser form has no control for the auth token env name, so app.js echoes
+// it back from the state payload. That only works if /api/state exposes the key
+// and a structured save round-trips it; if either breaks, a save silently
+// disables authentication with no error shown to the user.
+func TestSettingsStructuredSavePreservesAuthTokenEnv(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	seed := "server:\n  addr: \"127.0.0.1:8787\"\n  auth_token_env: \"OCTOPUS_AUTH_TOKEN\"\n" +
+		"weights:\n  quality: 1\nproviders:\n  p:\n    kind: anthropic\n    api_key_env: \"K\"\n" +
+		"catalog:\n  - id: \"p/m\"\n    quality: 0.5\n    speed: 0.5\n    caps: { max_context: 1000 }\n"
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(path)
+	server := NewServer(store, func(_ context.Context) error { return nil }, nil)
+
+	stateReq := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	stateRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(stateRec, stateReq)
+	var state map[string]any
+	if err := json.Unmarshal(stateRec.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	document := state["document"].(map[string]any)
+	if document["auth_token_env"] != "OCTOPUS_AUTH_TOKEN" {
+		t.Fatalf("state document auth_token_env = %#v, want OCTOPUS_AUTH_TOKEN (app.js cannot echo what it is not sent)",
+			document["auth_token_env"])
+	}
+
+	// Post the document straight back, as the form does after an unrelated edit.
+	document["server_addr"] = "127.0.0.1:9999"
+	body, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/structured", bytes.NewReader(body))
+	req.Host = "127.0.0.1:8787"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Octopus-Settings", "1")
+	req.Header.Set("X-Octopus-CSRF", server.csrf)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(written), "auth_token_env: OCTOPUS_AUTH_TOKEN") {
+		t.Errorf("a form save stripped auth_token_env, disabling authentication; written config:\n%s", written)
+	}
+}
+
+// The Go round-trip fix is necessary but not sufficient: app.js builds the POST
+// body key by key, so a key it omits arrives as "" and is written back as "",
+// disabling authentication. This is the third field in this codebase to hit
+// that root cause (after routing.max_attempts and caps.max_output_tokens), so
+// pin the echo-back explicitly — no Go test can otherwise reach it.
+func TestBrowserFormEchoesAuthTokenEnv(t *testing.T) {
+	data, err := staticFiles.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "auth_token_env: state.document.auth_token_env") {
+		t.Error("app.js collectDocument() does not echo auth_token_env; a form save will silently disable authentication")
 	}
 }

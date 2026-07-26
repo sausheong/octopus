@@ -245,7 +245,7 @@ func (c *Config) Validate() error {
 	if !strings.EqualFold(host, "localhost") {
 		ip := net.ParseIP(host)
 		if ip == nil || !ip.IsLoopback() {
-			return fmt.Errorf("server.addr must use a loopback host because inbound requests are unauthenticated")
+			return fmt.Errorf("server.addr must use a loopback host because inbound requests may be unauthenticated")
 		}
 	}
 	finite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }

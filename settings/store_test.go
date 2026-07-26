@@ -71,3 +71,28 @@ func TestDocumentRoundTripPreservesMaxAttempts(t *testing.T) {
 		t.Errorf("MaxAttempts = %d after round trip, want 5", back.Routing.MaxAttempts)
 	}
 }
+
+// A structured (form) save must not silently drop the auth token env name.
+// Document.config() rebuilds config.Config field by field, so a field the
+// Document does not know about is zeroed on every save — and zeroing this one
+// turns authentication off without any error or indication to the user.
+func TestDocumentRoundTripPreservesAuthTokenEnv(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr:   "127.0.0.1:8787",
+		AuthTokenEnv: "OCTOPUS_AUTH_TOKEN",
+		Weights:      config.Weights{Quality: 1},
+		Routing:      config.RoutingCfg{SessionSticky: true, SessionTTL: time.Hour, CacheAware: true, MaxAttempts: 3},
+		Providers:    map[string]config.ProviderCreds{"p": {Kind: "anthropic", APIKeyEnv: "K"}},
+		Catalog: []config.CatalogEntry{
+			{ID: "p/m", Quality: 0.5, Speed: 0.5, Caps: config.Caps{MaxContext: 1000}},
+		},
+	}
+	back, err := documentFromConfig(cfg).config()
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if back.AuthTokenEnv != "OCTOPUS_AUTH_TOKEN" {
+		t.Errorf("AuthTokenEnv = %q after round trip, want %q (a form save must not disable authentication)",
+			back.AuthTokenEnv, "OCTOPUS_AUTH_TOKEN")
+	}
+}

@@ -153,10 +153,19 @@ rather than being special-cased as "first request".
 content-type requirement stay. They cost nothing and stop simple form posts.
 
 All three apply to writes (`POST /api/structured`, `POST /api/yaml`). Reads are
-not gated: `GET /api/state` exposes configuration but not secrets — provider
-API keys reach it only when a user has inlined them in `config.yaml`, and the
-same file is readable by any local process anyway. Gating reads would also
-break the initial page load, which must fetch state before it has a token.
+not gated, because gating them would break the initial page load, which must
+fetch state before it has a token.
+
+An earlier draft of this section justified that by arguing `GET /api/state`
+exposes no secret a local process could not already read from `config.yaml`.
+**That reasoning was wrong for the attacker this milestone exists to stop.** It
+holds for a local process, but a DNS-rebinding page cannot read `config.yaml`
+and *can* fetch `/api/state` same-origin, so an inlined provider key reaching
+that response is a real escalation. Because reads stay ungated, the response
+itself must carry no secret: `/api/state` substitutes a sentinel for every
+inline `api_key`, and withholds the raw YAML entirely while one is present. A
+structured save that echoes the sentinel back resolves to the stored key, so
+redaction does not destroy the credential on the next save.
 
 ### 5. Optional routing-endpoint authentication
 
@@ -213,7 +222,11 @@ is the primary defence: `127.0.0.1:8787`, `[::1]:8787`, `localhost:8787`,
 | `Host: localhost:PORT`, valid CSRF | 200 |
 | `Host: [::1]:PORT`, valid CSRF | 200 |
 | Valid CSRF, missing `X-Octopus-Settings` | 403 |
+| Valid CSRF, non-JSON `Content-Type` | 403 |
 | `GET /api/state` with attacker `Host` | 200 — reads are not gated |
+| `GET /api/state` with an inlined key, either channel | key absent from the response |
+| Structured save echoing the redaction sentinel | stored key preserved |
+| Structured save with a new or an emptied key | key replaced, or cleared |
 
 Plus one asserting the served HTML contains a non-placeholder token, since the
 UI is broken if it does not.

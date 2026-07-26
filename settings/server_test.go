@@ -233,7 +233,8 @@ func TestRebindingWriteIsRejected(t *testing.T) {
 }
 
 // Reads are deliberately not gated: the page must load before it can hold a
-// token, and /api/state carries no secret a local process cannot already read.
+// token. That is only safe because the response carries no secret — see
+// TestStateWithholdsInlineAPIKey, which is the other half of this decision.
 func TestStateReadIsNotHostGated(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".octopus", "config.yaml")
 	server := NewServer(NewStore(path), nil, nil)
@@ -284,6 +285,84 @@ func TestWriteRequiresCSRFToken(t *testing.T) {
 			server.Handler().ServeHTTP(rec, req)
 			if rec.Code != c.want {
 				t.Errorf("status = %d, want %d (body %s)", rec.Code, c.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+// The header and content-type gates were entirely unpinned: both could be
+// deleted from validWriteRequest with the suite still green. They are the layer
+// that stops a plain HTML form post, which cannot set a custom header and
+// cannot send application/json, so a browser that ignores CORS preflight for
+// simple requests still cannot reach a write.
+func TestWriteRequiresSettingsHeaderAndJSONContentType(t *testing.T) {
+	for _, c := range []struct {
+		name        string
+		header      string
+		contentType string
+		want        int
+	}{
+		{"both present", "1", "application/json", http.StatusOK},
+		{"missing X-Octopus-Settings", "", "application/json", http.StatusForbidden},
+		{"wrong X-Octopus-Settings", "0", "application/json", http.StatusForbidden},
+		{"missing content type", "1", "", http.StatusForbidden},
+		// The shape a plain <form> can produce without any scripting.
+		{"form content type", "1", "application/x-www-form-urlencoded", http.StatusForbidden},
+		{"text content type", "1", "text/plain", http.StatusForbidden},
+		{"json with charset", "1", "application/json; charset=utf-8", http.StatusOK},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			// A fresh server per case so an accepted write cannot change what a
+			// later case observes.
+			server := NewServer(NewStore(filepath.Join(t.TempDir(), "config.yaml")), nil, nil)
+			req := writeReq(t, server, "/api/yaml", validYAMLBody)
+			// Deleted rather than set to "": http.Header treats a present empty
+			// value differently from an absent one, and absent is what a form
+			// post actually sends.
+			if c.header == "" {
+				req.Header.Del("X-Octopus-Settings")
+			} else {
+				req.Header.Set("X-Octopus-Settings", c.header)
+			}
+			if c.contentType == "" {
+				req.Header.Del("Content-Type")
+			} else {
+				req.Header.Set("Content-Type", c.contentType)
+			}
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, req)
+			if rec.Code != c.want {
+				t.Errorf("status = %d, want %d (body %s)", rec.Code, c.want, rec.Body.String())
+			}
+			if c.want == http.StatusForbidden {
+				if _, _, exists, _ := server.store.Load(); exists {
+					t.Error("a rejected write still persisted config")
+				}
+			}
+		})
+	}
+}
+
+// The spec's matrix lists localhost and [::1] as accepted, but only
+// TestLoopbackHost covered them and that tests the predicate in isolation. A
+// predicate can be correct while the handler never consults it, so drive a real
+// write through the full handler for each accepted spelling of "this machine".
+func TestWriteAcceptsEveryLoopbackHostSpelling(t *testing.T) {
+	for _, host := range []string{"127.0.0.1:8787", "localhost:8787", "[::1]:8787"} {
+		t.Run(host, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			server := NewServer(NewStore(path), nil, nil)
+			req := writeReq(t, server, "/api/yaml", validYAMLBody)
+			req.Host = host
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+			}
+			// A 200 alone would also be returned if the handler short-circuited
+			// before writing, so confirm the config actually landed.
+			if _, _, exists, err := server.store.Load(); err != nil || !exists {
+				t.Errorf("write from %s did not persist: exists=%v err=%v", host, exists, err)
 			}
 		})
 	}

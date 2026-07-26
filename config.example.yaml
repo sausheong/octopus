@@ -6,7 +6,8 @@ server:
   # the endpoints accept any request that reaches them, relying solely on the
   # loopback bind — any local process can spend your provider credits. Naming a
   # variable that is not set in the environment leaves authentication disabled
-  # rather than rejecting every request, and Octopus does not warn about it.
+  # rather than rejecting every request; Octopus logs a warning at startup:
+  # "auth token variable is empty; routing endpoints are UNAUTHENTICATED".
   # Clients may send the token as x-api-key or as Authorization: Bearer.
   # auth_token_env: "OCTOPUS_AUTH_TOKEN"
 

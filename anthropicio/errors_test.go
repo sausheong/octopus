@@ -186,7 +186,8 @@ func TestRetryable(t *testing.T) {
 		{"raw context cancel", context.Canceled, false},
 		{"unknown error", errors.New("mystery"), true},
 		// Guards against a panic, not a wrong answer: MapBackendError would
-		// dereference nil, and Task 3 calls this on a lastErr that can be nil.
+		// dereference nil, and the fallback loops consult this predicate on a
+		// lastErr value that can still be nil.
 		{"nil error", nil, false},
 	}
 	for _, c := range cases {

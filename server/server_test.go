@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/octopus/config"
 	"github.com/sausheong/octopus/insights"
@@ -980,6 +981,32 @@ func TestOpenAIPathRespectsAttemptCap(t *testing.T) {
 	}
 	if rec.Code != 429 {
 		t.Errorf("status = %d, want 429", rec.Code)
+	}
+}
+
+// The 400 arm of oaiBackendError is the path a local mlx/Ollama/LM Studio
+// rejection takes: the backend's own complaint has to reach the caller intact
+// instead of being retried across the catalog and masked as a 502.
+func TestOpenAIInvalidRequestStopsAfterOneAttempt(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"buffered", `{"model":"x","messages":[{"role":"user","content":"hi"}]}`},
+		{"streaming", `{"model":"x","stream":true,"messages":[{"role":"user","content":"hi"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingErrProv{err: &openai.APIError{HTTPStatusCode: 400, Message: "bad max_tokens"}}
+			s := buildFanoutServer(t, prov, 3)
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(tc.body)))
+			if prov.calls != 1 {
+				t.Errorf("ChatStream calls = %d, want 1 (400 is not retryable)", prov.calls)
+			}
+			if rec.Code != 400 {
+				t.Errorf("status = %d, want 400 (real backend error, not a masked 502)", rec.Code)
+			}
+			if !strings.Contains(rec.Body.String(), "bad max_tokens") {
+				t.Errorf("backend message lost from response body: %s", rec.Body.String())
+			}
+		})
 	}
 }
 

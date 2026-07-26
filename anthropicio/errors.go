@@ -44,10 +44,10 @@ func MapError(err error) (int, []byte) {
 		case "upstream":
 			status, errType = 502, "api_error"
 		case KindCanceled:
-			// 499 (client closed request): the caller hung up, so reporting a
-			// server error would misattribute the failure. Task 3 stops writing
-			// a body at all for cancellation; this keeps the mapping honest
-			// meanwhile rather than defaulting to 500.
+			// The handlers write nothing at all for a cancelled request, so this
+			// is not a hot path. It is a coherence backstop for any other
+			// caller: 499 (client closed request) says the caller hung up,
+			// where the default 500 would misattribute the failure to us.
 			status, errType = 499, "invalid_request_error"
 		}
 	}

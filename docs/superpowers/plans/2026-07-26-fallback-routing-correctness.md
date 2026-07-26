@@ -1096,16 +1096,32 @@ would fail JSON decoding:
     routing: {session_sticky: $("#session-sticky").checked, session_ttl: $("#session-ttl").value.trim(), cache_aware: $("#cache-aware").checked, max_attempts: Number($("#max-attempts").value.trim() || 3)},
 ```
 
-Then add a Go-side regression test to `settings/server_test.go` that POSTs a
-structured payload containing `max_attempts` and asserts the saved config
-retains it. Follow the existing structured-form test in that file for the
-request shape (it needs the `X-Octopus-Settings: 1` header and
-`Content-Type: application/json`). Assert on a NON-default value such as 7, so
-the test fails if the field is dropped and defaulted back to 3.
+**The catalog `caps` object has the same defect.** `app.js` (around line 306)
+rebuilds each catalog entry's `caps` field by field, emitting only `tools`,
+`vision`, `reasoning`, and `max_context` — so the `max_output_tokens` added in
+Task 5 is dropped on the first Settings-UI save, exactly like `max_attempts`.
+Add it to that object too:
 
-Verify by mutation: remove `max_attempts` from the app.js payload and confirm
-your new Go test still passes (it exercises the server, not the browser), then
-confirm the value is lost by reading the written YAML. Report both.
+```js
+      max_output_tokens: Number($('[data-field="max_output_tokens"]', item).value || 0),
+```
+
+and add the matching input to the catalog-entry template in `index.html`,
+following the `max_context` field's markup. Zero means unconstrained, so unlike
+`max_attempts` an empty input is a legitimate value — do not force a default.
+
+Then add Go-side regression tests to `settings/server_test.go` that POST a
+structured payload and assert the saved config retains both fields. Follow the
+existing structured-form test in that file for the request shape (it needs the
+`X-Octopus-Settings: 1` header and `Content-Type: application/json`). Use a
+NON-default `max_attempts` such as 7, so the test fails if the field is dropped
+and defaulted back to 3, and a non-zero `max_output_tokens` such as 8192.
+
+Verify by mutation: remove each field from the app.js payload in turn and
+confirm your new Go tests still pass (they exercise the server, not the
+browser), then confirm the value is lost by reading the written YAML. Report
+both. This is the honest framing — the Go tests cannot catch a browser-layer
+omission, which is precisely why both gaps survived Tasks 2 and 5.
 
 - [ ] **Step 1: Update `config.example.yaml`**
 

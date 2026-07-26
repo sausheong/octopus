@@ -57,6 +57,9 @@ func main() {
 
 	rt := router.NewRouter(cfg, reg)
 	srv := server.New(rt, reg, cfg.Catalog)
+	// Opt-in: an unconfigured or unset variable yields "", which leaves the
+	// endpoints open exactly as they were before this option existed.
+	srv.SetAuthToken(cfg.AuthToken())
 
 	httpSrv := &http.Server{
 		Addr:    cfg.ServerAddr,

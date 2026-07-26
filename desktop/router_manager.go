@@ -94,7 +94,11 @@ func (m *RouterManager) Reload(ctx context.Context) error {
 		return err
 	}
 	rt := router.NewRouter(resolved, reg)
-	handler := server.New(rt, reg, resolved.Catalog, m.insights.Record).Handler()
+	srv := server.New(rt, reg, resolved.Catalog, m.insights.Record)
+	// Opt-in: an unconfigured or unset variable yields "", which leaves the
+	// endpoints open exactly as they were before this option existed.
+	srv.SetAuthToken(resolved.AuthToken())
+	handler := srv.Handler()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()

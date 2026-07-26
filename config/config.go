@@ -93,10 +93,15 @@ type RoutingCfg struct {
 
 // Config is the full router configuration.
 type Config struct {
-	ServerAddr string        `yaml:"-"`
-	Classifier ClassifierCfg `yaml:"classifier"`
-	Weights    Weights       `yaml:"weights"`
-	Routing    RoutingCfg    `yaml:"routing"`
+	ServerAddr string `yaml:"-"`
+	// AuthTokenEnv names the environment variable holding a shared secret that
+	// callers must present on the routing endpoints. Empty means no
+	// authentication, which is the default: a signed installer is already in
+	// use and requiring a token would break every existing client.
+	AuthTokenEnv string        `yaml:"-"`
+	Classifier   ClassifierCfg `yaml:"classifier"`
+	Weights      Weights       `yaml:"weights"`
+	Routing      RoutingCfg    `yaml:"routing"`
 	// DefaultModel is accepted for compatibility with older configuration
 	// files. It is deprecated and ignored; an empty eligible set is an error.
 	DefaultModel string                   `yaml:"default_model"`
@@ -104,11 +109,22 @@ type Config struct {
 	Catalog      []CatalogEntry           `yaml:"catalog"`
 }
 
+// AuthToken resolves the configured shared secret. An unset or empty variable
+// yields "", which callers must treat as "authentication disabled" rather than
+// "the expected token is empty" — the latter would accept every request.
+func (c *Config) AuthToken() string {
+	if c.AuthTokenEnv == "" {
+		return ""
+	}
+	return os.Getenv(c.AuthTokenEnv)
+}
+
 // yamlConfig mirrors Config but nests server.addr so YAML maps cleanly,
 // then we flatten into Config.
 type yamlConfig struct {
 	Server struct {
-		Addr string `yaml:"addr"`
+		Addr         string `yaml:"addr"`
+		AuthTokenEnv string `yaml:"auth_token_env"`
 	} `yaml:"server"`
 	Classifier   ClassifierCfg            `yaml:"classifier"`
 	Weights      Weights                  `yaml:"weights"`
@@ -158,9 +174,10 @@ func Parse(data []byte) (*Config, error) {
 		maxAttempts = *yc.Routing.MaxAttempts
 	}
 	c := &Config{
-		ServerAddr: yc.Server.Addr,
-		Classifier: yc.Classifier,
-		Weights:    yc.Weights,
+		ServerAddr:   yc.Server.Addr,
+		AuthTokenEnv: yc.Server.AuthTokenEnv,
+		Classifier:   yc.Classifier,
+		Weights:      yc.Weights,
 		Routing: RoutingCfg{
 			SessionSticky: sticky,
 			SessionTTL:    sessionTTL,
@@ -197,6 +214,7 @@ func Marshal(c *Config) ([]byte, error) {
 		Catalog:      copyCfg.Catalog,
 	}
 	yc.Server.Addr = copyCfg.ServerAddr
+	yc.Server.AuthTokenEnv = copyCfg.AuthTokenEnv
 	data, err := yaml.Marshal(&yc)
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)

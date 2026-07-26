@@ -417,3 +417,52 @@ providers:
 		t.Errorf("explicit max_output_tokens = %d, want 8192", got)
 	}
 }
+
+func TestParseAuthTokenEnv(t *testing.T) {
+	cfg, err := Parse([]byte(`
+server:
+  addr: "127.0.0.1:8787"
+  auth_token_env: "OCTOPUS_AUTH_TOKEN"
+weights:
+  quality: 1
+providers:
+  p:
+    kind: anthropic
+    api_key_env: "K"
+catalog:
+  - id: "p/m"
+    quality: 0.5
+    speed: 0.5
+    caps: { max_context: 1000 }
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.AuthTokenEnv != "OCTOPUS_AUTH_TOKEN" {
+		t.Errorf("AuthTokenEnv = %q, want %q", cfg.AuthTokenEnv, "OCTOPUS_AUTH_TOKEN")
+	}
+}
+
+func TestAuthTokenResolvesEnvVar(t *testing.T) {
+	t.Setenv("OCTOPUS_TEST_TOKEN", "s3cret")
+	cfg := &Config{AuthTokenEnv: "OCTOPUS_TEST_TOKEN"}
+	if got := cfg.AuthToken(); got != "s3cret" {
+		t.Errorf("AuthToken() = %q, want %q", got, "s3cret")
+	}
+}
+
+// A named-but-unset variable must mean "no auth", not "the token is the empty
+// string" — the latter would accept every request while looking configured.
+func TestAuthTokenEmptyWhenEnvUnset(t *testing.T) {
+	cfg := &Config{AuthTokenEnv: "OCTOPUS_DEFINITELY_UNSET_VAR"}
+	if got := cfg.AuthToken(); got != "" {
+		t.Errorf("AuthToken() = %q, want empty", got)
+	}
+}
+
+func TestAuthTokenEmptyWhenUnconfigured(t *testing.T) {
+	cfg := &Config{}
+	if got := cfg.AuthToken(); got != "" {
+		t.Errorf("AuthToken() = %q, want empty", got)
+	}
+}

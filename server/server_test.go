@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1123,5 +1124,84 @@ func TestUnresolvableModelDoesNotConsumeAttempt(t *testing.T) {
 	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(fanoutBody)))
 	if rec.Code != 200 {
 		t.Errorf("status = %d, want 200 (unresolvable first entry must not burn the single attempt)", rec.Code)
+	}
+}
+
+// buildServerWithAuth wires the standard fake-provider Server and configures a
+// shared secret on it. An empty token leaves authentication disabled.
+func buildServerWithAuth(t *testing.T, token string) *Server {
+	t.Helper()
+	s := buildServerWithProv(t, &fakeProv{text: "Hello"})
+	s.SetAuthToken(token)
+	return s
+}
+
+func TestRoutingAuth(t *testing.T) {
+	const token = "s3cret-token"
+	for _, c := range []struct {
+		name       string
+		configured string
+		header     string
+		value      string
+		path       string
+		want       int
+	}{
+		{"unconfigured allows anonymous", "", "", "", "/v1/messages", 200},
+		{"correct x-api-key", token, "x-api-key", token, "/v1/messages", 200},
+		{"correct bearer", token, "Authorization", "Bearer " + token, "/v1/messages", 200},
+		{"wrong token anthropic", token, "x-api-key", "nope", "/v1/messages", 401},
+		{"missing token anthropic", token, "", "", "/v1/messages", 401},
+		{"wrong token openai", token, "Authorization", "Bearer nope", "/v1/chat/completions", 401},
+		{"models requires auth", token, "", "", "/v1/models", 401},
+		{"models with auth", token, "x-api-key", token, "/v1/models", 200},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := buildServerWithAuth(t, c.configured)
+			var req *http.Request
+			if c.path == "/v1/models" {
+				req = httptest.NewRequest(http.MethodGet, c.path, nil)
+			} else {
+				body := `{"model":"x","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`
+				if c.path == "/v1/chat/completions" {
+					body = `{"model":"x","messages":[{"role":"user","content":"hi"}]}`
+				}
+				req = httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(body))
+			}
+			if c.header != "" {
+				req.Header.Set(c.header, c.value)
+			}
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+			if rec.Code != c.want {
+				t.Errorf("status = %d, want %d (body %s)", rec.Code, c.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+// The error body must match the endpoint the caller used, not a single shape.
+func TestAuthErrorShapePerEndpoint(t *testing.T) {
+	s := buildServerWithAuth(t, "tok")
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"x","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)))
+	var anth map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &anth); err != nil {
+		t.Fatalf("anthropic body not JSON: %v", err)
+	}
+	if anth["type"] != "error" {
+		t.Errorf("anthropic error body = %v, want top-level type=error", anth)
+	}
+
+	rec2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`)))
+	var oai map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &oai); err != nil {
+		t.Fatalf("openai body not JSON: %v", err)
+	}
+	if _, ok := oai["error"]; !ok || oai["type"] != nil {
+		t.Errorf("openai error body = %v, want an error object with no top-level type", oai)
 	}
 }

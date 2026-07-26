@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -30,7 +31,13 @@ type Server struct {
 	reg           *registry.Registry
 	catalog       []config.CatalogEntry
 	usageObserver func(insights.Observation)
+	authToken     string
 }
+
+// SetAuthToken enables shared-secret authentication on the routing endpoints.
+// An empty token disables it, which is the default and preserves the
+// no-credentials behaviour every existing client relies on.
+func (s *Server) SetAuthToken(token string) { s.authToken = token }
 
 // New builds a Server.
 func New(rt *router.Router, reg *registry.Registry, catalog []config.CatalogEntry, observers ...func(insights.Observation)) *Server {
@@ -41,12 +48,45 @@ func New(rt *router.Router, reg *registry.Registry, catalog []config.CatalogEntr
 	return server
 }
 
+// authorized reports whether the request carries the configured shared secret.
+// Anthropic clients send x-api-key and OpenAI clients send an Authorization
+// bearer, so both are accepted. Always true when no token is configured.
+func (s *Server) authorized(r *http.Request) bool {
+	if s.authToken == "" {
+		return true
+	}
+	if key := r.Header.Get("x-api-key"); key != "" &&
+		subtle.ConstantTimeCompare([]byte(key), []byte(s.authToken)) == 1 {
+		return true
+	}
+	bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return bearer != "" && subtle.ConstantTimeCompare([]byte(bearer), []byte(s.authToken)) == 1
+}
+
 // Handler returns the HTTP handler (mux) for the server.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/messages", s.handleMessages)
-	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
-	mux.HandleFunc("/v1/models", s.handleModels)
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(r) {
+			writeAnthropicUnauthorized(w)
+			return
+		}
+		s.handleMessages(w, r)
+	})
+	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(r) {
+			writeOAIError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid credentials")
+			return
+		}
+		s.handleChatCompletions(w, r)
+	})
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(r) {
+			writeOAIError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid credentials")
+			return
+		}
+		s.handleModels(w, r)
+	})
 	return mux
 }
 
@@ -547,6 +587,15 @@ func writeErrorStatus(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"`+msg+`"}}`)
+}
+
+// writeAnthropicUnauthorized emits a 401 in the Anthropic error shape.
+// writeError has no 401 mapping, and reusing its invalid_request kind would
+// report a credentials failure as a malformed request.
+func writeAnthropicUnauthorized(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = io.WriteString(w, `{"type":"error","error":{"type":"authentication_error","message":"missing or invalid credentials"}}`)
 }
 
 // flushWriter adapts http.ResponseWriter to SSEWriter, flushing after each

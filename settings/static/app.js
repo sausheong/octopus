@@ -6,6 +6,10 @@ const sections = {
   yaml: ["Advanced YAML", "Edit the complete configuration source."],
 };
 
+// Delivered in a meta tag rather than an inline script because the settings
+// Content-Security-Policy is script-src 'self'.
+const CSRF = document.querySelector('meta[name="octopus-csrf"]')?.content || "";
+
 let state = null;
 let activeSection = "general";
 let dirty = false;
@@ -342,7 +346,7 @@ async function save() {
   try {
     const response = await fetch(isYAML ? "/api/yaml" : "/api/structured", {
       method: "POST",
-      headers: {"Content-Type": "application/json", "X-Octopus-Settings": "1"},
+      headers: {"Content-Type": "application/json", "X-Octopus-Settings": "1", "X-Octopus-CSRF": CSRF},
       body: JSON.stringify(body),
     });
     const result = await response.json();

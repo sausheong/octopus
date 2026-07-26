@@ -2,10 +2,14 @@ package settings
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -36,6 +40,7 @@ type Server struct {
 	url        string
 	logo       []byte
 	insights   InsightsFunc
+	csrf       string
 }
 
 func NewServer(store *Store, reload ReloadFunc, status StatusFunc, insightFuncs ...InsightsFunc) *Server {
@@ -43,6 +48,16 @@ func NewServer(store *Store, reload ReloadFunc, status StatusFunc, insightFuncs 
 	if len(insightFuncs) > 0 {
 		server.insights = insightFuncs[0]
 	}
+	// Generated here rather than in Start because callers (and tests) may use
+	// Handler() without ever starting a listener; a token created in Start
+	// would be empty on those paths and every CSRF check would pass vacuously.
+	token := make([]byte, 32)
+	if _, err := rand.Read(token); err != nil {
+		// crypto/rand failing means the process cannot generate any secret.
+		// Refusing to serve is better than serving with a predictable token.
+		panic("settings: cannot generate CSRF token: " + err.Error())
+	}
+	server.csrf = hex.EncodeToString(token)
 	return server
 }
 
@@ -96,8 +111,9 @@ func (s *Server) Handler() http.Handler {
 			http.Error(w, "settings unavailable", http.StatusInternalServerError)
 			return
 		}
+		html := strings.Replace(string(data), "{{CSRF_TOKEN}}", s.csrf, 1)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(data)
+		_, _ = io.WriteString(w, html)
 	})
 	return securityHeaders(mux)
 }
@@ -164,8 +180,8 @@ func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleStructured(w http.ResponseWriter, r *http.Request) {
-	if !validWriteRequest(r) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "settings write rejected"})
+	if !s.validWriteRequest(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "settings write rejected; reopen Settings from the menu bar and try again"})
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -185,8 +201,8 @@ func (s *Server) handleStructured(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleYAML(w http.ResponseWriter, r *http.Request) {
-	if !validWriteRequest(r) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "settings write rejected"})
+	if !s.validWriteRequest(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "settings write rejected; reopen Settings from the menu bar and try again"})
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -245,11 +261,17 @@ func loopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func validWriteRequest(r *http.Request) bool {
+func (s *Server) validWriteRequest(r *http.Request) bool {
 	if !loopbackHost(r.Host) {
 		return false
 	}
 	if r.Header.Get("X-Octopus-Settings") != "1" || !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		return false
+	}
+	// Constant-time: a timing oracle on a 32-byte token is not a realistic
+	// attack here, but the comparison is free and the habit is worth keeping.
+	got := r.Header.Get("X-Octopus-CSRF")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(s.csrf)) != 1 {
 		return false
 	}
 	origin := r.Header.Get("Origin")

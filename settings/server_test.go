@@ -27,6 +27,7 @@ func TestSettingsHandlerCreatesConfigFromStructuredForm(t *testing.T) {
 	req.Host = "127.0.0.1:8787"
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Octopus-Settings", "1")
+	req.Header.Set("X-Octopus-CSRF", server.csrf)
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !reloaded {
@@ -56,6 +57,7 @@ func TestSettingsStructuredSavePreservesAttemptsAndOutputCap(t *testing.T) {
 	req.Host = "127.0.0.1:8787"
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Octopus-Settings", "1")
+	req.Header.Set("X-Octopus-CSRF", server.csrf)
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -116,6 +118,7 @@ func TestSettingsHandlerRejectsCrossOriginWrite(t *testing.T) {
 	req.Host = "127.0.0.1:8787"
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Octopus-Settings", "1")
+	req.Header.Set("X-Octopus-CSRF", server.csrf)
 	req.Header.Set("Origin", "https://attacker.example")
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
@@ -229,5 +232,74 @@ func TestStateReadIsNotHostGated(t *testing.T) {
 	server.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+}
+
+// writeReq builds a settings write that passes every check except the one a
+// test is targeting, so each test varies exactly one thing.
+func writeReq(t *testing.T, server *Server, path, body string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Host = "127.0.0.1:8787"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Octopus-Settings", "1")
+	req.Header.Set("X-Octopus-CSRF", server.csrf)
+	return req
+}
+
+const validYAMLBody = `{"yaml":"server:\n  addr: \"127.0.0.1:8787\"\nweights:\n  quality: 1\nproviders:\n  p:\n    kind: anthropic\n    api_key_env: K\ncatalog:\n  - id: p/m\n    quality: 0.5\n    speed: 0.5\n    caps: { max_context: 1000 }\n"}`
+
+func TestWriteRequiresCSRFToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".octopus", "config.yaml")
+	server := NewServer(NewStore(path), nil, nil)
+
+	if server.csrf == "" {
+		t.Fatal("NewServer must generate a CSRF token; an empty token makes every check vacuous")
+	}
+
+	for _, c := range []struct {
+		name  string
+		token string
+		want  int
+	}{
+		{"correct token", server.csrf, http.StatusOK},
+		{"missing token", "", http.StatusForbidden},
+		{"wrong token", "0000000000000000000000000000000000000000000000000000000000000000", http.StatusForbidden},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			req := writeReq(t, server, "/api/yaml", validYAMLBody)
+			req.Header.Set("X-Octopus-CSRF", c.token)
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, req)
+			if rec.Code != c.want {
+				t.Errorf("status = %d, want %d (body %s)", rec.Code, c.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestServedHTMLCarriesToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".octopus", "config.yaml")
+	server := NewServer(NewStore(path), nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "127.0.0.1:8787"
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, server.csrf) {
+		t.Error("served HTML does not contain the CSRF token; the UI cannot save")
+	}
+	if strings.Contains(body, "{{CSRF_TOKEN}}") {
+		t.Error("placeholder was not substituted")
+	}
+}
+
+// Two servers must not share a token, or a token leaked from one process
+// would authorise writes to another.
+func TestTokensArePerProcess(t *testing.T) {
+	a := NewServer(NewStore(filepath.Join(t.TempDir(), "a.yaml")), nil, nil)
+	b := NewServer(NewStore(filepath.Join(t.TempDir(), "b.yaml")), nil, nil)
+	if a.csrf == b.csrf {
+		t.Fatal("two servers generated the same CSRF token")
 	}
 }

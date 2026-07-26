@@ -4,8 +4,14 @@ on:
   push:
   pull_request:
 
+# This job only reads the checkout. Narrowing the token means a compromised
+# action in the dependency chain cannot push, tag, or open issues.
+permissions:
+  contents: read
+
 jobs:
   build:
+    timeout-minutes: 15
     # Linux only, by design. cmd/octopus/main_darwin.go and menubar/ are cgo
     # plus Objective-C; a Linux runner compiles the !darwin path, which still
     # covers every test-bearing package. `make app` exercises the macOS path
@@ -35,6 +41,11 @@ jobs:
         run: go test -race ./...
       - name: Gofmt
         run: |
+          # set -e explicitly rather than relying on the runner's default
+          # shell: gofmt writes parse errors to stderr and exits 2, leaving
+          # $unformatted empty, so without -e an unparseable file would pass
+          # this gate silently.
+          set -euo pipefail
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
             echo "These files are not gofmt-clean:"

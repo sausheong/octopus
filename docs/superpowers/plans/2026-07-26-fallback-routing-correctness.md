@@ -1047,15 +1047,65 @@ git commit -m "fix: stop user identifiers collapsing separate conversations"
 
 ---
 
-### Task 7: Documentation
+### Task 7: Documentation and Settings UI field
 
 **Files:**
 - Modify: `config.example.yaml`
 - Modify: `README.md`
+- Modify: `settings/static/index.html`
+- Modify: `settings/static/app.js`
+- Test: `settings/server_test.go`
 
 **Interfaces:**
 - Consumes: `routing.max_attempts` (Task 2), `caps.max_output_tokens` (Task 5), the behavior changes from Tasks 3 and 6.
 - Produces: nothing consumed by code.
+
+**Why the UI change belongs here.** Task 2 fixed the Go round-trip, but
+`settings/static/app.js:322` builds the structured-save payload by hand and
+omits `max_attempts`. `settings/server.go` uses `DisallowUnknownFields()`, so
+the key could not be sent before Task 2 added the field — and now that it
+exists, the form still drops it: saving from the structured form writes 0,
+which `Validate` defaults back to 3. A user who sets `max_attempts: 7` in the
+YAML editor loses it on the next form save. This is the same silent-zeroing
+class the Task 2 round-trip test guards, one layer up.
+
+- [ ] **Step 0: Add the Settings UI field**
+
+In `settings/static/index.html`, immediately after the `session-ttl` row
+(around line 188), mirroring that row's markup exactly:
+
+```html
+              <label class="setting-row compact" for="max-attempts">
+                <span><strong>Max attempts</strong><small>Backends to try per request before giving up</small></span>
+                <input id="max-attempts" type="number" min="1" required autocomplete="off" placeholder="3">
+              </label>
+```
+
+In `settings/static/app.js`, next to the existing `setValue("#session-ttl", ...)`
+call (around line 54):
+
+```js
+  setValue("#max-attempts", doc.routing.max_attempts);
+```
+
+And in the structured-save payload at line 322, add the field to the `routing`
+object. `Number()` is required because the Go field is an `int` and a string
+would fail JSON decoding:
+
+```js
+    routing: {session_sticky: $("#session-sticky").checked, session_ttl: $("#session-ttl").value.trim(), cache_aware: $("#cache-aware").checked, max_attempts: Number($("#max-attempts").value.trim() || 3)},
+```
+
+Then add a Go-side regression test to `settings/server_test.go` that POSTs a
+structured payload containing `max_attempts` and asserts the saved config
+retains it. Follow the existing structured-form test in that file for the
+request shape (it needs the `X-Octopus-Settings: 1` header and
+`Content-Type: application/json`). Assert on a NON-default value such as 7, so
+the test fails if the field is dropped and defaulted back to 3.
+
+Verify by mutation: remove `max_attempts` from the app.js payload and confirm
+your new Go test still passes (it exercises the server, not the browser), then
+confirm the value is lost by reading the written YAML. Report both.
 
 - [ ] **Step 1: Update `config.example.yaml`**
 
@@ -1133,14 +1183,17 @@ GOWORK=off go test ./config/ -run TestExampleConfigParses -v
 rm config/zz_example_test.go
 ```
 
-Expected: PASS. This catches a `KnownFields(true)` rejection of a mistyped new key. Remove the temporary file before committing — `git status` must show only `config.example.yaml` and `README.md`.
+Expected: PASS. This catches a `KnownFields(true)` rejection of a mistyped new
+key. Remove the temporary file before committing — `git status` must show only
+`config.example.yaml`, `README.md`, `settings/static/index.html`,
+`settings/static/app.js`, and `settings/server_test.go`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git status --porcelain
-git add config.example.yaml README.md
-git commit -m "docs: document max_attempts, max_output_tokens, and fallback changes"
+git add config.example.yaml README.md settings/static/index.html settings/static/app.js settings/server_test.go
+git commit -m "docs: document max_attempts and max_output_tokens; expose max_attempts in Settings"
 ```
 
 ---

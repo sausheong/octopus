@@ -27,6 +27,12 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./...
+      # Kept separate from the plain run so a data race is distinguishable from
+      # a logic failure at a glance. Octopus is a concurrent proxy with shared
+      # session-affinity state, which is the shape the race detector earns its
+      # runtime on.
+      - name: Test (race)
+        run: go test -race ./...
       - name: Gofmt
         run: |
           unformatted=$(gofmt -l .)

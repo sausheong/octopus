@@ -265,9 +265,11 @@ function addProvider(provider = {}, markDirty = true) {
     name: provider.name || "",
     kind: provider.kind || provider.name || "anthropic",
     api_key_env: provider.api_key_env || "",
-    // The server sends a sentinel, never the stored key. Round-tripping it
-    // unchanged tells the server to keep that key; typing over it sets a new
-    // one and emptying the field clears it.
+    // The server sends an opaque placeholder, never the stored key. Round-trip
+    // it byte for byte and the server keeps the key belonging to this row —
+    // including when the name field beside it has been edited, because the
+    // placeholder identifies the row rather than the name. Typing over it sets
+    // a new key; emptying the field clears it.
     api_key: provider.api_key || "",
     base_url: provider.base_url || "",
   };

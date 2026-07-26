@@ -229,14 +229,22 @@ func (s *Server) handleStructured(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid settings document: " + err.Error()})
 		return
 	}
-	// The form was served a sentinel in place of each inline key, so restore
+	// The form was served a placeholder in place of each inline key, so restore
 	// the stored values before writing. Skipping this would blank on save every
-	// credential the user had inlined. The load error is ignored: an
-	// unparseable file has no keys to carry forward, and refusing the save
-	// would trap the user with no way to repair it from the form.
+	// credential the user had inlined. The load error is ignored: a file that
+	// does not parse yields the default document, which carries no key and so
+	// was never rendered with a placeholder — a save that nonetheless sends one
+	// came from a stale page, and the mismatch is reported below.
 	if usesRedactedKey(doc) {
 		stored, _, _, _ := s.store.Load()
-		doc = resolveRedactedKeys(doc, stored)
+		resolved, err := resolveRedactedKeys(doc, stored)
+		if err != nil {
+			// Refusing is the whole point: the alternative is writing an empty
+			// key over a live credential and reporting success.
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		doc = resolved
 	}
 	raw, err := s.store.SaveDocument(doc)
 	if err != nil {

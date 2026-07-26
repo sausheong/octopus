@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sausheong/octopus/config"
 )
 
 const inlineKeySecret = "sk-ant-SUPERSECRET"
@@ -350,14 +352,93 @@ func TestAPIKeyEnvIsNotTreatedAsAnInlineKey(t *testing.T) {
 	}
 }
 
-// A provider named in a save whose key is the sentinel but which has no stored
-// counterpart resolves to empty rather than to another provider's secret.
-func TestRedactedKeyForUnknownProviderResolvesEmpty(t *testing.T) {
+// inlineKeyOnlyParsingFinds holds configurations whose inline key the textual
+// scan cannot see, because rawHasInlineKey is line-oriented and neither of
+// these puts api_key at the start of a line. They are the whole reason
+// documentHasInlineKey exists as a second, independent check — for these
+// inputs, it is the only thing standing between the key and the attacker.
+var inlineKeyOnlyParsingFinds = map[string]string{
+	// A flow mapping keeps the whole provider on one line.
+	"flow mapping": "server:\n  addr: \"127.0.0.1:8787\"\nweights:\n  quality: 1\n" +
+		"providers:\n  p: { kind: anthropic, api_key: " + inlineKeySecret + " }\n" +
+		"catalog:\n  - id: \"p/m\"\n    quality: 0.5\n    speed: 0.5\n    caps: { max_context: 1000 }\n",
+	// JSON is valid YAML, so a whole file may arrive in this shape.
+	"json-style whole file": `{"server": {"addr": "127.0.0.1:8787"}, "weights": {"quality": 1}, ` +
+		`"providers": {"p": {"kind": "anthropic", "api_key": "` + inlineKeySecret + `"}}, ` +
+		`"catalog": [{"id": "p/m", "quality": 0.5, "speed": 0.5, "caps": {"max_context": 1000}}]}`,
+}
+
+// The two detection checks are complementary, and the parsed one carries these
+// inputs alone. Without this test documentHasInlineKey is entirely unpinned:
+// replacing its body with `return false` left the whole settings suite green,
+// so a refactor could delete it and silently reopen the disclosure.
+func TestParsedCheckCatchesKeysTheRawScanMisses(t *testing.T) {
+	for name, seed := range inlineKeyOnlyParsingFinds {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			doc, raw, _, err := NewStore(path).Load()
+			if err != nil {
+				t.Fatalf("fixture must parse for the parsed check to see it: %v", err)
+			}
+
+			// Guard the guard twice over. If the fixture ever stops carrying a
+			// key, or the raw scan grows to catch these shapes, this test would
+			// keep passing while proving nothing about documentHasInlineKey.
+			if got := storedKey(t, path, "p"); got != inlineKeySecret {
+				t.Fatalf("fixture stored key = %q, want the inline secret", got)
+			}
+			if rawHasInlineKey(raw) {
+				t.Fatal("rawHasInlineKey now catches this shape, so the fixture no longer isolates " +
+					"the parsed check and the end-to-end assertions below would pass with " +
+					"documentHasInlineKey deleted. Replace it with a config only the parser sees.")
+			}
+
+			if !documentHasInlineKey(doc) {
+				t.Fatal("documentHasInlineKey missed a key the raw scan cannot see; /api/state would serve the file with the key in it")
+			}
+
+			// End to end, because the checks only matter through the response.
+			server := NewServer(NewStore(path), nil, nil)
+			state, body := getState(t, server)
+			if strings.Contains(body, inlineKeySecret) {
+				t.Error("GET /api/state disclosed the inline API key")
+			}
+			if !state.YAMLWithheld {
+				t.Error("yaml_withheld is false for a config holding an inline key")
+			}
+		})
+	}
+}
+
+// A placeholder that matches no stored provider must fail the save rather than
+// resolve to empty. Resolving to empty is how the first version of this code
+// destroyed a key on rename: it reported success while writing nothing over a
+// live credential. It must equally never fall through to some other provider's
+// secret.
+func TestRedactedKeyForUnknownProviderIsRejected(t *testing.T) {
 	stored := Document{Providers: []ProviderDocument{{Name: "p", APIKey: inlineKeySecret}}}
-	incoming := Document{Providers: []ProviderDocument{{Name: "renamed", APIKey: redactedAPIKey}}}
-	got := resolveRedactedKeys(incoming, stored)
-	if got.Providers[0].APIKey != "" {
-		t.Errorf("key = %q for an unknown provider, want empty", got.Providers[0].APIKey)
+	for name, incoming := range map[string]Document{
+		"placeholder for a provider that is not stored": {
+			Providers: []ProviderDocument{{Name: "renamed", APIKey: redactedKeyFor("gone")}},
+		},
+		// The bare constant names nothing, so it cannot identify a row either.
+		// A config file could contain this literal text as its api_key.
+		"placeholder carrying no provider name": {
+			Providers: []ProviderDocument{{Name: "p", APIKey: redactedAPIKey}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := resolveRedactedKeys(incoming, stored)
+			if err == nil {
+				t.Fatalf("resolve succeeded with key %q, want an error", got.Providers[0].APIKey)
+			}
+			if strings.Contains(err.Error(), inlineKeySecret) {
+				t.Errorf("the error message discloses the stored key: %v", err)
+			}
+		})
 	}
 }
 
@@ -372,7 +453,7 @@ func TestRedactDocumentDoesNotMutateCaller(t *testing.T) {
 	if doc.Providers[0].APIKey != inlineKeySecret {
 		t.Errorf("caller's document was mutated to %q; a save would persist the placeholder", doc.Providers[0].APIKey)
 	}
-	if redacted.Providers[0].APIKey != redactedAPIKey {
+	if redacted.Providers[0].APIKey != redactedKeyFor("p") {
 		t.Errorf("returned document was not redacted: %q", redacted.Providers[0].APIKey)
 	}
 }
@@ -381,9 +462,11 @@ func TestRedactDocumentDoesNotMutateCaller(t *testing.T) {
 // slice, or a Document already queued for a response would gain the key.
 func TestResolveRedactedKeysDoesNotMutateCaller(t *testing.T) {
 	stored := Document{Providers: []ProviderDocument{{Name: "p", APIKey: inlineKeySecret}}}
-	incoming := Document{Providers: []ProviderDocument{{Name: "p", APIKey: redactedAPIKey}}}
-	resolveRedactedKeys(incoming, stored)
-	if incoming.Providers[0].APIKey != redactedAPIKey {
+	incoming := Document{Providers: []ProviderDocument{{Name: "p", APIKey: redactedKeyFor("p")}}}
+	if _, err := resolveRedactedKeys(incoming, stored); err != nil {
+		t.Fatal(err)
+	}
+	if incoming.Providers[0].APIKey != redactedKeyFor("p") {
 		t.Errorf("caller's document was mutated to %q", incoming.Providers[0].APIKey)
 	}
 }
@@ -449,31 +532,36 @@ func TestYAMLSaveStoresInlineKeyVerbatim(t *testing.T) {
 	}
 }
 
-// A save must not be able to smuggle the sentinel into the file as a real key,
-// or the next load would treat that literal string as a credential.
+// A save must not be able to smuggle a placeholder into the file as a real key,
+// or the next load would treat that literal string as a credential. Both forms
+// are checked: the bare constant and one carrying a provider name.
 func TestYAMLSaveOfSentinelIsNotResolved(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	store := NewStore(path)
-	// The document channel is the one that interprets the sentinel; a YAML save
-	// bypasses it entirely, so the literal text is written as-is.
-	seed := "server:\n  addr: \"127.0.0.1:8787\"\nweights:\n  quality: 1\n" +
-		"providers:\n  p:\n    kind: anthropic\n    api_key: \"" + redactedAPIKey + "\"\n" +
-		"catalog:\n  - id: \"p/m\"\n    quality: 0.5\n    speed: 0.5\n    caps: { max_context: 1000 }\n"
-	if _, err := store.SaveYAML([]byte(seed)); err != nil {
-		t.Fatal(err)
-	}
-	// documentHasInlineKey must not count the sentinel as a real key, but
-	// rawHasInlineKey scans text and will — so the tab is withheld, which is
-	// the fail-safe direction.
-	doc, raw, _, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if documentHasInlineKey(doc) {
-		t.Error("the sentinel was counted as a real inline key")
-	}
-	if !rawHasInlineKey(raw) {
-		t.Error("the raw scan should withhold conservatively when it sees any api_key value")
+	for _, literal := range []string{redactedAPIKey, redactedKeyFor("p")} {
+		t.Run(literal, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			store := NewStore(path)
+			// The document channel is the one that interprets a placeholder; a
+			// YAML save bypasses it entirely, so the text is written as-is.
+			seed := "server:\n  addr: \"127.0.0.1:8787\"\nweights:\n  quality: 1\n" +
+				"providers:\n  p:\n    kind: anthropic\n    api_key: \"" + literal + "\"\n" +
+				"catalog:\n  - id: \"p/m\"\n    quality: 0.5\n    speed: 0.5\n    caps: { max_context: 1000 }\n"
+			if _, err := store.SaveYAML([]byte(seed)); err != nil {
+				t.Fatal(err)
+			}
+			// documentHasInlineKey must not count a placeholder as a real key,
+			// but rawHasInlineKey scans text and will — so the tab is withheld,
+			// which is the fail-safe direction.
+			doc, raw, _, err := store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if documentHasInlineKey(doc) {
+				t.Error("the placeholder was counted as a real inline key")
+			}
+			if !rawHasInlineKey(raw) {
+				t.Error("the raw scan should withhold conservatively when it sees any api_key value")
+			}
+		})
 	}
 }
 
@@ -585,7 +673,300 @@ func TestSentinelSurvivesJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(encoded, &back); err != nil {
 		t.Fatal(err)
 	}
-	if back.Providers[0].APIKey != redactedAPIKey {
-		t.Errorf("sentinel = %q after a JSON round trip", back.Providers[0].APIKey)
+	if back.Providers[0].APIKey != redactedKeyFor("p") {
+		t.Errorf("placeholder = %q after a JSON round trip", back.Providers[0].APIKey)
+	}
+}
+
+// seedTwoProviderConfig writes a config with two providers, each carrying a
+// distinct inline key and its own base_url, and returns its path. The base_urls
+// matter: they are what makes a mis-paired key observable, and without one a
+// provider that loses its key fails config.Validate instead of saving quietly.
+func seedTwoProviderConfig(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	seed := "server:\n  addr: \"127.0.0.1:8787\"\nweights:\n  quality: 1\nproviders:\n" +
+		"  alpha:\n    kind: anthropic\n    api_key: \"KEY-ALPHA\"\n    base_url: \"https://alpha.invalid\"\n" +
+		"  beta:\n    kind: openai\n    api_key: \"KEY-BETA\"\n    base_url: \"https://beta.invalid\"\n" +
+		"catalog:\n  - id: \"alpha/m\"\n    quality: 0.5\n    speed: 0.5\n    caps: { max_context: 1000 }\n" +
+		"  - id: \"beta/m\"\n    quality: 0.5\n    speed: 0.5\n    caps: { max_context: 1000 }\n"
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// storedProvider reads one provider straight off disk, bypassing every response
+// path, so an assertion about what was persisted cannot be satisfied by the
+// redaction logic under test.
+func storedProvider(t *testing.T, path, name string) ProviderDocument {
+	t.Helper()
+	doc, _, _, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatalf("load stored config: %v", err)
+	}
+	for _, p := range doc.Providers {
+		if p.Name == name {
+			return p
+		}
+	}
+	t.Fatalf("provider %q is not in the stored config", name)
+	return ProviderDocument{}
+}
+
+// Renaming a provider must not destroy its key. The placeholder means "the key
+// for the row this field was rendered next to", and the name on that row is
+// user-editable in the same form — so resolving by the submitted name, as the
+// first version of this code did, looks up a name nothing is stored under and
+// writes an empty key over a live credential while returning 200.
+func TestRenamingProviderDoesNotSilentlyDestroyItsKey(t *testing.T) {
+	path := seedTwoProviderConfig(t)
+	server := NewServer(NewStore(path), func(_ context.Context) error { return nil }, nil)
+
+	state, _ := getState(t, server)
+	doc := state.Document
+	// Exactly what the browser posts after a rename: the name field edited, the
+	// key field left holding whatever the server put in it.
+	renamed := false
+	for i := range doc.Providers {
+		if doc.Providers[i].Name == "alpha" {
+			doc.Providers[i].Name = "renamed"
+			renamed = true
+		}
+	}
+	if !renamed {
+		t.Fatal("fixture has no provider named alpha")
+	}
+	for i := range doc.Catalog {
+		if doc.Catalog[i].ID == "alpha/m" {
+			doc.Catalog[i].ID = "renamed/m"
+		}
+	}
+
+	rec, _ := postDocument(t, server, doc)
+	// The placeholder identifies the row, so the rename carries the key across
+	// rather than needing the user to retype it. Pinned strictly: accepting a
+	// refusal here as well would let a change that breaks renaming outright
+	// pass this test, and renaming has to keep working.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rename status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := storedProvider(t, path, "renamed"); got.APIKey != "KEY-ALPHA" {
+		t.Errorf("renamed provider holds key %q, want KEY-ALPHA carried across the rename", got.APIKey)
+	}
+	if got := storedProvider(t, path, "beta"); got.APIKey != "KEY-BETA" {
+		t.Errorf("the untouched provider's key became %q", got.APIKey)
+	}
+	if strings.Contains(rec.Body.String(), "KEY-ALPHA") {
+		t.Error("the save response echoed the preserved key back to the page")
+	}
+}
+
+// Swapping two provider names pairs each placeholder with the other provider's
+// entry when resolution goes by submitted name. That does not merely lose a
+// key: it sends a live credential to a base_url the user never chose for it.
+func TestSwappingProviderNamesNeverMisdirectsAKey(t *testing.T) {
+	path := seedTwoProviderConfig(t)
+	server := NewServer(NewStore(path), func(_ context.Context) error { return nil }, nil)
+
+	state, _ := getState(t, server)
+	doc := state.Document
+	// Swap only the names. Every other field, base_url included, stays on the
+	// row it came from, which is what makes a mis-pairing observable.
+	for i := range doc.Providers {
+		switch doc.Providers[i].Name {
+		case "alpha":
+			doc.Providers[i].Name = "beta"
+		case "beta":
+			doc.Providers[i].Name = "alpha"
+		}
+	}
+
+	rec, _ := postDocument(t, server, doc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("swap status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Each key must still sit beside the base_url it was configured with. Under
+	// name-based resolution both rows resolve to the other provider's key, so
+	// the base_url pairing is what makes the misdirection visible.
+	for _, want := range []ProviderDocument{
+		{Name: "beta", APIKey: "KEY-ALPHA", BaseURL: "https://alpha.invalid"},
+		{Name: "alpha", APIKey: "KEY-BETA", BaseURL: "https://beta.invalid"},
+	} {
+		got := storedProvider(t, path, want.Name)
+		if got.APIKey != want.APIKey {
+			t.Errorf("provider %q holds key %q, want %q; the swap misdirected a credential",
+				want.Name, got.APIKey, want.APIKey)
+		}
+		if got.BaseURL != want.BaseURL {
+			t.Errorf("provider %q has base_url %q, want %q", want.Name, got.BaseURL, want.BaseURL)
+		}
+	}
+}
+
+// Deleting one provider and adding another in the same save must leave the
+// survivor's key alone. Resolution keys off the placeholder, so a row that
+// disappeared must not shift which stored key any other row resolves to.
+func TestDeletingAndAddingProvidersPreservesTheSurvivorsKey(t *testing.T) {
+	path := seedTwoProviderConfig(t)
+	server := NewServer(NewStore(path), func(_ context.Context) error { return nil }, nil)
+
+	state, _ := getState(t, server)
+	doc := state.Document
+	kept := make([]ProviderDocument, 0, len(doc.Providers))
+	for _, provider := range doc.Providers {
+		if provider.Name != "alpha" {
+			kept = append(kept, provider)
+		}
+	}
+	if len(kept) != len(doc.Providers)-1 {
+		t.Fatalf("fixture: expected to drop exactly one provider, kept %d of %d", len(kept), len(doc.Providers))
+	}
+	// A brand-new row carries a key the user just typed, never a placeholder.
+	doc.Providers = append(kept, ProviderDocument{
+		Name: "gamma", Kind: "openai", APIKey: "KEY-GAMMA", BaseURL: "https://gamma.invalid",
+	})
+	catalog := make([]CatalogDocument, 0, len(doc.Catalog))
+	for _, entry := range doc.Catalog {
+		if entry.ID != "alpha/m" {
+			catalog = append(catalog, entry)
+		}
+	}
+	doc.Catalog = append(catalog, CatalogDocument{
+		ID: "gamma/m", Quality: 0.5, Speed: 0.5, Caps: config.Caps{MaxContext: 1000},
+	})
+
+	rec, _ := postDocument(t, server, doc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := storedProvider(t, path, "beta"); got.APIKey != "KEY-BETA" {
+		t.Errorf("the surviving provider's key is %q, want KEY-BETA", got.APIKey)
+	}
+	if got := storedProvider(t, path, "gamma"); got.APIKey != "KEY-GAMMA" {
+		t.Errorf("the newly added provider's key is %q, want the value typed in", got.APIKey)
+	}
+	stored, _, _, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, provider := range stored.Providers {
+		if provider.Name == "alpha" {
+			t.Error("the deleted provider is still in the file")
+		}
+	}
+}
+
+// A provider with no base_url has the inline key as its only credential
+// source, so losing the key on rename used to fail config.Validate and surface
+// as a confusing 422 — safe, but only by accident. Now the key survives and the
+// rename simply succeeds, which is what the user asked for.
+func TestRenamingProviderWithoutBaseURLKeepsTheKey(t *testing.T) {
+	path := seedInlineKeyConfig(t)
+	server := NewServer(NewStore(path), func(_ context.Context) error { return nil }, nil)
+
+	state, _ := getState(t, server)
+	doc := state.Document
+	// Guard the guard: the point of this fixture is the absent base_url.
+	if doc.Providers[0].BaseURL != "" {
+		t.Fatalf("fixture provider has base_url %q; this test needs one without", doc.Providers[0].BaseURL)
+	}
+	doc.Providers[0].Name = "renamed"
+	doc.Catalog[0].ID = "renamed/m"
+
+	rec, _ := postDocument(t, server, doc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := storedKey(t, path, "renamed"); got != inlineKeySecret {
+		t.Errorf("stored key = %q after the rename, want it carried across", got)
+	}
+	if strings.Contains(rec.Body.String(), inlineKeySecret) {
+		t.Error("the response disclosed the inline API key")
+	}
+}
+
+// Renaming must remain possible. If the only way to rename were to lose the
+// credential, the fix for the rename bug would have broken the feature instead.
+func TestRenamingProviderSucceedsWhenTheKeyIsRetyped(t *testing.T) {
+	path := seedTwoProviderConfig(t)
+	server := NewServer(NewStore(path), func(_ context.Context) error { return nil }, nil)
+
+	state, _ := getState(t, server)
+	doc := state.Document
+	for i := range doc.Providers {
+		if doc.Providers[i].Name == "alpha" {
+			doc.Providers[i].Name = "renamed"
+			doc.Providers[i].APIKey = "KEY-RETYPED"
+		}
+	}
+	for i := range doc.Catalog {
+		if doc.Catalog[i].ID == "alpha/m" {
+			doc.Catalog[i].ID = "renamed/m"
+		}
+	}
+
+	rec, _ := postDocument(t, server, doc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s; renaming with a retyped key must work", rec.Code, rec.Body.String())
+	}
+	if got := storedProvider(t, path, "renamed"); got.APIKey != "KEY-RETYPED" {
+		t.Errorf("renamed provider holds key %q, want the retyped value", got.APIKey)
+	}
+	if got := storedProvider(t, path, "beta"); got.APIKey != "KEY-BETA" {
+		t.Errorf("the untouched provider's key became %q", got.APIKey)
+	}
+}
+
+// A refused save must say which field to fix and must not put the credential in
+// the message: the error is rendered into the page, which is the same surface
+// the disclosure fix exists to protect.
+func TestRejectedResolveExplainsWhatToDoWithoutLeakingTheKey(t *testing.T) {
+	path := seedInlineKeyConfig(t)
+	server := NewServer(NewStore(path), func(_ context.Context) error { return nil }, nil)
+
+	doc, _, _, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A placeholder for a provider that is not on disk: what a stale page sends
+	// after the file has been edited underneath it.
+	doc.Providers[0].APIKey = redactedKeyFor("vanished")
+
+	rec, _ := postDocument(t, server, doc)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for an unresolvable key", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, inlineKeySecret) {
+		t.Error("the rejection message disclosed the stored key")
+	}
+	for _, want := range []string{"p", "re-enter"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the rejection message does not mention %q, so the user cannot act on it: %s", want, body)
+		}
+	}
+	if got := storedKey(t, path, "p"); got != inlineKeySecret {
+		t.Errorf("a rejected save still modified the stored key: %q", got)
+	}
+}
+
+// The browser must round-trip the placeholder untouched. app.js reads the key
+// field back verbatim, so any normalisation there — trimming, or treating the
+// placeholder as a value to clear — would turn a preserved key into a lost one.
+func TestBrowserFormDoesNotAlterTheRedactedKeyField(t *testing.T) {
+	data, err := staticFiles.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	// Every other text field is trimmed; this one must not be, because the
+	// placeholder has to arrive back byte for byte to be recognised.
+	if !strings.Contains(source, `api_key: $('[data-field="api_key"]', item).value,`) {
+		t.Error("collectDocument() no longer submits the api_key field verbatim; a save would not preserve inlined keys")
+	}
+	if strings.Contains(source, `[data-field="api_key"]', item).value.trim()`) {
+		t.Error("collectDocument() trims the api_key field; a placeholder must round-trip byte for byte")
 	}
 }

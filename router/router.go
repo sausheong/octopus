@@ -163,8 +163,10 @@ const (
 	CacheWrite1HourInputMultiplier = 2.00
 )
 
-// SessionID returns an explicit client session ID, or a deterministic fallback
-// based on the stable conversation prefix used by prompt caching.
+// SessionID returns one of three shapes: an "explicit:" hash of a client
+// session ID, or a "derived:" hash of the stable conversation prefix used by
+// prompt caching — with a "user:"-tagged identifier, when present, folded into
+// that derived hash rather than treated as an explicit ID.
 func SessionID(chat llm.ChatRequest) string {
 	// A "user:" prefix marks a client-supplied user identifier rather than a
 	// conversation. It disambiguates two users who send the same opening

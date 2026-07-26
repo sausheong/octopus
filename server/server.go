@@ -88,15 +88,41 @@ func (s *Server) prepareAttempt(id string, chat llm.ChatRequest, dec router.Deci
 	return prov, attempt, nil
 }
 
+// attemptCap returns the per-request fallback bound, defaulting to 3 when a
+// Decision predates the config field (hand-built Decisions in tests).
+func attemptCap(dec router.Decision) int {
+	if dec.MaxAttempts > 0 {
+		return dec.MaxAttempts
+	}
+	return 3
+}
+
+// logAttemptFailure records a failed candidate. A client hang-up is not a
+// server fault, so it is logged at debug: warning per candidate would turn one
+// disconnect into a burst of alarming noise.
+func logAttemptFailure(msg, id string, err error) {
+	if err != nil && anthropicio.MapBackendError(err).Kind == anthropicio.KindCanceled {
+		slog.Debug("request cancelled during provider attempt", "model", id)
+		return
+	}
+	slog.Warn(msg, "model", id, "err", err)
+}
+
 // tryProvidersStream opens a streaming channel for the request, trying each
 // candidate in order. It peeks the first event: an EventError or a closed
 // channel (empty stream) both trigger fallback. Returns the pre-populated
 // channel, the winning model ID, and an error only if every candidate failed.
 func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, chat llm.ChatRequest) (<-chan llm.ChatEvent, string, error) {
 	var lastErr error
+	// attempts counts only real backend calls, so a bound cap is spent on
+	// things a different backend could plausibly fix.
+	attempts := 0
+	maxTries := attemptCap(dec)
 	for _, id := range candidates(dec) {
 		prov, attempt, err := s.prepareAttempt(id, chat, dec)
 		if err != nil {
+			// A misconfigured catalog entry never reached a backend, so it costs
+			// nothing and must not consume one of the bounded attempts.
 			lastErr = err
 			slog.Warn("provider resolve failed", "model", id, "err", err)
 			continue
@@ -105,7 +131,11 @@ func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, ch
 		ch, err := prov.ChatStream(ctx, attempt)
 		if err != nil {
 			lastErr = err
-			slog.Warn("provider stream open failed, trying fallback", "model", id, "err", err)
+			logAttemptFailure("provider stream open failed, trying fallback", id, err)
+			attempts++
+			if !anthropicio.Retryable(lastErr) || attempts >= maxTries {
+				break
+			}
 			continue
 		}
 
@@ -115,6 +145,10 @@ func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, ch
 		if !ok {
 			lastErr = errors.New("provider returned empty stream")
 			slog.Warn("provider returned empty stream, trying fallback", "model", id)
+			attempts++
+			if !anthropicio.Retryable(lastErr) || attempts >= maxTries {
+				break
+			}
 			continue
 		}
 		if first.Type == llm.EventError {
@@ -123,11 +157,15 @@ func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, ch
 				chErr = errors.New("provider stream error")
 			}
 			lastErr = chErr
-			slog.Warn("provider stream error on first event, trying fallback", "model", id, "err", chErr)
+			logAttemptFailure("provider stream error on first event, trying fallback", id, chErr)
 			go func() {
 				for range ch {
 				}
 			}()
+			attempts++
+			if !anthropicio.Retryable(lastErr) || attempts >= maxTries {
+				break
+			}
 			continue
 		}
 
@@ -160,9 +198,15 @@ func (s *Server) collectWithFallback(
 	collect func(model string, ch <-chan llm.ChatEvent) ([]byte, error),
 ) ([]byte, string, error) {
 	var lastErr error
+	// attempts counts only real backend calls, so a bound cap is spent on
+	// things a different backend could plausibly fix.
+	attempts := 0
+	maxTries := attemptCap(dec)
 	for _, id := range candidates(dec) {
 		prov, attempt, err := s.prepareAttempt(id, chat, dec)
 		if err != nil {
+			// A misconfigured catalog entry never reached a backend, so it costs
+			// nothing and must not consume one of the bounded attempts.
 			lastErr = err
 			slog.Warn("provider resolve failed", "model", id, "err", err)
 			continue
@@ -171,7 +215,11 @@ func (s *Server) collectWithFallback(
 		ch, err := prov.ChatStream(ctx, attempt)
 		if err != nil {
 			lastErr = err
-			slog.Warn("provider stream open failed, trying fallback", "model", id, "err", err)
+			logAttemptFailure("provider stream open failed, trying fallback", id, err)
+			attempts++
+			if !anthropicio.Retryable(lastErr) || attempts >= maxTries {
+				break
+			}
 			continue
 		}
 
@@ -181,14 +229,22 @@ func (s *Server) collectWithFallback(
 		peeked, peekErr := peekForContent(ch)
 		if peekErr != nil {
 			lastErr = peekErr
-			slog.Warn("provider returned empty or failed stream, trying fallback", "model", id, "err", peekErr)
+			logAttemptFailure("provider returned empty or failed stream, trying fallback", id, peekErr)
+			attempts++
+			if !anthropicio.Retryable(lastErr) || attempts >= maxTries {
+				break
+			}
 			continue
 		}
 
 		out, err := collect(id, s.observeEvents(chat, id, dec, peeked))
 		if err != nil {
 			lastErr = err
-			slog.Warn("provider collection failed, trying fallback", "model", id, "err", err)
+			logAttemptFailure("provider collection failed, trying fallback", id, err)
+			attempts++
+			if !anthropicio.Retryable(lastErr) || attempts >= maxTries {
+				break
+			}
 			continue
 		}
 
@@ -318,6 +374,11 @@ func oaiBackendError(w http.ResponseWriter, err error) {
 		status, errType = http.StatusServiceUnavailable, "overloaded_error"
 	case "invalid_request":
 		status, errType = http.StatusBadRequest, "invalid_request_error"
+	case anthropicio.KindCanceled:
+		// Both handlers return without writing anything for a hang-up, so this
+		// is unreachable from them. It exists so this mapping cannot drift from
+		// anthropicio.MapError (499) and hand a future caller a bogus 502.
+		status, errType = 499, "invalid_request_error"
 	default:
 		status, errType = http.StatusBadGateway, "api_error"
 	}
@@ -358,6 +419,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if dr.Stream {
 		ch, chosen, err := s.tryProvidersStream(ctx, dec, dr.Chat)
 		if err != nil {
+			if anthropicio.MapBackendError(err).Kind == anthropicio.KindCanceled {
+				// The client hung up; there is no one to receive a status or body.
+				slog.Debug("request cancelled by client", "requested_model", dr.RequestedModel)
+				return
+			}
 			writeError(w, anthropicio.MapBackendError(err))
 			return
 		}
@@ -376,6 +442,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			return anthropicio.CollectMessage(model, ch)
 		})
 		if err != nil {
+			if anthropicio.MapBackendError(err).Kind == anthropicio.KindCanceled {
+				// The client hung up; there is no one to receive a status or body.
+				slog.Debug("request cancelled by client", "requested_model", dr.RequestedModel)
+				return
+			}
 			writeError(w, anthropicio.MapBackendError(err))
 			return
 		}
@@ -426,6 +497,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if stream {
 		ch, chosen, err := s.tryProvidersStream(ctx, dec, chat)
 		if err != nil {
+			if anthropicio.MapBackendError(err).Kind == anthropicio.KindCanceled {
+				// The client hung up; there is no one to receive a status or body.
+				slog.Debug("request cancelled by client", "requested_model", requestedModel)
+				return
+			}
 			oaiBackendError(w, err)
 			return
 		}
@@ -445,6 +521,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return openaiio.CollectCompletion(model, ch)
 		})
 		if err != nil {
+			if anthropicio.MapBackendError(err).Kind == anthropicio.KindCanceled {
+				// The client hung up; there is no one to receive a status or body.
+				slog.Debug("request cancelled by client", "requested_model", requestedModel)
+				return
+			}
 			oaiBackendError(w, err)
 			return
 		}

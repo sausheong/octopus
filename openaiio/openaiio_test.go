@@ -434,3 +434,24 @@ func TestEncodeSSEPrematureClosureEmitsError(t *testing.T) {
 		t.Fatalf("premature closure was not surfaced as an error: %s", out)
 	}
 }
+
+func TestDecodeTagsUserAsNonExplicitSession(t *testing.T) {
+	chat, _, _, err := Decode([]byte(`{"model":"m","user":"bob",
+		"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if chat.SessionID != "user:bob" {
+		t.Errorf("SessionID = %q, want %q", chat.SessionID, "user:bob")
+	}
+}
+
+func TestDecodeLeavesSessionEmptyWithoutUser(t *testing.T) {
+	chat, _, _, err := Decode([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if chat.SessionID != "" {
+		t.Errorf("SessionID = %q, want empty", chat.SessionID)
+	}
+}

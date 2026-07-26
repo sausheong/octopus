@@ -26,7 +26,12 @@ func Decode(body []byte) (llm.ChatRequest, bool, string, error) {
 		return llm.ChatRequest{}, false, "", fmt.Errorf("temperature must be a finite number in [0,2]")
 	}
 
-	chat := llm.ChatRequest{Model: wr.Model, SessionID: wr.User}
+	chat := llm.ChatRequest{Model: wr.Model}
+	// Same reasoning as the Anthropic endpoint: "user" names a user, not a
+	// conversation.
+	if wr.User != "" {
+		chat.SessionID = "user:" + wr.User
+	}
 	if wr.MaxTokens != nil {
 		chat.MaxTokens = *wr.MaxTokens
 	}

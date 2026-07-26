@@ -124,7 +124,7 @@ func TestDecodePreservesPromptCacheControls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	if dr.Chat.SessionID != "claude-session-1" {
+	if dr.Chat.SessionID != "user:claude-session-1" {
 		t.Fatalf("SessionID = %q", dr.Chat.SessionID)
 	}
 	if dr.Chat.CacheControl == nil || dr.Chat.CacheControl.TTL != "1h" {
@@ -324,5 +324,27 @@ func TestNormalizeToolSchemaEmpty(t *testing.T) {
 	_ = json.Unmarshal(got, &m)
 	if string(m["type"]) != `"object"` {
 		t.Errorf("expected type object, got: %s", got)
+	}
+}
+
+func TestDecodeTagsUserIDAsNonExplicitSession(t *testing.T) {
+	dr, err := Decode([]byte(`{"model":"m","max_tokens":10,
+		"metadata":{"user_id":"alice"},
+		"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if dr.Chat.SessionID != "user:alice" {
+		t.Errorf("SessionID = %q, want %q", dr.Chat.SessionID, "user:alice")
+	}
+}
+
+func TestDecodeLeavesSessionEmptyWithoutUserID(t *testing.T) {
+	dr, err := Decode([]byte(`{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if dr.Chat.SessionID != "" {
+		t.Errorf("SessionID = %q, want empty", dr.Chat.SessionID)
 	}
 }

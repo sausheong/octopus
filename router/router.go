@@ -166,11 +166,23 @@ const (
 // SessionID returns an explicit client session ID, or a deterministic fallback
 // based on the stable conversation prefix used by prompt caching.
 func SessionID(chat llm.ChatRequest) string {
-	if chat.SessionID != "" {
+	// A "user:" prefix marks a client-supplied user identifier rather than a
+	// conversation. It disambiguates two users who send the same opening
+	// prompt, but must not pin all of one user's conversations together — so
+	// it feeds the derived hash instead of short-circuiting as an explicit ID.
+	// The prefix is a convention set by the decoders, not a guarantee: a client
+	// that sends a literal "user:..." X-Octopus-Session-ID header gets derived
+	// behaviour. That is an accepted trade-off over escaping every value.
+	userTag := ""
+	if strings.HasPrefix(chat.SessionID, "user:") {
+		userTag = chat.SessionID
+	} else if chat.SessionID != "" {
 		sum := sha256.Sum256([]byte(chat.SessionID))
 		return "explicit:" + hex.EncodeToString(sum[:])
 	}
 	h := sha256.New()
+	h.Write([]byte(userTag))
+	h.Write([]byte{0})
 	h.Write([]byte(chat.SystemPrompt))
 	for _, part := range chat.SystemPromptParts {
 		h.Write([]byte(part.Text))

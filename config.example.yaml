@@ -24,6 +24,10 @@ routing:
   session_sticky: true
   session_ttl: "1h"
   cache_aware: true
+  # Maximum backends one request may try before giving up. Only retryable
+  # failures (rate limits, overloads, transport errors) consume an attempt;
+  # a malformed request stops immediately. Defaults to 3 when omitted.
+  max_attempts: 3
 
 # Backend credentials: api_key_env names the env var holding the key.
 providers:
@@ -61,7 +65,8 @@ catalog:
     cost_per_mtok_in: 15.0
     cost_per_mtok_out: 75.0
     speed: 0.4
-    caps: { tools: true, vision: true, reasoning: true, max_context: 1000000 }
+    # max_output_tokens is optional; omit it (or use 0) for no output limit.
+    caps: { tools: true, vision: true, reasoning: true, max_context: 1000000, max_output_tokens: 32000 }
   - id: "anthropic/claude-haiku-3-5-20241022"
     quality: 0.70
     cost_per_mtok_in: 1.0

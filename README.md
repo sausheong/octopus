@@ -223,9 +223,9 @@ The app always reads and writes `~/.octopus/config.yaml`. If the file does not e
 
 Settings has five sections:
 
-- **General** controls the router address, classifier, scoring weights, and session/cache behavior.
+- **General** controls the router address, classifier, scoring weights, session/cache behavior, and the fallback attempt limit.
 - **Providers** configures provider kinds, endpoints, environment-variable names, and optional inline credentials. Inline credentials are stored locally in the YAML file; prefer environment variables when practical.
-- **Models** edits the routing catalog, pricing, capabilities, and context limits.
+- **Models** edits the routing catalog, pricing, capabilities, and context and output limits.
 - **Advanced YAML** edits the complete configuration directly.
 - **Insights** shows request volume, token usage, estimated spend, savings over time, cache efficiency, and model usage.
 
@@ -398,10 +398,10 @@ After a successful response, Octopus records the reported ratio of cached to unc
 
 Sticky routing records the successful model for a conversation and selects it again while it remains eligible. Session identity is resolved in this order:
 
-1. `X-Octopus-Session-ID` HTTP header.
-2. Legacy `X-LLMRouter-Session-ID` header.
-3. Anthropic `metadata.user_id` or OpenAI `user` request field.
-4. A deterministic SHA-256 identifier derived from the system prompt, tools, and first genuine user turn.
+1. `X-Octopus-Session-ID` HTTP header, or the legacy `X-LLMRouter-Session-ID` header. Either is the explicit session key: it alone determines the session.
+2. A deterministic SHA-256 identifier derived from the system prompt, tools, and first genuine user turn.
+
+Anthropic `metadata.user_id` and the OpenAI `user` field are not explicit keys. They contribute to the derived hash instead, so two users sending the same opening prompt stay separated, while one user's distinct conversations are not merged onto a single model and a false prompt-cache prediction.
 
 Explicit identifiers are hashed before being stored. The in-memory session table is concurrency-safe, expires entries, and has a hard size bound. Session state is process-local and is reset when Octopus restarts.
 
@@ -435,7 +435,7 @@ Apply valid session affinity
         ▼
 Normalize tools and call provider
         │
-        ├── failure before response → next eligible model
+        ├── retryable failure before response → next eligible model
         ▼
 Encode response and observe usage/cache state
 ```
@@ -467,6 +467,7 @@ Models are first filtered by hard requirements:
 - Vision support when images are present.
 - Tool support when tools are declared.
 - Enough context for estimated input plus output.
+- An output limit, when `caps.max_output_tokens` declares one, at least as large as the estimated response.
 
 For high-difficulty tasks, models below the `0.85` quality floor are removed when at least one otherwise-eligible model clears the floor. This floor never empties the eligible set by itself.
 
@@ -489,12 +490,14 @@ When a task benefits from reasoning, the router recommends medium reasoning effo
 
 Eligible models are attempted in score order, starting with the chosen model.
 
-- Failure while opening a stream triggers the next model.
-- A closed stream or `EventError` before the first meaningful event triggers fallback.
-- Buffered responses may fall back after a later collection failure because no client bytes have been written yet.
+- Only retryable failures — rate limits, overloads, and transport errors — advance to the next model. Failure while opening a stream, a closed stream, or an `EventError` before the first meaningful event all qualify. Buffered responses may also fall back after a later collection failure, because no client bytes have been written yet.
+- A malformed request (HTTP `400`) stops immediately and the backend's own error is returned, rather than being retried across the catalog and masked as a `502`.
+- A cancelled request stops immediately; no further backends are tried, and no status or body is written because the client is gone.
+- `routing.max_attempts` (default `3`) bounds the total number of backends tried.
+- A catalog entry naming an unconfigured provider is skipped without consuming an attempt.
 - Once streaming response bytes have been sent, Octopus cannot transparently switch providers.
 
-If every eligible backend fails, Octopus maps rate-limit, overload, invalid-request, and generic backend failures into the appropriate endpoint-specific error shape.
+If every attempted backend fails, Octopus maps rate-limit, overload, invalid-request, and generic backend failures into the appropriate endpoint-specific error shape.
 
 If no catalog entry can satisfy the request, the Anthropic endpoint returns an invalid-request error and the OpenAI endpoint returns HTTP `422`.
 
@@ -595,6 +598,7 @@ The section is optional; these defaults are applied when it is omitted.
 | `session_sticky` | `true` | Keep a conversation on its last successful eligible model. |
 | `session_ttl` | `1h` | Lifetime of model affinity. Must not be negative. |
 | `cache_aware` | `true` | Include expected cache writes/reads in cost scoring. |
+| `max_attempts` | `3` | Maximum backends one request may try. Only retryable failures — rate limits, overloads, and transport errors — consume an attempt. Must not be negative; `0` is treated as omitted. |
 
 ### `providers`
 
@@ -655,6 +659,9 @@ Every entry requires a unique `provider/model` ID. The provider prefix must exis
 | `caps.vision` | Boolean | Image-input support. |
 | `caps.reasoning` | Boolean | Native extended reasoning support. |
 | `caps.max_context` | Positive integer | Maximum combined context capacity. |
+| `caps.max_output_tokens` | Optional, `>= 0` | Maximum response tokens the model accepts. Omitted or `0` means unconstrained. |
+
+`caps.max_output_tokens` is a hard eligibility filter alongside `caps.max_context`: a model whose declared output limit is below the estimated response size is removed before scoring, rather than being discovered at the backend. The estimate is floored at the client's requested `max_tokens` (or `1024` when unset), so a client that habitually requests a generous `max_tokens` it never fills can exclude models that would in practice have coped.
 
 Catalog prices and capabilities are operator-maintained. Keep them synchronized with provider documentation; Octopus does not fetch pricing or model metadata automatically.
 

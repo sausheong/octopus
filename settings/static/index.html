@@ -186,6 +186,10 @@
                 <span><strong>Session lifetime</strong><small>Go duration, such as 30m or 1h</small></span>
                 <input id="session-ttl" required autocomplete="off" placeholder="1h">
               </label>
+              <label class="setting-row compact" for="max-attempts">
+                <span><strong>Max attempts</strong><small>Backends to try per request before giving up</small></span>
+                <input id="max-attempts" type="number" min="1" required autocomplete="off" placeholder="3">
+              </label>
               <label class="setting-row" for="cache-aware">
                 <span><strong>Cache-aware scoring</strong><small>Price expected prompt cache reads and writes</small></span>
                 <input class="switch" id="cache-aware" type="checkbox">
@@ -299,6 +303,7 @@
         <label><input data-field="vision" type="checkbox"> Vision</label>
         <label><input data-field="reasoning" type="checkbox"> Reasoning</label>
         <label class="context-field"><span>Context</span><input data-field="max_context" type="number" min="1" step="1" required></label>
+        <label class="context-field"><span>Max output</span><input data-field="max_output_tokens" type="number" min="0" step="1" autocomplete="off" placeholder="No limit"></label>
       </div>
     </fieldset>
   </template>

@@ -59,6 +59,10 @@ func main() {
 	srv := server.New(rt, reg, cfg.Catalog)
 	// Opt-in: an unconfigured or unset variable yields "", which leaves the
 	// endpoints open exactly as they were before this option existed.
+	if cfg.AuthTokenMisconfigured() {
+		slog.Warn("auth token variable is empty; routing endpoints are UNAUTHENTICATED",
+			"auth_token_env", cfg.AuthTokenEnv)
+	}
 	srv.SetAuthToken(cfg.AuthToken())
 
 	httpSrv := &http.Server{

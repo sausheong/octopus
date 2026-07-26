@@ -97,6 +97,13 @@ func (m *RouterManager) Reload(ctx context.Context) error {
 	srv := server.New(rt, reg, resolved.Catalog, m.insights.Record)
 	// Opt-in: an unconfigured or unset variable yields "", which leaves the
 	// endpoints open exactly as they were before this option existed.
+	if resolved.AuthTokenMisconfigured() {
+		// Especially likely here: a menu bar app launched from Finder never
+		// sources the user's shell profile, so a token exported in .zshrc is
+		// invisible to it.
+		slog.Warn("auth token variable is empty; routing endpoints are UNAUTHENTICATED",
+			"auth_token_env", resolved.AuthTokenEnv)
+	}
 	srv.SetAuthToken(resolved.AuthToken())
 	handler := srv.Handler()
 

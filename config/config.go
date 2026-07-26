@@ -119,6 +119,14 @@ func (c *Config) AuthToken() string {
 	return os.Getenv(c.AuthTokenEnv)
 }
 
+// AuthTokenMisconfigured reports that a shared secret was configured but the
+// named variable is empty, so authentication is silently off. Callers warn on
+// this: a typo in the variable name, or a GUI launch that never sourced the
+// user's shell profile, otherwise disables the control with no signal at all.
+func (c *Config) AuthTokenMisconfigured() bool {
+	return c.AuthTokenEnv != "" && c.AuthToken() == ""
+}
+
 // yamlConfig mirrors Config but nests server.addr so YAML maps cleanly,
 // then we flatten into Config.
 type yamlConfig struct {

@@ -466,3 +466,25 @@ func TestAuthTokenEmptyWhenUnconfigured(t *testing.T) {
 		t.Errorf("AuthToken() = %q, want empty", got)
 	}
 }
+
+// A typo in the variable name, or a GUI launch that never sourced the user's
+// shell profile, silently disables authentication. Callers warn on this, so the
+// predicate has to distinguish it from "no token was ever configured".
+func TestAuthTokenMisconfigured(t *testing.T) {
+	t.Setenv("OCTOPUS_MISCONF_SET", "s3cret")
+	for _, c := range []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{"not configured at all", &Config{}, false},
+		{"configured and set", &Config{AuthTokenEnv: "OCTOPUS_MISCONF_SET"}, false},
+		{"configured but variable unset", &Config{AuthTokenEnv: "OCTOPUS_MISCONF_ABSENT"}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.cfg.AuthTokenMisconfigured(); got != c.want {
+				t.Errorf("AuthTokenMisconfigured() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}

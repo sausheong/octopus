@@ -572,7 +572,7 @@ Octopus parses YAML with unknown-field rejection, so misspelled settings fail fa
 
 When `auth_token_env` is set, requests must present the secret as either `x-api-key` or `Authorization: Bearer <token>`; both are accepted because Anthropic and OpenAI clients each send their own. An `Authorization` header carrying the bare token without the `Bearer ` prefix is also accepted. Requests without a valid secret receive `401` in the error shape of the endpoint they called.
 
-Naming a variable that is not set in the environment resolves to an empty token, which disables authentication rather than rejecting every request. Octopus does not warn about this, so confirm the variable is exported in the environment the router actually runs in — for the menu bar app, that is the environment Launch Services gives the app, not your shell.
+Naming a variable that is not set in the environment resolves to an empty token, which disables authentication rather than rejecting every request. Octopus logs a warning at startup when this happens — `auth token variable is empty; routing endpoints are UNAUTHENTICATED` — because the alternative is a security control that silently is not there. Confirm the variable is exported in the environment the router actually runs in: for the menu bar app, that is the environment Launch Services gives the app, not your shell, so a token exported in `.zshrc` will not be visible to it.
 
 Saving from Settings rewrites the file through the config marshaller, which always emits `auth_token_env` even when empty. A line reading `auth_token_env: ""` appearing after a save is expected and matches how the sibling `server` fields are written.
 

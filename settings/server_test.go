@@ -205,19 +205,29 @@ func TestLoopbackHost(t *testing.T) {
 // The demonstrated attack: a page on evil.example.com whose DNS resolves to
 // 127.0.0.1. Host and Origin agree with each other, so the old Origin-vs-Host
 // comparison accepted it; only the literal address rejects it.
+//
+// Built from writeReq and varying only Host and Origin. Hand-rolling the
+// headers here once let this test silently stop exercising the Host check: a
+// later layer (the CSRF token) short-circuited validWriteRequest before
+// loopbackHost ran, so the whole rebinding defence could be deleted with the
+// suite still green. A request that satisfies every other gate is the only
+// kind that can pin this one.
 func TestRebindingWriteIsRejected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".octopus", "config.yaml")
 	server := NewServer(NewStore(path), nil, nil)
-	req := httptest.NewRequest(http.MethodPost, "/api/yaml",
-		strings.NewReader(`{"yaml":"server:\n  addr: \"127.0.0.1:8787\"\n"}`))
+	// The rebound page sends a config that would otherwise save cleanly, so a
+	// failure here means the write really would have landed, not that some
+	// unrelated validation happened to catch it.
+	req := writeReq(t, server, "/api/yaml", validYAMLBody)
 	req.Host = "evil.example.com:54321"
 	req.Header.Set("Origin", "http://evil.example.com:54321")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Octopus-Settings", "1")
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (rebinding must be rejected)", rec.Code)
+	}
+	if _, _, exists, _ := server.store.Load(); exists {
+		t.Fatal("a rebound write persisted config")
 	}
 }
 
@@ -281,6 +291,11 @@ func TestWriteRequiresCSRFToken(t *testing.T) {
 func TestServedHTMLCarriesToken(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".octopus", "config.yaml")
 	server := NewServer(NewStore(path), nil, nil)
+	// strings.Contains(body, "") is always true, so without this the assertion
+	// below would pass against any page whatsoever.
+	if server.csrf == "" {
+		t.Fatal("NewServer must generate a CSRF token; an empty token makes the containment check vacuous")
+	}
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "127.0.0.1:8787"
 	rec := httptest.NewRecorder()
@@ -291,6 +306,25 @@ func TestServedHTMLCarriesToken(t *testing.T) {
 	}
 	if strings.Contains(body, "{{CSRF_TOKEN}}") {
 		t.Error("placeholder was not substituted")
+	}
+}
+
+// A Server whose token was never generated must reject writes rather than
+// accept unauthenticated ones. ConstantTimeCompare returns 1 for two empty
+// slices, so without an explicit guard the check fails open on exactly the
+// state the token exists to rule out. Not reachable through NewServer today;
+// pinned so that a second constructor cannot introduce it silently.
+func TestEmptyTokenFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".octopus", "config.yaml")
+	server := &Server{store: NewStore(path)}
+	req := httptest.NewRequest(http.MethodPost, "/api/yaml", strings.NewReader(validYAMLBody))
+	req.Host = "127.0.0.1:8787"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Octopus-Settings", "1")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (an ungenerated token must not authorise writes)", rec.Code)
 	}
 }
 

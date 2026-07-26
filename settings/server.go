@@ -270,8 +270,12 @@ func (s *Server) validWriteRequest(r *http.Request) bool {
 	}
 	// Constant-time: a timing oracle on a 32-byte token is not a realistic
 	// attack here, but the comparison is free and the habit is worth keeping.
+	// The empty-token guard makes the check fail closed: ConstantTimeCompare
+	// of two empty slices returns 1, so a Server built as a bare literal
+	// rather than by NewServer would otherwise accept writes carrying no
+	// token at all.
 	got := r.Header.Get("X-Octopus-CSRF")
-	if subtle.ConstantTimeCompare([]byte(got), []byte(s.csrf)) != 1 {
+	if s.csrf == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.csrf)) != 1 {
 		return false
 	}
 	origin := r.Header.Get("Origin")

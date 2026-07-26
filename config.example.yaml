@@ -24,9 +24,9 @@ routing:
   session_sticky: true
   session_ttl: "1h"
   cache_aware: true
-  # Maximum backends one request may try before giving up. Only retryable
-  # failures (rate limits, overloads, transport errors) consume an attempt;
-  # a malformed request stops immediately. Defaults to 3 when omitted.
+  # Maximum backends one request may try before giving up. Every failure
+  # consumes an attempt except a malformed request and a cancelled request,
+  # which stop immediately. Defaults to 3 when omitted.
   max_attempts: 3
 
 # Backend credentials: api_key_env names the env var holding the key.

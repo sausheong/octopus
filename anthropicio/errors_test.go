@@ -11,6 +11,7 @@ import (
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	openai "github.com/sashabaranov/go-openai"
+	"google.golang.org/genai"
 )
 
 // anthErr builds a fully-populated *anthropic.Error so that its Error() method
@@ -86,6 +87,46 @@ func TestMapBackendError(t *testing.T) {
 			status, _ := MapError(ae)
 			if status != c.wantStatus {
 				t.Errorf("MapError status = %d, want %d", status, c.wantStatus)
+			}
+		})
+	}
+}
+
+// TestMapBackendErrorPerProviderStatuses pins the status classification for
+// every provider SDK error type. A 400 must be terminal for all of them: a
+// malformed request fails identically on the next backend, so retrying it wastes
+// the attempt budget and masks the real error behind a generic 502.
+func TestMapBackendErrorPerProviderStatuses(t *testing.T) {
+	cases := []struct {
+		name          string
+		err           error
+		wantKind      string
+		wantRetryable bool
+	}{
+		{"anthropic 400", anthErr(400), "invalid_request", false},
+		{"anthropic 429", anthErr(429), "rate_limit", true},
+		{"anthropic 500", anthErr(500), "overloaded", true},
+		{"anthropic 529", anthErr(529), "overloaded", true},
+
+		{"openai APIError 400", &openai.APIError{HTTPStatusCode: 400, Message: "bad"}, "invalid_request", false},
+		{"openai APIError 429", &openai.APIError{HTTPStatusCode: 429, Message: "slow"}, "rate_limit", true},
+		{"openai APIError 503", &openai.APIError{HTTPStatusCode: 503, Message: "busy"}, "overloaded", true},
+
+		{"openai RequestError 400", &openai.RequestError{HTTPStatusCode: 400, Err: nil}, "invalid_request", false},
+		{"openai RequestError 429", &openai.RequestError{HTTPStatusCode: 429, Err: nil}, "rate_limit", true},
+		{"openai RequestError 503", &openai.RequestError{HTTPStatusCode: 503, Err: nil}, "overloaded", true},
+
+		{"gemini 400", genai.APIError{Code: 400, Message: "bad"}, "invalid_request", false},
+		{"gemini 429", genai.APIError{Code: 429, Message: "slow"}, "rate_limit", true},
+		{"gemini 503", genai.APIError{Code: 503, Message: "busy"}, "overloaded", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := MapBackendError(c.err).Kind; got != c.wantKind {
+				t.Errorf("Kind = %q, want %q", got, c.wantKind)
+			}
+			if got := Retryable(c.err); got != c.wantRetryable {
+				t.Errorf("Retryable = %v, want %v", got, c.wantRetryable)
 			}
 		})
 	}

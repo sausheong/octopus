@@ -29,7 +29,7 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
 - OpenAI-compatible `GET /v1/models` generated from the configured catalog.
 - Routing across Anthropic, OpenAI, Gemini, Qwen, local models, and compatible gateways.
 - Optional low-cost classifier with a zero-call short circuit for trivial requests.
-- Hard tool, vision, and context-window eligibility checks.
+- Hard tool, vision, context-window, and output-limit eligibility checks.
 - Quality/cost/speed scoring with deterministic fallback order.
 - Sticky conversation routing for prompt-cache continuity.
 - Full Anthropic `cache_control` preservation, including `5m` and `1h` TTLs.
@@ -490,7 +490,7 @@ When a task benefits from reasoning, the router recommends medium reasoning effo
 
 Eligible models are attempted in score order, starting with the chosen model.
 
-- Only retryable failures — rate limits, overloads, and transport errors — advance to the next model. Failure while opening a stream, a closed stream, or an `EventError` before the first meaningful event all qualify. Buffered responses may also fall back after a later collection failure, because no client bytes have been written yet.
+- Every failure advances to the next model except a malformed request and a cancelled request; anything else, including an error the router cannot classify, is treated as retryable. Failure while opening a stream, a closed stream, or an `EventError` before the first meaningful event all qualify. Buffered responses may also fall back after a later collection failure, because no client bytes have been written yet.
 - A malformed request (HTTP `400`) stops immediately and the backend's own error is returned, rather than being retried across the catalog and masked as a `502`.
 - A cancelled request stops immediately; no further backends are tried, and no status or body is written because the client is gone.
 - `routing.max_attempts` (default `3`) bounds the total number of backends tried.
@@ -598,7 +598,7 @@ The section is optional; these defaults are applied when it is omitted.
 | `session_sticky` | `true` | Keep a conversation on its last successful eligible model. |
 | `session_ttl` | `1h` | Lifetime of model affinity. Must not be negative. |
 | `cache_aware` | `true` | Include expected cache writes/reads in cost scoring. |
-| `max_attempts` | `3` | Maximum backends one request may try. Only retryable failures — rate limits, overloads, and transport errors — consume an attempt. Must not be negative; `0` is treated as omitted. |
+| `max_attempts` | `3` | Maximum backends one request may try. Every failure consumes an attempt except a malformed request and a cancelled request, which stop immediately. Must not be negative; `0` is treated as omitted. |
 
 ### `providers`
 

@@ -78,7 +78,7 @@ func MapBackendError(err error) APIError {
 	if errors.As(err, &already) {
 		return already
 	}
-	// anthropic 429 -> rate_limit, 529 -> overloaded
+	// anthropic 429 -> rate_limit, 529/5xx -> overloaded, 400 -> invalid_request
 	var anthErr *anthropic.Error
 	if errors.As(err, &anthErr) {
 		switch anthErr.StatusCode {
@@ -94,7 +94,9 @@ func MapBackendError(err error) APIError {
 			return NewAPIError("invalid_request", err.Error())
 		}
 	}
-	// openai APIError / RequestError: 429 -> rate_limit, 5xx -> overloaded
+	// openai APIError / RequestError: 429 -> rate_limit, 5xx -> overloaded,
+	// 400 -> invalid_request. The 400 mapping matters most here: the local
+	// mlx/Ollama/LM Studio backends all speak the openai kind.
 	var oaiAPI *openai.APIError
 	if errors.As(err, &oaiAPI) {
 		if oaiAPI.HTTPStatusCode == 429 {
@@ -102,6 +104,9 @@ func MapBackendError(err error) APIError {
 		}
 		if oaiAPI.HTTPStatusCode >= 500 && oaiAPI.HTTPStatusCode < 600 {
 			return NewAPIError("overloaded", err.Error())
+		}
+		if oaiAPI.HTTPStatusCode == 400 {
+			return NewAPIError("invalid_request", err.Error())
 		}
 	}
 	var oaiReq *openai.RequestError
@@ -112,6 +117,9 @@ func MapBackendError(err error) APIError {
 		if oaiReq.HTTPStatusCode >= 500 && oaiReq.HTTPStatusCode < 600 {
 			return NewAPIError("overloaded", err.Error())
 		}
+		if oaiReq.HTTPStatusCode == 400 {
+			return NewAPIError("invalid_request", err.Error())
+		}
 	}
 	// gemini: genai.APIError is a VALUE type (value receiver Error()), match the value
 	var gErr genai.APIError
@@ -121,6 +129,9 @@ func MapBackendError(err error) APIError {
 		}
 		if gErr.Code >= 500 && gErr.Code < 600 {
 			return NewAPIError("overloaded", err.Error())
+		}
+		if gErr.Code == 400 {
+			return NewAPIError("invalid_request", err.Error())
 		}
 	}
 	return NewAPIError("upstream", err.Error())

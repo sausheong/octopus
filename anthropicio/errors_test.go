@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
+	openai "github.com/sashabaranov/go-openai"
 )
 
 // anthErr builds a fully-populated *anthropic.Error so that its Error() method
@@ -30,6 +31,8 @@ func TestMapErrorKinds(t *testing.T) {
 		typ    string
 	}{
 		{NewAPIError("invalid_request", "bad"), 400, "invalid_request_error"},
+		// 499, not 500: a client hang-up is not a server error.
+		{NewAPIError(KindCanceled, "client went away"), 499, "invalid_request_error"},
 		{NewAPIError("rate_limit", "slow down"), 429, "rate_limit_error"},
 		{NewAPIError("overloaded", "busy"), 503, "overloaded_error"},
 		{NewAPIError("upstream", "boom"), 502, "api_error"},
@@ -88,10 +91,11 @@ func TestMapBackendError(t *testing.T) {
 	}
 }
 
-// cancelWrapper mimics an SDK that wraps context cancellation inside its own
-// error type. MapBackendError must detect the wrapped cancellation before it
-// reaches the SDK type switches, or cancellation is misclassified as a
-// retryable upstream failure and the fan-out defect persists.
+// cancelWrapper is a custom error type that unwraps to a cancellation but
+// matches none of the SDK branches. It only proves errors.Is reaches through an
+// opaque wrapper; it cannot test ordering, since with nothing to shadow it the
+// cancellation check yields the same answer wherever it sits in the function.
+// The shadowing cases below are what pin the ordering.
 type cancelWrapper struct{ inner error }
 
 func (c cancelWrapper) Error() string { return "sdk: " + c.inner.Error() }
@@ -106,6 +110,14 @@ func TestMapBackendErrorClassifiesCancellation(t *testing.T) {
 		{"bare deadline", context.DeadlineExceeded},
 		{"wrapped canceled", cancelWrapper{inner: context.Canceled}},
 		{"wrapped in fmt.Errorf", fmt.Errorf("stream open: %w", context.Canceled)},
+		// These two both wrap cancellation AND match a real SDK branch, so they
+		// are only classified as canceled if that check runs before the SDK type
+		// switches. Without them, moving the check lower still passes the suite.
+		{"openai 500 wrapping cancel", &openai.RequestError{HTTPStatusCode: 500, Err: context.Canceled}},
+		{"anthropic 529 joined with cancel", fmt.Errorf("%w: %w", anthErr(529), context.Canceled)},
+		// Pins cancellation above the APIError passthrough specifically: swapping
+		// those two would classify this as overloaded rather than canceled.
+		{"classified overloaded wrapping cancel", fmt.Errorf("%w: %w", NewAPIError("overloaded", "busy"), context.Canceled)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -132,6 +144,9 @@ func TestRetryable(t *testing.T) {
 		{"anthropic 529", anthErr(529), true},
 		{"raw context cancel", context.Canceled, false},
 		{"unknown error", errors.New("mystery"), true},
+		// Guards against a panic, not a wrong answer: MapBackendError would
+		// dereference nil, and Task 3 calls this on a lastErr that can be nil.
+		{"nil error", nil, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

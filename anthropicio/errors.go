@@ -43,6 +43,12 @@ func MapError(err error) (int, []byte) {
 			status, errType = 503, "overloaded_error"
 		case "upstream":
 			status, errType = 502, "api_error"
+		case KindCanceled:
+			// 499 (client closed request): the caller hung up, so reporting a
+			// server error would misattribute the failure. Task 3 stops writing
+			// a body at all for cancellation; this keeps the mapping honest
+			// meanwhile rather than defaulting to 500.
+			status, errType = 499, "invalid_request_error"
 		}
 	}
 
@@ -124,6 +130,13 @@ func MapBackendError(err error) APIError {
 // A malformed request fails identically everywhere, and a cancelled request
 // has no one waiting for it; everything else is worth another candidate.
 func Retryable(err error) bool {
+	// The fallback loops call this on an accumulated lastErr that can still be
+	// nil; MapBackendError would dereference it. Panicking inside a request
+	// handler is a worse outcome than any routing mistake, and "no error" is
+	// nothing to retry anyway.
+	if err == nil {
+		return false
+	}
 	switch MapBackendError(err).Kind {
 	case "invalid_request", KindCanceled:
 		return false

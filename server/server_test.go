@@ -1022,6 +1022,10 @@ func TestChannelSideFailuresRespectAttemptBounds(t *testing.T) {
 		{"streaming first-event 400 stops immediately", fanoutStreamBody,
 			[]llm.ChatEvent{{Type: llm.EventError, Error: anthErr(400)}}, 1},
 		{"buffered peek failure stops at cap", fanoutBody, nil, 3},
+		// First event is the error, so this stops at the peekForContent break
+		// site rather than the collect one the two cases below reach.
+		{"buffered peek 400 stops immediately", fanoutBody,
+			[]llm.ChatEvent{{Type: llm.EventError, Error: anthErr(400)}}, 1},
 		{"buffered collection error stops at cap", fanoutBody,
 			[]llm.ChatEvent{{Type: llm.EventTextDelta, Text: "partial"}, {Type: llm.EventError, Error: anthErr(429)}}, 3},
 		{"buffered collection 400 stops immediately", fanoutBody,

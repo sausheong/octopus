@@ -42,7 +42,13 @@ func TestDocumentCarriesEveryConfigField(t *testing.T) {
 			MaxAttempts:   7,
 		},
 		Providers: map[string]config.ProviderCreds{
-			"p": {Kind: "anthropic", APIKeyEnv: "K", BaseURL: "https://example.invalid"},
+			// APIKey is set here even though a committed config should use
+			// APIKeyEnv instead: Document does round-trip an inline key, so
+			// dropping it would lose a credential the user had configured.
+			"p": {
+				Kind: "anthropic", APIKeyEnv: "K", APIKey: "inline-key",
+				BaseURL: "https://example.invalid",
+			},
 		},
 		Catalog: []config.CatalogEntry{{
 			ID: "p/m", Quality: 0.5, CostPerMTokIn: 1.5, CostPerMTokOut: 2.5, Speed: 0.5,
@@ -56,8 +62,17 @@ func TestDocumentCarriesEveryConfigField(t *testing.T) {
 	// Guard the guard: if a new config field is added and not set above, the
 	// round trip would "preserve" its zero value and this test would pass
 	// while proving nothing.
+	// The nested structs matter as much as the top level: each is hand-copied
+	// field by field into its Document counterpart, which is the same mechanism
+	// that caused every historical incident — including caps.max_output_tokens,
+	// which lives in Caps rather than on Config itself.
 	assertAllFieldsSet(t, reflect.ValueOf(*full), "Config")
 	assertAllFieldsSet(t, reflect.ValueOf(full.Routing), "RoutingCfg")
+	assertAllFieldsSet(t, reflect.ValueOf(full.Classifier), "ClassifierCfg")
+	assertAllFieldsSet(t, reflect.ValueOf(full.Weights), "Weights")
+	assertAllFieldsSet(t, reflect.ValueOf(full.Catalog[0]), "CatalogEntry")
+	assertAllFieldsSet(t, reflect.ValueOf(full.Catalog[0].Caps), "Caps")
+	assertAllFieldsSet(t, reflect.ValueOf(full.Providers["p"]), "ProviderCreds")
 
 	back, err := documentFromConfig(full).config()
 	if err != nil {
@@ -102,8 +117,11 @@ func assertAllFieldsSet(t *testing.T, v reflect.Value, name string) {
 			continue
 		}
 		if v.Field(i).IsZero() {
-			t.Errorf("%s.%s is zero in the fixture: set it to a distinctive value, "+
-				"or add it to documentOmits with a reason", name, field.Name)
+			t.Errorf("%s.%s is zero in the fixture. Set it to a distinctive value "+
+				"AND add a comparison for it below — setting it alone makes this "+
+				"test pass while the field is still dropped. If the Document "+
+				"deliberately does not carry it, add it to documentOmits with a "+
+				"reason instead.", name, field.Name)
 		}
 	}
 }

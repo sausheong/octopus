@@ -20,7 +20,7 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
 - [Local and mixed-provider recipes](#local-and-mixed-provider-recipes)
 - [Benchmarking](#benchmarking)
 - [Development](#development)
-- [Rename compatibility](#rename-compatibility)
+- [License](#license)
 
 ## Highlights
 
@@ -228,6 +228,8 @@ Settings has five sections:
 - **Models** edits the routing catalog, pricing, capabilities, and context and output limits.
 - **Advanced YAML** edits the complete configuration directly.
 - **Insights** shows request volume, token usage, estimated spend, savings over time, cache efficiency, and model usage.
+
+Saving requires a CSRF token that is generated fresh each time Octopus starts and embedded in the page when it loads. A settings page left open across a restart therefore holds a token the new process will not accept, and must be reopened from the menu bar before it can save.
 
 Every save is parsed and validated before replacing the existing file. A valid save reloads the router immediately without restarting the menu-bar app. If validation fails, the existing file and running router remain unchanged and the settings page shows the error. If a newly saved configuration cannot start—for example because a credential environment variable is absent—the file remains saved, the previous working router stays active when possible, and the status area reports the problem.
 
@@ -566,6 +568,13 @@ Octopus parses YAML with unknown-field rejection, so misspelled settings fail fa
 | Field | Required | Description |
 |---|---:|---|
 | `addr` | Yes | Loopback `host:port`, such as `127.0.0.1:8787`, `localhost:8787`, or `[::1]:8787`. Non-loopback addresses are rejected. |
+| `auth_token_env` | No | Names the environment variable holding a shared secret for the routing endpoints. The token itself is never written to the config file. Omitted or empty means no authentication. |
+
+When `auth_token_env` is set, requests must present the secret as either `x-api-key` or `Authorization: Bearer <token>`; both are accepted because Anthropic and OpenAI clients each send their own. An `Authorization` header carrying the bare token without the `Bearer ` prefix is also accepted. Requests without a valid secret receive `401` in the error shape of the endpoint they called.
+
+Naming a variable that is not set in the environment resolves to an empty token, which disables authentication rather than rejecting every request. Octopus does not warn about this, so confirm the variable is exported in the environment the router actually runs in — for the menu bar app, that is the environment Launch Services gives the app, not your shell.
+
+Saving from Settings rewrites the file through the config marshaller, which always emits `auth_token_env` even when empty. A line reading `auth_token_env: ""` appearing after a save is expected and matches how the sibling `server` fields are written.
 
 ### `classifier`
 
@@ -667,13 +676,27 @@ Catalog prices and capabilities are operator-maintained. Keep them synchronized 
 
 ## Deployment and security
 
-Octopus intentionally has no inbound authentication. To reduce exposure:
+### Routing endpoints
 
-- `server.addr` is validated as loopback-only.
+The routing endpoints are unauthenticated by default. The only thing standing between them and a caller is the loopback bind, so **any process running as any user on the machine can reach them and spend your provider credits**. That is an acceptable posture for a single-user workstation and a poor one for a shared or multi-tenant host. Set [`server.auth_token_env`](#server) to require a shared secret; it is off by default because turning it on breaks every already-configured client.
+
+Loopback binding is a real control but a narrow one. It stops remote network access and nothing else — not other local users, not other applications, not a compromised dependency in an unrelated project on the same machine.
+
+- `server.addr` is validated as loopback-only, and validation rejects a non-loopback address precisely because inbound requests may be unauthenticated.
 - Do not expose port `8787` through a public tunnel, container port, or reverse proxy without adding authentication at that boundary.
 - Keep provider keys in environment variables or an ignored `config.yaml`.
 - Never commit inline `api_key` values.
 - Rotate a provider key immediately if it appears in logs, shell history, or version control.
+
+### Settings server
+
+The settings server binds to a random loopback port and enforces two controls on every write. They defend against different attacks and neither substitutes for the other.
+
+**A literal-loopback `Host` check** is what closes DNS rebinding. A rebinding attacker serves a page from a hostname they control, then repoints that hostname at `127.0.0.1`. Comparing `Origin` against `Host` proves nothing there, because both are attacker-controlled and agree with each other. Only the literal address distinguishes the real local UI from a hostile page, so writes are rejected unless `Host` names a loopback IP or `localhost`. Note that the CSRF token contributes nothing against rebinding: the attacker's page origin *is* the target origin, so its `GET /` is same-origin and it can simply read the token out of the served HTML.
+
+**A per-process CSRF token** closes classic cross-site request forgery, which the `Host` check does not touch. An attacker page that POSTs directly to `http://127.0.0.1:PORT` sends a valid loopback `Host` and sails through the first check. There, however, the page is genuinely cross-origin: no CORS headers are served, so it cannot read the response to `GET /` and harvest the token, and `frame-ancestors 'none'` with `X-Frame-Options: DENY` closes the framing route to the same end. Without the token the forged write is rejected.
+
+Writes additionally require an `X-Octopus-Settings: 1` header and a JSON content type, and any `Origin` present must match the request `Host`. Responses carry a restrictive `Content-Security-Policy`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, and `Cache-Control: no-store`.
 
 The HTTP server uses:
 

@@ -854,3 +854,7 @@ octopus/
 ```
 
 The shared provider abstraction and implementations live in [`github.com/sausheong/harness`](https://github.com/sausheong/harness). Octopus currently requires harness `v0.3.4`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

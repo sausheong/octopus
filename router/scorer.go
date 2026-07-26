@@ -54,11 +54,6 @@ func eligible(p TaskProfile, e config.CatalogEntry) bool {
 	return true
 }
 
-// reqCost estimates the dollar cost of the request on a given model.
-func reqCost(p TaskProfile, e config.CatalogEntry) float64 {
-	return reqCostWithInputMultiplier(p, e, 1)
-}
-
 func reqCostWithInputMultiplier(p TaskProfile, e config.CatalogEntry, inputMultiplier float64) float64 {
 	return float64(p.EstTokensIn)/1e6*e.CostPerMTokIn*inputMultiplier +
 		float64(p.EstTokensOut)/1e6*e.CostPerMTokOut

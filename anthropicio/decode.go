@@ -123,13 +123,6 @@ func Decode(body []byte) (DecodedRequest, error) {
 	}, nil
 }
 
-// decodeSystem accepts either a JSON string or an array of {type:text,text}
-// blocks, joining block texts with newlines.
-func decodeSystem(raw json.RawMessage) (string, error) {
-	system, _, err := decodeSystemDetails(raw)
-	return system, err
-}
-
 func decodeSystemDetails(raw json.RawMessage) (string, []llm.SystemPromptPart, error) {
 	if len(raw) == 0 {
 		return "", nil, nil

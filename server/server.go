@@ -281,10 +281,6 @@ func (s *Server) observeEvents(chat llm.ChatRequest, model string, decision rout
 	return out
 }
 
-type errString string
-
-func (e errString) Error() string { return string(e) }
-
 // peekForContent reads the first event from ch. If the channel is empty
 // (closed without events) or the first event is EventError, it returns an
 // error so collectWithFallback can try the next candidate. Otherwise it

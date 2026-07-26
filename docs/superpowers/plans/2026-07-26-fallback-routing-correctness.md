@@ -121,7 +121,19 @@ At the very top of `MapBackendError`, **before** the existing `var anthErr *anth
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return NewAPIError(KindCanceled, err.Error())
 	}
+	// An already-classified error keeps its Kind. Without this, the fallthrough
+	// below re-derives every APIError as "upstream", so Retryable would call a
+	// malformed or cancelled request retryable and fan it across the catalog.
+	var classified APIError
+	if errors.As(err, &classified) {
+		return classified
+	}
 ```
+
+Note the second block: unlike `MapError`, `MapBackendError` has no `APIError`
+passthrough today, and `Retryable` delegates to it. Omitting the passthrough
+makes `Retryable` return `true` for `invalid_request` and `canceled`, which
+defeats the entire task.
 
 Then append to the file:
 

@@ -410,3 +410,34 @@ func TestRouteCarriesMaxAttempts(t *testing.T) {
 		t.Errorf("Decision.MaxAttempts = %d, want 2", dec.MaxAttempts)
 	}
 }
+
+func TestEstimateRequestTokensCountsSystemPromptParts(t *testing.T) {
+	big := strings.Repeat("x", 60000)
+
+	partsOnly := EstimateRequestTokens(llm.ChatRequest{
+		SystemPromptParts: []llm.SystemPromptPart{{Text: big}},
+		Messages:          []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if partsOnly < 15000 {
+		t.Errorf("parts-only estimate = %d, want >= 15000 (60KB / 3 bytes per token)", partsOnly)
+	}
+
+	// Decode sets both fields for a structured prompt. Parts replace
+	// SystemPrompt in harness semantics, so the bytes must be counted once.
+	both := EstimateRequestTokens(llm.ChatRequest{
+		SystemPrompt:      big,
+		SystemPromptParts: []llm.SystemPromptPart{{Text: big}},
+		Messages:          []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if both != partsOnly {
+		t.Errorf("double counted: both = %d, parts-only = %d", both, partsOnly)
+	}
+
+	promptOnly := EstimateRequestTokens(llm.ChatRequest{
+		SystemPrompt: big,
+		Messages:     []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if promptOnly != partsOnly {
+		t.Errorf("prompt-only = %d, parts-only = %d; equivalent input should estimate equally", promptOnly, partsOnly)
+	}
+}

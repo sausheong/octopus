@@ -69,7 +69,16 @@ const msgOverheadBytes = 12
 func EstimateRequestTokens(chat llm.ChatRequest) int {
 	var totalBytes int
 
-	totalBytes += len(chat.SystemPrompt)
+	// SystemPromptParts, when non-empty, replaces SystemPrompt in harness
+	// semantics — and anthropicio.Decode populates both for a structured
+	// prompt, so counting each unconditionally would double the estimate.
+	if len(chat.SystemPromptParts) > 0 {
+		for _, part := range chat.SystemPromptParts {
+			totalBytes += len(part.Text)
+		}
+	} else {
+		totalBytes += len(chat.SystemPrompt)
+	}
 
 	for _, m := range chat.Messages {
 		totalBytes += msgOverheadBytes

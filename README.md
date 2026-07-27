@@ -9,8 +9,11 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
 ## Contents
 
 - [Quick start](#quick-start)
+- [Using Octopus](#using-octopus)
+  - [Claude Code](#claude-code)
+  - [Codex CLI](#codex-cli)
+  - [Other clients](#other-clients)
 - [macOS menu bar app](#macos-menu-bar-app)
-- [Claude Code setup](#claude-code-setup)
 - [Prompt caching](#prompt-caching)
 - [Routing behavior](#routing-behavior)
 - [API compatibility](#api-compatibility)
@@ -20,6 +23,7 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
 - [Local and mixed-provider recipes](#local-and-mixed-provider-recipes)
 - [Benchmarking](#benchmarking)
 - [Development](#development)
+- [Releasing](#releasing)
 - [License](#license)
 
 ## Highlights
@@ -123,6 +127,75 @@ Use another configuration file with:
 
 The process logs `octopus listening` when it is ready. It handles `SIGINT` and `SIGTERM` by draining in-flight requests for up to 30 seconds.
 
+## Using Octopus
+
+Octopus speaks two APIs on one port, so most clients need only a base URL. Point the client at `http://127.0.0.1:8787` and keep the real provider keys in the Octopus configuration, not in the client.
+
+### Claude Code
+
+Run the two in separate terminals so the upstream provider credential and Claude Code's gateway token stay distinct.
+
+Terminal 1 — start Octopus with the real provider key:
+
+```bash
+cd /path/to/octopus
+export ANTHROPIC_API_KEY="sk-ant-real-provider-key"
+./octopus
+```
+
+Terminal 2 — point Claude Code at Octopus:
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
+export ANTHROPIC_AUTH_TOKEN="local-octopus"
+claude
+```
+
+`ANTHROPIC_AUTH_TOKEN` can be any non-empty value unless you have set `server.auth_token_env`, in which case it must match that token. Octopus never forwards this client token: upstream requests are built with credentials from `config.yaml`. This follows Anthropic's [Claude Code LLM gateway guidance](https://docs.anthropic.com/en/docs/claude-code/llm-gateway).
+
+Claude Code requests a specific model, but Octopus treats the inbound model as advisory and picks a catalog model itself. The label shown in Claude Code is therefore the client-side name, not necessarily the backend that served the turn; the routed provider and model appear in Octopus logs and Insights. Passing `--model octopus` makes that distinction visible.
+
+#### Verify prompt caching
+
+1. Enable `routing.session_sticky` and `routing.cache_aware`, or omit them to use their `true` defaults.
+2. Start a session with a large, stable prompt prefix.
+3. Send at least two turns within the cache TTL.
+4. Look for `prompt cache usage` in the Octopus log.
+5. Confirm a later response reports a positive `cache_read_input_tokens`.
+
+A zero cache count does not always mean forwarding failed. Providers impose minimum cacheable-prefix sizes, and a new or changed prefix must be written before it can be read.
+
+### Codex CLI
+
+**Codex CLI does not work with Octopus yet.** Current Codex versions require the OpenAI Responses API, which Octopus does not implement.
+
+Codex removed support for the Chat Completions wire protocol ([openai/codex#7782](https://github.com/openai/codex/discussions/7782)). Setting `wire_api = "chat"` now fails at startup:
+
+```
+Error loading config.toml: `wire_api = "chat"` is no longer supported.
+How to fix: set `wire_api = "responses"` in your provider config.
+```
+
+Setting `wire_api = "responses"` reaches Octopus but finds no such endpoint:
+
+```
+ERROR: unexpected status 404 Not Found: 404 page not found,
+       url: http://127.0.0.1:8787/v1/responses
+```
+
+Octopus serves `/v1/messages`, `/v1/chat/completions`, and `/v1/models`. Adding `/v1/responses` is tracked as future work; until then, use a client that speaks either the Anthropic Messages API or OpenAI Chat Completions.
+
+### Other clients
+
+Any client that targets OpenAI Chat Completions works by overriding the base URL:
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:8787/v1"
+export OPENAI_API_KEY="local-octopus"
+```
+
+`GET /v1/models` reports the configured catalog, so clients that populate a model picker from the server will list your catalog entries. As with Claude Code, the requested model is advisory — Octopus selects the backend.
+
 ## macOS menu bar app
 
 ### Build and launch
@@ -136,87 +209,12 @@ open dist/Octopus.app
 
 For regular use, copy `dist/Octopus.app` to `/Applications`. The locally built app is ad-hoc signed rather than distributed through the App Store; macOS may ask you to confirm the first launch.
 
-### Signed installer
-
-Release maintainers can build a Developer ID-signed, notarized installer package. The required Developer ID Application and Developer ID Installer certificates must be installed in the current user's Keychain.
-
-Set the release environment variables:
-
-```bash
-export APPLE_ID="developer@example.com"
-export TEAM_ID="ABCDE12345"
-export APP_SIGN_ID="Developer ID Application: Example Company (ABCDE12345)"
-export PKG_SIGN_ID="Developer ID Installer: Example Company (ABCDE12345)"
-export KEYCHAIN_PROFILE="octopus-notary"
-```
-
-Store the notarization credentials once. Apple prompts securely for the app-specific password; it does not need to be placed in an environment variable or command history.
-
-```bash
-make notary-profile
-```
-
-Then create the installer:
-
-```bash
-make installer
-```
-
-The target builds `Octopus.app`, signs it with the hardened runtime and a trusted timestamp, verifies that its signing team matches `TEAM_ID`, creates a signed package that installs the app in `/Applications`, submits the package using `KEYCHAIN_PROFILE`, waits for notarization, staples the ticket, and validates the finished installer. The result is written to `dist/Octopus-<version>.pkg`, where the version comes from `packaging/Info.plist`.
-
-`KEYCHAIN_PROFILE` supplies the stored Apple ID credentials during notarization. `APPLE_ID` and `TEAM_ID` are used when creating that profile; `make installer` also requires them so an incomplete release environment fails before signing begins. Never commit these values or an app-specific password to the repository.
-
-### Publishing a release
-
-Before publishing, review and commit every change that belongs in the release. The release command deliberately refuses to run with modified, staged, or untracked files because a Git tag must identify one complete, reproducible commit.
-
-```bash
-git status --short
-git add <files-to-release>
-git commit -m "Describe the release changes"
-git status --short            # must produce no output
-```
-
-If every current file belongs in the release, `git add -A` can replace the selective `git add` command. Review the staged contents with `git diff --cached` before committing; do not include local configuration, credentials, build products, or unrelated work.
-
-Confirm that GitHub CLI authentication and the Apple notarization profile are ready:
-
-```bash
-gh auth status
-xcrun notarytool history --keychain-profile "$KEYCHAIN_PROFILE"
-```
-
-With all five release environment variables set, publish a three-component semantic version:
-
-```bash
-make release v0.1.0
-```
-
-The version must use the exact `vX.Y.Z` form; prerelease suffixes and partial versions are not accepted. The release target performs the following operations:
-
-1. Verifies the clean worktree, required environment variables, signing identities, notarization profile, GitHub authentication, and current Git branch.
-2. Runs the complete test suite.
-3. Updates `packaging/Info.plist` and increments its build number when the requested version differs, then commits and pushes that version change.
-4. Creates and pushes an annotated Git tag.
-5. Creates a draft GitHub release. Its notes contain a short description, up to eight recent commit subjects, installation guidance, and a full-changelog link when an earlier tag exists.
-6. Runs `make installer` to build, sign, notarize, staple, and validate `dist/Octopus-X.Y.Z.pkg`.
-7. Uploads the installer and publishes the draft as the latest GitHub release.
-
-The command pushes commits and tags to `origin`; verify the current branch and remote before running it. It does not collect or commit outstanding development work automatically—the only commit it creates is the version metadata update.
-
-#### Release troubleshooting
-
-`error: the Git worktree must be clean before creating a release` means `git status --short` reports at least one modified, staged, or untracked file. Review those files, commit the ones intended for the release, and remove, ignore, or separately preserve anything that should not be published. Then rerun the release command.
-
-The GitHub release remains a draft if building, signing, notarization, or upload fails. Correct the problem and run the same command again to resume it. A published version cannot be overwritten by this target.
-
 The menu contains exactly two items:
 
 1. **Settings…** opens the local settings web app in your default browser.
 2. **Quit Octopus** stops the router and settings server, then exits.
 
 There is no Dock icon and no application-window menu. The settings server binds to a random loopback port and is available only while Octopus is running.
-
 ### Settings and live reload
 
 The app always reads and writes `~/.octopus/config.yaml`. If the file does not exist, Settings opens with safe defaults; the file is created on the first successful save. The containing directory is created with mode `0700` and the file is written atomically with mode `0600`.
@@ -237,85 +235,37 @@ Every save is parsed and validated before replacing the existing file. A valid s
 
 The settings interface follows the macOS light or dark appearance and supports keyboard navigation, visible focus states, reduced motion, and WCAG 2.2 AA contrast.
 
-### Insights and savings calculation
+### Insights
 
-Insights is the final item in the Settings sidebar. It records one aggregate observation when a provider completes a request with final token usage. Tracking begins after an Insights-capable build starts; Octopus does not reconstruct earlier history from logs.
+Insights is the last item in the Settings sidebar. It records one aggregate observation each time a provider completes a request with final token usage, over the last 7, 30, 90, or 365 days. Tracking starts when an Insights-capable build first runs; history is not reconstructed from logs.
 
-#### What Insights provides
-
-The range selector supports the last 7, 30, 90, or 365 days. Every range shows:
-
-- **Net savings**: estimated savings after routing, prompt-cache effects, and classifier overhead.
-- **Actual cost**: the chosen model's cache-adjusted cost plus any classifier cost.
-- **Baseline cost**: estimated uncached cost of using the highest-quality eligible model instead.
-- **Requests and tokens**: completed requests and provider-reported input, output, cache-creation, and cache-read tokens.
-- **Savings over time**: cumulative actual cost and cumulative net savings across the selected daily range.
-- **Model routing**: savings from choosing a less expensive model rather than the baseline model.
-- **Prompt caching**: the chosen model's uncached cost minus its measured cache-adjusted cost. An initial cache write can make this negative.
-- **Classifier overhead**: input and output cost of nontrivial request classification, subtracted from savings.
-- **Cache hit rate**: cache-read input tokens divided by all reported input tokens, including ordinary input and cache creation.
-- **Model usage**: completed requests, tokens, and serving cost grouped by the model that returned the response. Classifier cost appears in the summary rather than this table.
-
-If a request uses models whose catalog prices are all zero, Insights still counts its requests and tokens but warns that savings may be understated.
+It reports net savings, actual and baseline cost, request and token counts, savings over time, cache hit rate, and a per-model usage breakdown. Savings are split three ways: **model routing** (choosing a cheaper model than the baseline), **prompt caching** (cache reads against the chosen model's uncached cost), and **classifier overhead**, which is subtracted. Negative values are kept rather than clamped — a cache write or a classifier call really can cost more than it saved in a given period.
 
 #### Baseline selection
 
-The baseline is selected independently for every request:
-
-1. Octopus applies the normal tool, vision, context-window, and high-difficulty quality filters.
-2. It considers only the models left in that request's eligible set.
-3. It selects the model with the highest configured `quality` value. If the chosen model ties for highest quality, it remains the baseline.
-4. It prices the baseline using the completed request's measured input and output token quantities at ordinary uncached catalog rates.
-
-This counterfactual answers: "What would the same measured request have cost on the highest-quality model Octopus could safely have selected?"
+The baseline answers: what would this same request have cost on the best model Octopus could safely have picked? For each request, Octopus applies the usual tool, vision, context, and difficulty filters, takes the highest-`quality` model still eligible, and prices it at ordinary uncached rates using the measured token counts. If the chosen model was already the highest quality, it is its own baseline.
 
 #### Cost formulas
 
-Let `Pᵢ(model)` and `Pₒ(model)` be the configured input and output prices per million tokens. Provider-reported token counts are:
-
-- `I`: ordinary input tokens
-- `W`: cache-creation input tokens
-- `R`: cache-read input tokens
-- `O`: output tokens
-
-The uncached cost of a model is:
+With `Pᵢ`/`Pₒ` the configured per-million input and output prices, and `I`, `W`, `R`, `O` the provider-reported ordinary-input, cache-write, cache-read, and output tokens:
 
 ```text
-uncached(model) = ((I + W + R) / 1,000,000 × Pᵢ(model))
-                 + (O / 1,000,000 × Pₒ(model))
+uncached(model)  = (I + W + R)/1e6 × Pᵢ(model) + O/1e6 × Pₒ(model)
+chosen measured  = (I + W×write_mult + R×0.10)/1e6 × Pᵢ(chosen) + O/1e6 × Pₒ(chosen)
+
+routing savings  = uncached(baseline) - uncached(chosen)
+cache savings    = uncached(chosen)  - chosen measured
+net savings      = routing savings + cache savings - classifier overhead
+actual cost      = chosen measured + classifier overhead
 ```
 
-The measured cost of the chosen model is:
+`write_mult` is `1.25` for a five-minute cache and `2.00` for one hour. Classifier tokens are priced at the classifier model's own catalog rates.
 
-```text
-chosen measured = ((I + W × write_multiplier + R × 0.10) / 1,000,000 × Pᵢ(chosen))
-                  + (O / 1,000,000 × Pₒ(chosen))
-```
+#### Privacy and accuracy
 
-The cache write multiplier is `1.25` for a five-minute cache and `2.00` for a one-hour cache. Classifier input and output tokens are priced separately using the classifier model's catalog prices.
+Daily totals and per-model aggregates live in `~/.octopus/insights.json`, written atomically with mode `0600` inside a `0700` directory. The ledger holds dates, model IDs, token totals, request counts, and USD amounts — no prompts, responses, tool definitions, session identifiers, or credentials. Quit Octopus before deleting it to reset history.
 
-The displayed savings components are:
-
-```text
-routing savings = uncached(baseline) - uncached(chosen)
-cache savings = uncached(chosen) - chosen measured
-net savings = routing savings + cache savings - classifier overhead
-actual cost = chosen measured + classifier overhead
-```
-
-Octopus retains negative routing, cache, and net savings. A negative value truthfully indicates that the chosen route, a cache write, or classifier overhead cost more than the baseline for that period.
-
-#### Persistence and privacy
-
-Insights stores daily totals and per-model aggregates in `~/.octopus/insights.json`. The containing `~/.octopus` directory uses mode `0700`; the ledger is atomically replaced with mode `0600`.
-
-The ledger contains no prompts, responses, system instructions, tool definitions, session identifiers, API keys, or other credentials. It contains dates, model IDs, token totals, request counts, and calculated USD amounts. Quit Octopus before manually removing `~/.octopus/insights.json` to reset history.
-
-#### Accuracy and limitations
-
-These figures are estimates, not provider invoices. They depend on current catalog prices and provider-reported usage. Requests without final provider usage are not counted. Changing catalog prices affects future observations only; historical aggregates retain the economics calculated when each request completed.
-
-The counterfactual uses the completed request's measured token quantities for both the chosen and baseline models. A different baseline model might have produced a different number of output tokens in reality. Provider-specific taxes, volume discounts, batch discounts, tiered pricing, and charges not represented by `cost_per_mtok_in` or `cost_per_mtok_out` are outside the calculation.
+These are estimates, not invoices. They use your catalog prices and provider-reported usage, so requests that never report final usage are not counted, and price edits apply only to future observations. The counterfactual also reuses the chosen model's measured token counts for the baseline, which a different model would not have reproduced exactly. Taxes, volume and batch discounts, and tiered pricing are outside the calculation.
 
 ### Provider credentials at launch
 
@@ -330,44 +280,6 @@ Applications opened from Finder do not inherit shell-only exports. For routine F
 ### Remove the app
 
 Quit Octopus, remove `Octopus.app`, and optionally remove `~/.octopus` if you no longer want the configuration and Insights history. Removing `~/.octopus` deletes user data and is not performed by the build or app.
-
-## Claude Code setup
-
-Run Octopus and Claude Code in separate terminals so the upstream provider credential and Claude Code's local gateway token are not confused.
-
-Terminal 1 — start Octopus with the real provider key:
-
-```bash
-cd /path/to/octopus
-export ANTHROPIC_API_KEY="sk-ant-real-provider-key"
-./octopus
-```
-
-Terminal 2 — point Claude Code at Octopus:
-
-```bash
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
-export ANTHROPIC_AUTH_TOKEN="local-octopus"
-claude
-```
-
-`ANTHROPIC_AUTH_TOKEN` can be any non-empty value because Octopus does not authenticate inbound loopback requests. It never forwards this client token: upstream requests are built with credentials from `config.yaml`.
-
-The `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` gateway configuration follows Anthropic's [Claude Code LLM gateway guidance](https://docs.anthropic.com/en/docs/claude-code/llm-gateway).
-
-Claude Code may request a specific model name, but Octopus intentionally treats the inbound model as advisory and selects a catalog model itself.
-
-The model label in Claude Code describes the client-side model name, not necessarily the backend Octopus selected. A launcher can pass `--model octopus` to make that distinction visible; the routed provider and model remain available in Octopus logs and Insights.
-
-### Verify Claude Code prompt caching
-
-1. Enable `routing.session_sticky` and `routing.cache_aware` or omit them to use their `true` defaults.
-2. Start a Claude Code session with a sufficiently large, stable prompt prefix.
-3. Send at least two turns within the cache TTL.
-4. Inspect the Octopus log for `prompt cache usage`.
-5. Confirm a later response reports a positive `cache_read_input_tokens` value.
-
-A zero cache count does not always mean forwarding failed. Providers impose minimum cacheable-prefix sizes, and a new or changed prefix may create a cache before it can be read.
 
 ## Prompt caching
 
@@ -879,6 +791,54 @@ octopus/
 ```
 
 The shared provider abstraction and implementations live in [`github.com/sausheong/harness`](https://github.com/sausheong/harness). Octopus currently requires harness `v0.3.4`.
+
+## Releasing
+
+For maintainers publishing signed builds. Using Octopus requires none of this.
+
+### One-time setup
+
+Install the Developer ID Application and Developer ID Installer certificates in your Keychain, then set:
+
+```bash
+export APPLE_ID="developer@example.com"
+export TEAM_ID="ABCDE12345"
+export APP_SIGN_ID="Developer ID Application: Example Company (ABCDE12345)"
+export PKG_SIGN_ID="Developer ID Installer: Example Company (ABCDE12345)"
+export KEYCHAIN_PROFILE="octopus-notary"
+```
+
+Store the notarization credentials once — Apple prompts for the app-specific password, so it never enters your environment or shell history:
+
+```bash
+make notary-profile
+```
+
+Never commit these values or an app-specific password.
+
+### Build an installer
+
+```bash
+make installer
+```
+
+This builds `Octopus.app`, signs it with the hardened runtime and a trusted timestamp, checks the signing team against `TEAM_ID`, packages it to install into `/Applications`, notarizes and staples the result, and validates it. Output is `dist/Octopus-<version>.pkg`, versioned from `packaging/Info.plist`.
+
+### Publish a release
+
+The worktree must be clean — a tag has to identify one complete commit — and `gh auth status` must succeed.
+
+```bash
+make release v0.2.0
+```
+
+The version must be exactly `vX.Y.Z`; prerelease suffixes are rejected. The target verifies the environment, runs the test suite, bumps `packaging/Info.plist`, pushes the commit and an annotated tag, creates a draft release, builds and notarizes the installer, uploads it, and publishes.
+
+It pushes to `origin`, so check your branch first. The only commit it creates is the version bump; it never sweeps up outstanding work.
+
+**If it fails partway**, the release stays a draft. Fix the problem and run the same command to resume. A published version cannot be overwritten.
+
+Release notes are generated from up to eight recent commit subjects. That is a starting point, not a changelog — edit them afterwards with `gh release edit <tag> --notes-file <file>`.
 
 ## License
 

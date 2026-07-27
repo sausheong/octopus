@@ -323,6 +323,22 @@ Explicit identifiers are hashed before being stored. The in-memory session table
 
 If the sticky model is no longer eligible because of tools, vision, or context size, normal scoring selects another model. A successful fallback becomes the new sticky model.
 
+### Restart behavior
+
+Octopus does not cache prompts itself — caching happens on the provider (e.g. Anthropic), keyed to the exact byte prefix it received. Octopus's own job is to avoid routing a conversation away from the backend holding its warm cache, and to price a routing decision honestly when it might cost a cache write. Both of those depend entirely on the in-memory session table, which is not persisted, so a process restart resets it to empty while any conversation it was tracking keeps going.
+
+The next request in each affected session after a restart is scored without that memory:
+
+- **Sticky affinity is unknown.** `stickyModelForSession` finds no entry, so the request is scored fresh instead of pinned to whichever model it was already using.
+- **Cache fraction is unknown.** `cacheInputMultipliersForSession` has no `CacheUntil`/`CacheFraction` to blend in, so every cache-capable model is scored as if this request needs a full cache write (`1.25×`/`2.00×`), even for the model that actually still holds the warm cache at the provider.
+
+Two outcomes follow, both limited to that one request:
+
+1. Scoring still lands on the same model the conversation was already using. The provider's cache is likely still warm (if within its TTL), so the real bill reflects a cache hit — but Octopus's internal cost/savings accounting for that request overstates the cost, because it assumed a cold write. This is a bookkeeping inaccuracy in Insights, not an extra charge.
+2. Scoring lands on a different model. This is a genuine cache-losing switch — a real cold write at whatever provider is now serving the conversation, no different from any other mid-conversation switch.
+
+Either way, the response from the provider carries real `cache_creation_input_tokens`/`cache_read_input_tokens` usage, and `Router.Observe` repopulates the session table from it immediately after. So the effect of a restart is confined to one request per active session: the process self-corrects from the next turn onward. There is currently no snapshot/restore for the session table (unlike the Insights ledger, which is persisted to disk on every write) — a conversation's sticky/cache state does not survive a restart, only its session identity does, since `SessionID` is a pure deterministic hash of the request and needs no stored state to recompute.
+
 ## Routing behavior
 
 Each request passes through the following pipeline:

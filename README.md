@@ -433,6 +433,14 @@ If every attempted backend fails, Octopus maps rate-limit, overload, invalid-req
 
 If no catalog entry can satisfy the request, the Anthropic endpoint returns an invalid-request error and the OpenAI endpoint returns HTTP `422`.
 
+### Cross-provider tool-call IDs
+
+A routed conversation can move between providers turn to turn — an easy turn on Gemini, a harder one on Claude — and each new backend receives the full prior history, including tool calls and tool results from whichever provider handled earlier turns. That history has to satisfy the *new* backend's own ID rules, not the one that originally produced it.
+
+This matters most for Gemini: its function-call `id` field is optional and frequently absent, particularly for a single non-parallel call. The harness Gemini provider always emits a client-side ID regardless — a random, `toolu_`-shaped identifier when Gemini's own is empty — rather than falling back to the function name. A name-based fallback is not just a formatting mismatch: it is not unique, since a tool called more than once in a conversation (routine for coding agents re-reading files) would collide on the same ID. If that history is later replayed to an Anthropic-shaped backend, duplicate `tool_use` IDs are rejected outright, which used to surface as a hard failure the moment routing moved a tool-using conversation off Gemini.
+
+Practically, this means catalog entries for Gemini can (and should) declare `caps.tools: true`. Marking Gemini as tool-incapable to avoid the collision is not necessary and defeats cross-provider routing for any tool-using session — which, for coding-agent traffic, is effectively all of it.
+
 ## API compatibility
 
 ### Endpoints
@@ -603,6 +611,8 @@ Every entry requires a unique `provider/model` ID. The provider prefix must exis
 `caps.max_output_tokens` is a hard eligibility filter alongside `caps.max_context`: a model whose declared output limit is below the estimated response size is removed before scoring, rather than being discovered at the backend. The estimate is floored at the client's requested `max_tokens` (or `1024` when unset), so a client that habitually requests a generous `max_tokens` it never fills can exclude models that would in practice have coped.
 
 Catalog prices and capabilities are operator-maintained. Keep them synchronized with provider documentation; Octopus does not fetch pricing or model metadata automatically.
+
+Setting `caps.tools: false` on a catalog entry to work around a real or suspected provider incompatibility removes that model from every tool-using request — which, for coding-agent traffic, is effectively all requests. Gemini entries in particular can be declared with `caps.tools: true` safely; see [Cross-provider tool-call IDs](#cross-provider-tool-call-ids).
 
 ## Deployment and security
 

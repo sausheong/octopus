@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -16,6 +17,8 @@ func TestMarshalRoundTrip(t *testing.T) {
 		Strategy: RoutingStrategySticky, DataPolicy: DataPolicyAllowRemote, SessionSticky: true, SessionTTL: 45 * time.Minute,
 		CacheAware: false, MaxAttempts: 5, DefaultRemainingTurns: 7,
 		MinSwitchSavingsUSD: 0.02, MinSwitchSavingsPct: 0.15, SwitchConfidence: 0.75,
+		CostMode: CostModeAbsolute, CostReferenceUSD: 0.10, HighQualityFloor: 0.85, ReasoningBonus: 0.05,
+		WorkflowAffinity: true,
 	}
 	data, err := Marshal(original)
 	if err != nil {
@@ -31,7 +34,7 @@ func TestMarshalRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse marshaled config: %v\n%s", err, data)
 	}
-	if decoded.ServerAddr != original.ServerAddr || decoded.Routing != original.Routing || len(decoded.Catalog) != 1 {
+	if decoded.ServerAddr != original.ServerAddr || !reflect.DeepEqual(decoded.Routing, original.Routing) || len(decoded.Catalog) != 1 {
 		t.Fatalf("round trip mismatch: %#v", decoded)
 	}
 }

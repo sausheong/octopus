@@ -27,6 +27,8 @@ type Router struct {
 	// cachingModels is the set of catalog IDs that support prompt caching,
 	// computed once at build time to avoid per-request Resolve + type assertion.
 	cachingModels map[string]bool
+	background    *BackgroundDetector
+	affinity      *WorkflowAffinityStore
 }
 
 type sessionState struct {
@@ -60,6 +62,15 @@ func NewRouter(cfg *config.Config, reg *registry.Registry) *Router {
 	if cfg.Routing.DataPolicy == "" {
 		cfg.Routing.DataPolicy = config.DataPolicyAllowRemote
 	}
+	if cfg.Routing.CostMode == "" {
+		cfg.Routing.CostMode = config.CostModeAbsolute
+	}
+	if cfg.Routing.CostReferenceUSD <= 0 {
+		cfg.Routing.CostReferenceUSD = 0.10
+	}
+	if cfg.Routing.HighQualityFloor <= 0 {
+		cfg.Routing.HighQualityFloor = HighQualityFloor
+	}
 	caching := make(map[string]bool, len(cfg.Catalog))
 	for _, entry := range cfg.Catalog {
 		prov, _, err := reg.Resolve(entry.ID)
@@ -70,11 +81,30 @@ func NewRouter(cfg *config.Config, reg *registry.Registry) *Router {
 			caching[entry.ID] = true
 		}
 	}
+	var signatures []BackgroundSignature
+	for _, sig := range cfg.Routing.Background.Signatures {
+		model := sig.Model
+		if model == "" {
+			model = cfg.Routing.Background.Model
+		}
+		signatures = append(signatures, BackgroundSignature{
+			Name: sig.Name, Endpoint: sig.Endpoint, LastUserSHA256: sig.LastUserSHA256,
+			RequireNonStreaming:     sig.RequireNonStreaming,
+			ConversationIndependent: sig.ConversationIndependent, Model: model,
+		})
+	}
+	detector, err := NewBackgroundDetector(signatures)
+	if err != nil {
+		slog.Warn("background signatures disabled", "err", err)
+		detector, _ = NewBackgroundDetector(nil)
+	}
 	return &Router{
 		cfg:           cfg,
 		reg:           reg,
 		sessions:      make(map[string]sessionState),
 		cachingModels: caching,
+		background:    detector,
+		affinity:      NewWorkflowAffinityStore(cfg.Routing.SessionTTL, 4096),
 	}
 }
 
@@ -86,11 +116,41 @@ const shortCircuitBytes = 500
 // Route classifies the last genuine user turn, applies request-derived
 // capability cross-checks, scores the catalog, and returns the Decision.
 func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
+	return r.RouteWithMetadata(ctx, chat, RequestMetadata{})
+}
+
+// RouteWithMetadata adds transport and explicit workflow facts without
+// forwarding them to providers.
+func (r *Router) RouteWithMetadata(ctx context.Context, chat llm.ChatRequest, meta RequestMetadata) Decision {
+	var backgroundMatch BackgroundMatch
+	background := false
+	if r.cfg.Routing.Background.Enabled {
+		if match, ok := r.background.Detect(chat, meta); ok {
+			backgroundMatch, background = match, true
+			chat = match.Isolate(chat, meta)
+		}
+	}
+
+	// A valid sticky incumbent makes semantic classification irrelevant. Use a
+	// deterministic profile for fallback ordering and avoid the classifier call.
+	sid := ""
+	if r.cfg.Routing.Strategy != config.RoutingStrategyPerTurn || r.cfg.Routing.CacheAware {
+		sid = SessionID(chat)
+	}
+	stickyFastPath := false
+	if r.cfg.Routing.Strategy == config.RoutingStrategySticky {
+		if incumbent := r.stickyModelForSession(sid); incumbent != "" && r.deterministicallyEligible(chat, incumbent) {
+			stickyFastPath = true
+		}
+	}
 	turn, ok := LastUserTurn(chat.Messages)
 	var prof TaskProfile
 	var classifierUsage *llm.Usage
 	classifierModel := ""
-	if !ok {
+	if stickyFastPath {
+		prof = TrivialProfile()
+		slog.Debug("classifier skipped (eligible sticky incumbent)")
+	} else if !ok {
 		prof = DefaultProfile()
 	} else if isTrivial(chat, turn) {
 		prof = TrivialProfile()
@@ -120,7 +180,7 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 				if r.classifyFn != nil {
 					prof = r.classifyFn(cctx, prov, model, r.cfg.Classifier.MaxTokens, classifierTurn)
 				} else {
-					prof, classifierUsage = classifyWithUsage(cctx, prov, model, r.cfg.Classifier.MaxTokens, classifierTurn)
+					prof, classifierUsage = classifyWithUsageIdentity(cctx, prov, model, r.cfg.Classifier.Model, r.cfg.Classifier.MaxTokens, classifierTurn)
 				}
 			}
 		}
@@ -162,11 +222,6 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 		prof.EstimateConfidence = 0.25
 	}
 
-	// Compute session ID once; reuse for both sticky and cache multipliers.
-	sid := ""
-	if r.cfg.Routing.Strategy != config.RoutingStrategyPerTurn || r.cfg.Routing.CacheAware {
-		sid = SessionID(chat)
-	}
 	var multipliers map[string]float64
 	if r.cfg.Routing.Strategy != config.RoutingStrategyAmortized {
 		multipliers = r.cacheInputMultipliersForSession(chat, sid)
@@ -179,30 +234,62 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 		catalog = r.localCatalog()
 	} else if r.cfg.Routing.DataPolicy == config.DataPolicyPreferLocal {
 		locals := r.localCatalog()
-		if localDecision := ScoreWithInputMultipliers(prof, locals, r.cfg.Weights, multipliers); !localDecision.NoEligible {
+		if localDecision := r.score(prof, locals, multipliers); !localDecision.NoEligible {
 			catalog = locals
 		}
 	}
-	d := ScoreWithInputMultipliers(prof, catalog, r.cfg.Weights, multipliers)
+	d := r.score(prof, catalog, multipliers)
 	d.Strategy = r.cfg.Routing.Strategy
 	d.DataPolicy = r.cfg.Routing.DataPolicy
 	d.RemoteFallbackBlocked = r.cfg.Routing.DataPolicy == config.DataPolicyLocalOnly
 	d.ClassifierModel = classifierModel
 	d.ClassifierUsage = classifierUsage
 	d.MaxAttempts = r.cfg.Routing.MaxAttempts
-	switch r.cfg.Routing.Strategy {
-	case config.RoutingStrategySticky:
-		if sticky := r.stickyModelForSession(sid); sticky != "" {
-			for _, id := range d.Eligible {
-				if id == sticky {
-					d.Chosen = sticky
-					d.Reason = "sticky session affinity"
-					break
+	d.WorkflowID = meta.WorkflowID
+	if background {
+		for _, id := range d.Eligible {
+			if id == backgroundMatch.Model {
+				d.Chosen = id
+				d.Reason = "allowlisted background request"
+				d.Background = true
+				d.BackgroundName = backgroundMatch.Name
+				d.BackgroundConversationIndependent = backgroundMatch.ConversationIndependent
+				d.RoutingSessionID = chat.SessionID
+				break
+			}
+		}
+	}
+	if !d.Background && r.cfg.Routing.WorkflowAffinity && meta.WorkflowID != "" {
+		if _, hasSession := r.sessionSnapshot(sid, time.Now()); !hasSession {
+			if preferred, found := r.affinity.Preferred(meta.WorkflowID); found {
+				for _, id := range d.Eligible {
+					if id == preferred {
+						d.Chosen = preferred
+						d.Reason = "workflow model affinity"
+						d.WorkflowAffinity = true
+						break
+					}
 				}
 			}
 		}
-	case config.RoutingStrategyAmortized:
-		d = r.applyAmortized(chat, sid, d)
+	}
+	if !d.Background {
+		switch r.cfg.Routing.Strategy {
+		case config.RoutingStrategySticky:
+			if sticky := r.stickyModelForSession(sid); sticky != "" {
+				for _, id := range d.Eligible {
+					if id == sticky {
+						d.Chosen = sticky
+						d.Reason = "sticky session affinity"
+						break
+					}
+				}
+			}
+		case config.RoutingStrategyAmortized:
+			if !d.WorkflowAffinity {
+				d = r.applyAmortized(chat, sid, d)
+			}
+		}
 	}
 	// If the profile benefits from reasoning, recommend medium effort. The
 	// server applies it only to candidates that advertise reasoning support.
@@ -222,9 +309,67 @@ func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
 		"needs_vision", d.Profile.NeedsVision,
 		"needs_tools", d.Profile.NeedsTools,
 		"eligible", d.Eligible,
+		"score_breakdowns", d.Breakdowns,
+		"background", d.Background,
+		"workflow_affinity", d.WorkflowAffinity,
 		"switch_economics", d.Economics,
 	)
 	return d
+}
+
+// RequestForDecision applies routing-only transformations that must also be
+// used for the provider call, most importantly removing main-session history
+// from an explicitly conversation-independent background request.
+func RequestForDecision(chat llm.ChatRequest, d Decision) llm.ChatRequest {
+	if d.RoutingSessionID != "" {
+		chat.SessionID = d.RoutingSessionID
+	}
+	if d.Background && d.BackgroundConversationIndependent {
+		if turn, ok := LastUserTurn(chat.Messages); ok {
+			chat.Messages = []llm.Message{turn}
+		}
+		chat.SystemPrompt = ""
+		chat.SystemPromptParts = nil
+		chat.CacheControl = nil
+		chat.CacheLastMessage = false
+	}
+	return chat
+}
+
+func (r *Router) score(prof TaskProfile, catalog []config.CatalogEntry, multipliers map[string]float64) Decision {
+	mode := CostMode(r.cfg.Routing.CostMode)
+	reasoningBonus := r.cfg.Routing.ReasoningBonus
+	d := ScoreWithOptions(prof, catalog, r.cfg.Weights, multipliers, ScoringOptions{
+		CostMode: mode, ReferenceCostUSD: r.cfg.Routing.CostReferenceUSD,
+		QualityFloors:  map[string]float64{"high": r.cfg.Routing.HighQualityFloor},
+		ReasoningBonus: &reasoningBonus,
+	})
+	if mode == CostModeAbsolute {
+		legacy := ScoreWithOptions(prof, catalog, r.cfg.Weights, multipliers, ScoringOptions{
+			CostMode: CostModeRelative, QualityFloors: map[string]float64{"high": r.cfg.Routing.HighQualityFloor},
+			ReasoningBonus: &reasoningBonus,
+		})
+		d.LegacyChosen = legacy.Chosen
+		d.LegacyChanged = legacy.Chosen != "" && legacy.Chosen != d.Chosen
+	}
+	return d
+}
+
+func (r *Router) deterministicallyEligible(chat llm.ChatRequest, model string) bool {
+	prof := TrivialProfile()
+	prof.NeedsVision = requestHasImages(chat)
+	prof.NeedsTools = len(chat.Tools) > 0
+	prof.EstTokensIn = EstimateRequestTokens(chat)
+	prof.EstTokensOut = chat.MaxTokens
+	if prof.EstTokensOut <= 0 {
+		prof.EstTokensOut = 1024
+	}
+	for _, entry := range r.cfg.Catalog {
+		if entry.ID == model {
+			return eligible(prof, entry) && (r.cfg.Routing.DataPolicy != config.DataPolicyLocalOnly || r.cfg.IsLocalModel(model))
+		}
+	}
+	return false
 }
 
 func (r *Router) localCatalog() []config.CatalogEntry {
@@ -404,6 +549,16 @@ func (r *Router) Observe(chat llm.ChatRequest, model string, usage *llm.Usage) {
 	}
 }
 
+// ObserveDecision records a completed routed request using the same isolated
+// identity and explicit workflow metadata used during selection.
+func (r *Router) ObserveDecision(chat llm.ChatRequest, model string, usage *llm.Usage, d Decision) {
+	chat = RequestForDecision(chat, d)
+	r.Observe(chat, model, usage)
+	if !d.Background && r.cfg.Routing.WorkflowAffinity && d.WorkflowID != "" {
+		r.affinity.Remember(d.WorkflowID, model)
+	}
+}
+
 func cloneSessionState(state sessionState) sessionState {
 	if state.Models == nil {
 		return state
@@ -531,7 +686,7 @@ func requestHasImages(chat llm.ChatRequest) bool {
 // (incumbent/cache forecasts, sticky affinity, or cache-aware per-turn scoring).
 // When false the server can skip the wrapper goroutine entirely.
 func (r *Router) NeedsObservation() bool {
-	return r.cfg.Routing.Strategy != config.RoutingStrategyPerTurn || r.cfg.Routing.CacheAware
+	return r.cfg.Routing.Strategy != config.RoutingStrategyPerTurn || r.cfg.Routing.CacheAware || r.cfg.Routing.WorkflowAffinity
 }
 
 // SetClassifier overrides the classification function (test seam).

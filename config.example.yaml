@@ -41,6 +41,21 @@ routing:
   min_switch_savings_usd: 0.01
   min_switch_savings_pct: 0.10
   switch_confidence: 0.60
+  # Absolute scoring compares the estimated USD request cost with a stable
+  # reference. "relative" retains the legacy eligible-set comparison.
+  cost_mode: "absolute"
+  cost_reference_usd: 0.10
+  high_quality_floor: 0.85
+  reasoning_bonus: 0.05
+  # Clients may group independent subagent sessions using
+  # X-Octopus-Workflow-ID. Cache identities remain separate.
+  workflow_affinity: true
+  # Background routing is deliberately disabled until exact client request
+  # hashes have been observed and allowlisted in Advanced YAML.
+  background:
+    enabled: false
+    model: "deepseek/deepseek-v4-flash"
+    signatures: []
   # Maximum backends one request may try before giving up. Every failure
   # consumes an attempt except a malformed request and a cancelled request,
   # which stop immediately. Defaults to 3 when omitted.

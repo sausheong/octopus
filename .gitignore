@@ -1,6 +1,7 @@
 
 # Local environment-specific config (use config.example.yaml as template)
 config.yaml
+config.backup.yaml
 
 # Provider credential env files (never track)
 .deepseek-env
@@ -16,6 +17,10 @@ go.work.sum
 /octopus
 /llmrouter
 /dist/
+/octopus-eval/
+/octopus-eval.tgz
 .DS_Store
 __pycache__/
 *.pyc
+config.backup.yaml
+octopus-eval.tgz

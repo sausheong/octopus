@@ -63,6 +63,13 @@ function renderState() {
   setValue("#min-switch-savings-usd", doc.routing.min_switch_savings_usd ?? 0.01);
   setValue("#min-switch-savings-pct", doc.routing.min_switch_savings_pct ?? 0.10);
   setValue("#switch-confidence", doc.routing.switch_confidence ?? 0.60);
+  setValue("#cost-mode", doc.routing.cost_mode || "absolute");
+  setValue("#cost-reference-usd", doc.routing.cost_reference_usd || 0.10);
+  setValue("#high-quality-floor", doc.routing.high_quality_floor || 0.85);
+  setValue("#reasoning-bonus", doc.routing.reasoning_bonus ?? 0.05);
+  setChecked("#workflow-affinity", doc.routing.workflow_affinity ?? true);
+  setChecked("#background-enabled", doc.routing.background?.enabled || false);
+  setValue("#background-model", doc.routing.background?.model || "");
   toggleRoutingStrategy();
   setChecked("#classifier-enabled", doc.classifier_enabled);
   setValue("#classifier-model", doc.classifier.model);
@@ -135,11 +142,35 @@ function renderInsights(report) {
   $("#insight-classifier-cost").textContent = formatMoney(-Number(summary.classifier_overhead_usd || 0));
   $("#insight-cache-hit").textContent = formatPercent(summary.cache_hit_percent);
   $("#insight-switch-count").textContent = `${formatInteger(summary.amortized_switches)} of ${formatInteger(summary.amortized_decisions)} decisions`;
+  const classifierCache = report.classifier_cache || {};
+  $("#insight-classifier-cache").textContent = `${formatInteger(classifierCache.hits || 0)} hits, ${formatInteger(classifierCache.coalesced || 0)} shared`;
   $("#insights-methodology").textContent = report.methodology || "";
   renderInsightsChart(report.days || []);
   renderInsightModels(report.models || []);
-  renderRoutingEconomics(report.routing_decisions || []);
+  const decisions = report.routing_decisions || [];
+  renderRoutingEconomics(decisions.filter(item => item.incumbent && item.candidate));
+  renderWhyModels(decisions);
   if (report.last_error) showNotice(report.last_error, false);
+}
+
+function renderWhyModels(decisions) {
+  const body = $("#why-model-body");
+  const empty = $("#why-model-empty");
+  body.replaceChildren();
+  empty.classList.toggle("is-hidden", decisions.length !== 0);
+  decisions.slice(0, 50).forEach(item => {
+    const row = document.createElement("tr");
+    const detail = item.breakdowns?.[item.actual_model] || {};
+    const contributions = `Q ${Number(detail.quality_contribution || 0).toFixed(3)} · C ${Number(detail.cost_contribution || 0).toFixed(3)} · S ${Number(detail.speed_contribution || 0).toFixed(3)}`;
+    const flags = [item.background ? `background: ${item.background_name || "matched"}` : "", item.workflow_affinity ? "workflow affinity" : "", item.legacy_changed ? `legacy chose ${shortModel(item.legacy_chosen)}` : ""].filter(Boolean).join(" · ");
+    [shortModel(item.actual_model), item.reason || item.decision || "routed", item.cost_mode || "relative", contributions, flags || "—"].forEach((value, index) => {
+      const cell = document.createElement(index === 0 ? "th" : "td");
+      if (index === 0) cell.scope = "row";
+      cell.textContent = value;
+      row.append(cell);
+    });
+    body.append(row);
+  });
 }
 
 function renderRoutingEconomics(decisions) {
@@ -404,6 +435,16 @@ function collectDocument() {
       min_switch_savings_usd: numberValue("#min-switch-savings-usd"),
       min_switch_savings_pct: numberValue("#min-switch-savings-pct"),
       switch_confidence: numberValue("#switch-confidence"),
+      cost_mode: $("#cost-mode").value,
+      cost_reference_usd: numberValue("#cost-reference-usd"),
+      high_quality_floor: numberValue("#high-quality-floor"),
+      reasoning_bonus: numberValue("#reasoning-bonus"),
+      workflow_affinity: $("#workflow-affinity").checked,
+      background: {
+        enabled: $("#background-enabled").checked,
+        model: $("#background-model").value.trim(),
+        signatures: state.document.routing.background?.signatures || [],
+      },
     },
     providers,
     catalog,

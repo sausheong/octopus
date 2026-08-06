@@ -2,6 +2,8 @@ package router
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"strings"
 
@@ -21,6 +23,10 @@ Read the user's request and respond with ONLY a JSON object (no prose, no code f
 - "estimate_confidence": number from 0 to 1 expressing confidence in that turn estimate
 Respond with the JSON object only.`
 
+// classifierCacheVersion is deliberately independent of the Octopus release.
+// Bump it whenever classifier semantics change without changing the prompt.
+const classifierCacheVersion = "1"
+
 // Classify runs the fixed classifier model on the given user turn and returns
 // the parsed TaskProfile. Any failure (provider error, empty output,
 // unparseable JSON) yields DefaultProfile() — a classifier hiccup must never
@@ -31,6 +37,18 @@ func Classify(ctx context.Context, prov llm.LLMProvider, model string, maxTokens
 }
 
 func classifyWithUsage(ctx context.Context, prov llm.LLMProvider, model string, maxTokens int, turn llm.Message) (TaskProfile, *llm.Usage) {
+	return classifyWithUsageIdentity(ctx, prov, model, model, maxTokens, turn)
+}
+
+func classifyWithUsageIdentity(ctx context.Context, prov llm.LLMProvider, providerModel, cacheModelID string, maxTokens int, turn llm.Message) (TaskProfile, *llm.Usage) {
+	key := classifierMemoKey(cacheModelID, maxTokens, turn)
+	profile, usage, _ := processClassifierCache.do(ctx, key, func(loadCtx context.Context) (TaskProfile, *llm.Usage, bool) {
+		return runClassifier(loadCtx, prov, providerModel, maxTokens, turn)
+	})
+	return profile, usage
+}
+
+func runClassifier(ctx context.Context, prov llm.LLMProvider, model string, maxTokens int, turn llm.Message) (TaskProfile, *llm.Usage, bool) {
 	req := llm.ChatRequest{
 		Model:        model,
 		MaxTokens:    maxTokens,
@@ -39,7 +57,7 @@ func classifyWithUsage(ctx context.Context, prov llm.LLMProvider, model string, 
 	}
 	ch, err := prov.ChatStream(ctx, req)
 	if err != nil {
-		return DefaultProfile(), nil
+		return DefaultProfile(), nil, false
 	}
 	var sb strings.Builder
 	var usage *llm.Usage
@@ -50,14 +68,35 @@ func classifyWithUsage(ctx context.Context, prov llm.LLMProvider, model string, 
 		case llm.EventDone:
 			usage = ev.Usage
 		case llm.EventError:
-			return DefaultProfile(), usage
+			return DefaultProfile(), usage, false
 		}
 	}
 	prof, ok := parseProfile(sb.String())
 	if !ok {
-		return DefaultProfile(), usage
+		return DefaultProfile(), usage, false
 	}
-	return prof, usage
+	return prof, usage, true
+}
+
+// classifierMemoKey hashes the exact logical classifier request. The cache
+// retains only this digest, never model input or prompt text.
+func classifierMemoKey(model string, maxTokens int, turn llm.Message) string {
+	h := sha256.New()
+	writeHashField := func(value string) {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+		_, _ = h.Write(size[:])
+		_, _ = h.Write([]byte(value))
+	}
+	writeHashField(classifierCacheVersion)
+	writeHashField(classifierSystemPrompt)
+	writeHashField(model)
+	writeHashField(turn.Role)
+	writeHashField(turn.Content)
+	var tokens [8]byte
+	binary.BigEndian.PutUint64(tokens[:], uint64(maxTokens))
+	_, _ = h.Write(tokens[:])
+	return string(h.Sum(nil))
 }
 
 // rawProfile is the wire type for classifier JSON — pointer fields let us

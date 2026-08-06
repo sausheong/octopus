@@ -40,6 +40,9 @@ func TestDocumentCarriesEveryConfigField(t *testing.T) {
 			SessionTTL: 42 * time.Minute, CacheAware: true, MaxAttempts: 7,
 			DefaultRemainingTurns: 9, MinSwitchSavingsUSD: 0.023,
 			MinSwitchSavingsPct: 0.17, SwitchConfidence: 0.73,
+			CostMode: config.CostModeAbsolute, CostReferenceUSD: 0.123, HighQualityFloor: 0.87, ReasoningBonus: 0.07,
+			WorkflowAffinity: true,
+			Background:       config.BackgroundCfg{Enabled: true, Model: "p/m", Signatures: []config.BackgroundSignatureCfg{{Name: "ping", Endpoint: "/v1/messages", LastUserSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RequireNonStreaming: true, ConversationIndependent: true}}},
 		},
 		Providers: map[string]config.ProviderCreds{
 			// APIKey is set here even though a committed config should use
@@ -83,7 +86,7 @@ func TestDocumentCarriesEveryConfigField(t *testing.T) {
 	if back.AuthTokenEnv != full.AuthTokenEnv {
 		t.Errorf("AuthTokenEnv: got %q, want %q", back.AuthTokenEnv, full.AuthTokenEnv)
 	}
-	if back.Routing != full.Routing {
+	if !reflect.DeepEqual(back.Routing, full.Routing) {
 		t.Errorf("Routing: got %+v, want %+v", back.Routing, full.Routing)
 	}
 	if back.Classifier != full.Classifier {

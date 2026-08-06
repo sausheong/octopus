@@ -77,13 +77,14 @@ type ModelAggregate struct {
 
 // Report is the range-filtered API view used by Settings.
 type Report struct {
-	RangeDays        int               `json:"range_days"`
-	Summary          Summary           `json:"summary"`
-	Days             []DayPoint        `json:"days"`
-	Models           []ModelSummary    `json:"models"`
-	RoutingDecisions []RoutingDecision `json:"routing_decisions"`
-	Methodology      string            `json:"methodology"`
-	LastError        string            `json:"last_error,omitempty"`
+	RangeDays        int                         `json:"range_days"`
+	Summary          Summary                     `json:"summary"`
+	Days             []DayPoint                  `json:"days"`
+	Models           []ModelSummary              `json:"models"`
+	RoutingDecisions []RoutingDecision           `json:"routing_decisions"`
+	Methodology      string                      `json:"methodology"`
+	LastError        string                      `json:"last_error,omitempty"`
+	ClassifierCache  router.ClassifierCacheStats `json:"classifier_cache"`
 }
 
 type Summary struct {
@@ -109,22 +110,30 @@ type Summary struct {
 // RoutingDecision is the prompt-free audit trail behind the Switch economics
 // table. It records forecasts and actual cache-token outcomes only.
 type RoutingDecision struct {
-	Timestamp              time.Time `json:"timestamp"`
-	Strategy               string    `json:"strategy"`
-	ActualModel            string    `json:"actual_model"`
-	Incumbent              string    `json:"incumbent"`
-	Candidate              string    `json:"candidate"`
-	Decision               string    `json:"decision"`
-	ExpectedTurnsIncumbent int       `json:"expected_turns_incumbent"`
-	ExpectedTurnsCandidate int       `json:"expected_turns_candidate"`
-	Confidence             float64   `json:"confidence"`
-	StayCostUSD            float64   `json:"stay_cost_usd"`
-	SwitchCostUSD          float64   `json:"switch_cost_usd"`
-	EstimatedSavingsUSD    float64   `json:"estimated_savings_usd"`
-	BreakEvenTurns         float64   `json:"break_even_turns,omitempty"`
-	CandidateCacheWarm     bool      `json:"candidate_cache_warm"`
-	CacheCreationTokens    int       `json:"cache_creation_tokens"`
-	CacheReadTokens        int       `json:"cache_read_tokens"`
+	Timestamp              time.Time                            `json:"timestamp"`
+	Strategy               string                               `json:"strategy"`
+	ActualModel            string                               `json:"actual_model"`
+	Incumbent              string                               `json:"incumbent"`
+	Candidate              string                               `json:"candidate"`
+	Decision               string                               `json:"decision"`
+	ExpectedTurnsIncumbent int                                  `json:"expected_turns_incumbent"`
+	ExpectedTurnsCandidate int                                  `json:"expected_turns_candidate"`
+	Confidence             float64                              `json:"confidence"`
+	StayCostUSD            float64                              `json:"stay_cost_usd"`
+	SwitchCostUSD          float64                              `json:"switch_cost_usd"`
+	EstimatedSavingsUSD    float64                              `json:"estimated_savings_usd"`
+	BreakEvenTurns         float64                              `json:"break_even_turns,omitempty"`
+	CandidateCacheWarm     bool                                 `json:"candidate_cache_warm"`
+	CacheCreationTokens    int                                  `json:"cache_creation_tokens"`
+	CacheReadTokens        int                                  `json:"cache_read_tokens"`
+	Reason                 string                               `json:"reason"`
+	CostMode               router.CostMode                      `json:"cost_mode,omitempty"`
+	Breakdowns             map[string]router.CandidateBreakdown `json:"breakdowns,omitempty"`
+	Background             bool                                 `json:"background,omitempty"`
+	BackgroundName         string                               `json:"background_name,omitempty"`
+	WorkflowAffinity       bool                                 `json:"workflow_affinity,omitempty"`
+	LegacyChosen           string                               `json:"legacy_chosen,omitempty"`
+	LegacyChanged          bool                                 `json:"legacy_changed,omitempty"`
 }
 
 type DayPoint struct {
@@ -203,24 +212,30 @@ func (t *Tracker) Record(observation Observation) {
 	day.CacheSavingsUSD += calculation.cacheSavings
 	day.ClassifierOverheadUSD += calculation.classifierOverhead
 	day.NetSavingsUSD += calculation.netSavings
+	recent := RoutingDecision{
+		Timestamp: t.now(), Strategy: observation.Decision.Strategy, ActualModel: observation.Model,
+		Decision: observation.Decision.Reason, Reason: observation.Decision.Reason,
+		CostMode: observation.Decision.CostMode, Breakdowns: observation.Decision.Breakdowns,
+		Background: observation.Decision.Background, BackgroundName: observation.Decision.BackgroundName,
+		WorkflowAffinity: observation.Decision.WorkflowAffinity,
+		LegacyChosen:     observation.Decision.LegacyChosen, LegacyChanged: observation.Decision.LegacyChanged,
+		CacheCreationTokens: calculation.cacheCreationTokens, CacheReadTokens: calculation.cacheReadTokens,
+	}
 	if economics := observation.Decision.Economics; economics != nil {
 		day.AmortizedDecisions++
 		if economics.Decision == "switch" {
 			day.AmortizedSwitches++
 		}
 		day.ForecastSavingsUSD += economics.EstimatedSavingsUSD
-		t.ledger.RecentDecisions = append(t.ledger.RecentDecisions, RoutingDecision{
-			Timestamp: t.now(), Strategy: observation.Decision.Strategy, ActualModel: observation.Model,
-			Incumbent: economics.Incumbent, Candidate: economics.Candidate, Decision: economics.Decision,
-			ExpectedTurnsIncumbent: economics.ExpectedTurnsIncumbent, ExpectedTurnsCandidate: economics.ExpectedTurnsCandidate,
-			Confidence: economics.Confidence, StayCostUSD: economics.StayCostUSD, SwitchCostUSD: economics.SwitchCostUSD,
-			EstimatedSavingsUSD: economics.EstimatedSavingsUSD, BreakEvenTurns: economics.BreakEvenTurns,
-			CandidateCacheWarm:  economics.CandidateCacheWarm,
-			CacheCreationTokens: calculation.cacheCreationTokens, CacheReadTokens: calculation.cacheReadTokens,
-		})
-		if len(t.ledger.RecentDecisions) > maxRecentDecisions {
-			t.ledger.RecentDecisions = append([]RoutingDecision(nil), t.ledger.RecentDecisions[len(t.ledger.RecentDecisions)-maxRecentDecisions:]...)
-		}
+		recent.Incumbent, recent.Candidate, recent.Decision = economics.Incumbent, economics.Candidate, economics.Decision
+		recent.ExpectedTurnsIncumbent, recent.ExpectedTurnsCandidate = economics.ExpectedTurnsIncumbent, economics.ExpectedTurnsCandidate
+		recent.Confidence, recent.StayCostUSD, recent.SwitchCostUSD = economics.Confidence, economics.StayCostUSD, economics.SwitchCostUSD
+		recent.EstimatedSavingsUSD, recent.BreakEvenTurns = economics.EstimatedSavingsUSD, economics.BreakEvenTurns
+		recent.CandidateCacheWarm = economics.CandidateCacheWarm
+	}
+	t.ledger.RecentDecisions = append(t.ledger.RecentDecisions, recent)
+	if len(t.ledger.RecentDecisions) > maxRecentDecisions {
+		t.ledger.RecentDecisions = append([]RoutingDecision(nil), t.ledger.RecentDecisions[len(t.ledger.RecentDecisions)-maxRecentDecisions:]...)
 	}
 	model := day.Models[observation.Model]
 	if model == nil {
@@ -331,7 +346,8 @@ func (t *Tracker) Report(days int) Report {
 		Days:      make([]DayPoint, 0, days),
 		Methodology: "Quality-baseline savings compare each completed request with the highest-quality eligible catalog model at uncached list price. " +
 			"Actual cost uses provider-reported tokens, configured model prices, prompt-cache read/write multipliers, and classifier overhead.",
-		LastError: t.lastErr,
+		LastError:       t.lastErr,
+		ClassifierCache: router.CurrentClassifierCacheStats(),
 	}
 	today := dateOnly(t.now())
 	start := today.AddDate(0, 0, -(days - 1))

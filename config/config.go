@@ -4,6 +4,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"net"
@@ -142,6 +144,11 @@ const (
 	ProviderLocationRemote = "remote"
 )
 
+const (
+	CostModeRelative = "relative"
+	CostModeAbsolute = "absolute"
+)
+
 // RoutingCfg controls conversation affinity and cache-aware request pricing.
 type RoutingCfg struct {
 	// Strategy selects hard affinity, greedy per-turn scoring, or a
@@ -159,9 +166,35 @@ type RoutingCfg struct {
 	MinSwitchSavingsUSD   float64       `yaml:"min_switch_savings_usd"`
 	MinSwitchSavingsPct   float64       `yaml:"min_switch_savings_pct"`
 	SwitchConfidence      float64       `yaml:"switch_confidence"`
+	// CostMode controls whether request cost is scored relative to the current
+	// eligible set or against a stable dollar reference. Absolute is the
+	// recommended mode; relative remains available for compatibility.
+	CostMode         string        `yaml:"cost_mode"`
+	CostReferenceUSD float64       `yaml:"cost_reference_usd"`
+	HighQualityFloor float64       `yaml:"high_quality_floor"`
+	ReasoningBonus   float64       `yaml:"reasoning_bonus"`
+	WorkflowAffinity bool          `yaml:"workflow_affinity"`
+	Background       BackgroundCfg `yaml:"background"`
 	// MaxAttempts bounds how many backends one request may try. Without it,
 	// worst-case latency and spend grow with catalog size.
 	MaxAttempts int `yaml:"max_attempts"`
+}
+
+// BackgroundCfg enables only explicitly allowlisted, conversation-independent
+// maintenance requests. Signatures contain hashes, never raw client prompts.
+type BackgroundCfg struct {
+	Enabled    bool                     `yaml:"enabled" json:"enabled"`
+	Model      string                   `yaml:"model" json:"model"`
+	Signatures []BackgroundSignatureCfg `yaml:"signatures,omitempty" json:"signatures,omitempty"`
+}
+
+type BackgroundSignatureCfg struct {
+	Name                    string `yaml:"name" json:"name"`
+	Endpoint                string `yaml:"endpoint" json:"endpoint"`
+	LastUserSHA256          string `yaml:"last_user_sha256" json:"last_user_sha256"`
+	RequireNonStreaming     bool   `yaml:"require_non_streaming" json:"require_non_streaming"`
+	ConversationIndependent bool   `yaml:"conversation_independent" json:"conversation_independent"`
+	Model                   string `yaml:"model,omitempty" json:"model,omitempty"`
 }
 
 // Config is the full router configuration.
@@ -226,6 +259,12 @@ type yamlRoutingCfg struct {
 	MinSwitchSavingsUSD   *float64      `yaml:"min_switch_savings_usd"`
 	MinSwitchSavingsPct   *float64      `yaml:"min_switch_savings_pct"`
 	SwitchConfidence      *float64      `yaml:"switch_confidence"`
+	CostMode              string        `yaml:"cost_mode,omitempty"`
+	CostReferenceUSD      *float64      `yaml:"cost_reference_usd,omitempty"`
+	HighQualityFloor      *float64      `yaml:"high_quality_floor,omitempty"`
+	ReasoningBonus        *float64      `yaml:"reasoning_bonus,omitempty"`
+	WorkflowAffinity      *bool         `yaml:"workflow_affinity,omitempty"`
+	Background            BackgroundCfg `yaml:"background,omitempty"`
 }
 
 // Load reads, parses, and validates the config at path.
@@ -288,6 +327,26 @@ func Parse(data []byte) (*Config, error) {
 	if yc.Routing.SwitchConfidence != nil {
 		switchConfidence = *yc.Routing.SwitchConfidence
 	}
+	costMode := yc.Routing.CostMode
+	if costMode == "" {
+		costMode = CostModeAbsolute
+	}
+	costReferenceUSD := 0.10
+	if yc.Routing.CostReferenceUSD != nil {
+		costReferenceUSD = *yc.Routing.CostReferenceUSD
+	}
+	highQualityFloor := 0.85
+	if yc.Routing.HighQualityFloor != nil {
+		highQualityFloor = *yc.Routing.HighQualityFloor
+	}
+	reasoningBonus := 0.05
+	if yc.Routing.ReasoningBonus != nil {
+		reasoningBonus = *yc.Routing.ReasoningBonus
+	}
+	workflowAffinity := true
+	if yc.Routing.WorkflowAffinity != nil {
+		workflowAffinity = *yc.Routing.WorkflowAffinity
+	}
 	c := &Config{
 		ServerAddr:   yc.Server.Addr,
 		AuthTokenEnv: yc.Server.AuthTokenEnv,
@@ -304,6 +363,12 @@ func Parse(data []byte) (*Config, error) {
 			MinSwitchSavingsUSD:   minSwitchSavingsUSD,
 			MinSwitchSavingsPct:   minSwitchSavingsPct,
 			SwitchConfidence:      switchConfidence,
+			CostMode:              costMode,
+			CostReferenceUSD:      costReferenceUSD,
+			HighQualityFloor:      highQualityFloor,
+			ReasoningBonus:        reasoningBonus,
+			WorkflowAffinity:      workflowAffinity,
+			Background:            yc.Routing.Background,
 		},
 		DefaultModel: yc.DefaultModel,
 		Providers:    yc.Providers,
@@ -336,6 +401,12 @@ func Marshal(c *Config) ([]byte, error) {
 			MinSwitchSavingsUSD:   &copyCfg.Routing.MinSwitchSavingsUSD,
 			MinSwitchSavingsPct:   &copyCfg.Routing.MinSwitchSavingsPct,
 			SwitchConfidence:      &copyCfg.Routing.SwitchConfidence,
+			CostMode:              copyCfg.Routing.CostMode,
+			CostReferenceUSD:      &copyCfg.Routing.CostReferenceUSD,
+			HighQualityFloor:      &copyCfg.Routing.HighQualityFloor,
+			ReasoningBonus:        &copyCfg.Routing.ReasoningBonus,
+			WorkflowAffinity:      &copyCfg.Routing.WorkflowAffinity,
+			Background:            copyCfg.Routing.Background,
 		},
 		DefaultModel: copyCfg.DefaultModel,
 		Providers:    copyCfg.Providers,
@@ -427,6 +498,73 @@ func (c *Config) Validate() error {
 	}
 	if !finite(c.Routing.SwitchConfidence) || c.Routing.SwitchConfidence < 0 || c.Routing.SwitchConfidence > 1 {
 		return fmt.Errorf("routing.switch_confidence must be in [0,1]")
+	}
+	if c.Routing.CostMode == "" {
+		c.Routing.CostMode = CostModeAbsolute
+	}
+	if c.Routing.CostMode != CostModeAbsolute && c.Routing.CostMode != CostModeRelative {
+		return fmt.Errorf("routing.cost_mode must be absolute or relative")
+	}
+	if c.Routing.CostReferenceUSD == 0 {
+		c.Routing.CostReferenceUSD = 0.10
+	}
+	if !finite(c.Routing.CostReferenceUSD) || c.Routing.CostReferenceUSD <= 0 {
+		return fmt.Errorf("routing.cost_reference_usd must be a finite positive number")
+	}
+	if c.Routing.HighQualityFloor == 0 {
+		c.Routing.HighQualityFloor = 0.85
+	}
+	if !finite(c.Routing.HighQualityFloor) || c.Routing.HighQualityFloor < 0 || c.Routing.HighQualityFloor > 1 {
+		return fmt.Errorf("routing.high_quality_floor must be in [0,1]")
+	}
+	if !finite(c.Routing.ReasoningBonus) || c.Routing.ReasoningBonus < 0 || c.Routing.ReasoningBonus > 1 {
+		return fmt.Errorf("routing.reasoning_bonus must be in [0,1]")
+	}
+	if c.Routing.Background.Enabled && c.Routing.Background.Model == "" {
+		return fmt.Errorf("routing.background.model is required when background routing is enabled")
+	}
+	if c.Routing.Background.Enabled && c.Routing.Background.Model != "" {
+		found := false
+		for _, entry := range c.Catalog {
+			if entry.ID == c.Routing.Background.Model {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("routing.background.model %q is not in catalog", c.Routing.Background.Model)
+		}
+	}
+	seenBackground := make(map[string]struct{}, len(c.Routing.Background.Signatures))
+	for _, sig := range c.Routing.Background.Signatures {
+		if strings.TrimSpace(sig.Name) == "" || strings.TrimSpace(sig.Endpoint) == "" {
+			return fmt.Errorf("routing.background signature name and endpoint are required")
+		}
+		digest := strings.TrimSpace(sig.LastUserSHA256)
+		decoded, err := hex.DecodeString(digest)
+		if err != nil || len(decoded) != sha256.Size {
+			return fmt.Errorf("routing.background signature %q must contain a SHA-256 digest", sig.Name)
+		}
+		if !sig.ConversationIndependent {
+			return fmt.Errorf("routing.background signature %q must explicitly be conversation_independent", sig.Name)
+		}
+		if sig.Model != "" {
+			found := false
+			for _, entry := range c.Catalog {
+				if entry.ID == sig.Model {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("routing.background signature %q model %q is not in catalog", sig.Name, sig.Model)
+			}
+		}
+		key := strings.TrimSuffix(sig.Endpoint, "/") + "\x00" + strings.ToLower(digest)
+		if _, exists := seenBackground[key]; exists {
+			return fmt.Errorf("routing.background contains a duplicate signature")
+		}
+		seenBackground[key] = struct{}{}
 	}
 	if c.Routing.MaxAttempts < 0 {
 		return fmt.Errorf("routing.max_attempts must not be negative")

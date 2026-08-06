@@ -2,12 +2,15 @@
 
 ![Octopus logo](octopus.png)
 
-Octopus is a local LLM routing gateway for coding agents and OpenAI-compatible applications. It exposes Anthropic and OpenAI APIs on one loopback-only server, classifies each request, filters models by capability and context size, and chooses a backend using configurable quality, cost, speed, and cost-to-completion policies.
+Octopus is a model dispatcher that runs on your computer. Your AI application talks to Octopus instead of talking directly to Claude, Gemini, OpenAI, Qwen, or a local model. Octopus examines each request, removes models that cannot do the job, estimates the likely cost of finishing it, and sends it to the most suitable model left.
 
-It is designed to work particularly well with Claude Code: Anthropic prompt-cache markers are preserved end to end, routing accounts for each backend's warm or cold cache, and cache creation/read usage is included in responses, logs, and Insights.
+The aim is practical: use an expensive model when its extra ability is useful, use a cheaper model when it is good enough, and avoid changing models when rebuilding a large prompt cache would cost more than the switch saves. Octopus does not make models cheaper, shorten prompts, or know the future. It makes a configurable decision from the information available at that moment.
+
+Octopus works especially well with Claude Code. It preserves Anthropic prompt-cache instructions, tracks which model probably has a reusable cache, keeps separate state for parallel subagents, and shows the actual routed model and estimated savings in Insights. The model name displayed by Claude Code is the name Claude Code requested; use Octopus logs or Insights to see which model actually answered.
 
 ## Contents
 
+- [How Octopus works](#how-octopus-works)
 - [Quick start](#quick-start)
 - [Using Octopus](#using-octopus)
   - [Claude Code](#claude-code)
@@ -15,7 +18,7 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
   - [Other clients](#other-clients)
 - [macOS menu bar app](#macos-menu-bar-app)
 - [Prompt caching](#prompt-caching)
-- [Routing behavior](#routing-behavior)
+- [Routing details](#routing-details)
 - [API compatibility](#api-compatibility)
 - [Configuration reference](#configuration-reference)
 - [Deployment and security](#deployment-and-security)
@@ -41,6 +44,80 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
 - Tool calls, parallel tool results, images, streaming usage, and refusal propagation.
 - Loopback-only binding, bounded request bodies, transport timeouts, and graceful shutdown.
 - Native macOS menu-bar app with structured settings, an Advanced YAML editor, and immediate validated reloads.
+
+## How Octopus works
+
+Think of Octopus as a taxi dispatcher for AI models. The client says what it needs, Octopus checks which cars can handle the trip, estimates the cost and likely result, then sends the job to one of them. The client continues using the same Anthropic- or OpenAI-shaped API; Octopus handles the provider differences behind it.
+
+```text
+Claude Code, Codex, or another client
+                  |
+                  v
+             Octopus
+        understand the request
+        remove unsuitable models
+        compare quality, cost, and speed
+        account for reusable prompt caches
+                  |
+        +---------+---------+----------+
+        v         v         v          v
+      Claude    Gemini    OpenAI    local model
+```
+
+### Six useful ideas
+
+- A **provider** is the service that runs a model, such as Anthropic, Google, OpenAI, or Ollama.
+- The **catalogue** is your list of available models. For each model, you describe its price, quality, speed, context window, and abilities such as tools, images, and reasoning.
+- The **classifier** is a small, optional model call that labels a new task as trivial, low, medium, or high difficulty and estimates its size. Obvious trivial requests can skip this call entirely.
+- A **session** is one conversation. Octopus remembers the model currently serving it, called the incumbent, so follow-up turns are judged with the right history.
+- A **prompt cache** is a provider-side reusable copy of the long, unchanged beginning of a conversation. Reading it can be much cheaper than sending and processing that text again.
+- A **routing strategy** controls whether Octopus may change the incumbent and how it decides whether a change is worthwhile.
+
+### What happens to a request
+
+1. **The client calls Octopus.** Claude Code normally uses the Anthropic-compatible endpoint; other applications can use the OpenAI-compatible endpoint.
+2. **Octopus checks the request.** It rejects malformed or oversized requests before they reach a provider. The model name supplied by the client is a request label, not proof of which backend will be used.
+3. **It identifies the conversation.** An explicit `X-Octopus-Session-ID` is best. Without one, Octopus derives a private identifier from the opening conversation material. Giving each subagent a distinct session ID keeps its history and cache separate.
+4. **It recognises declared background traffic.** Exact, allowlisted, conversation-independent maintenance pings can go to a cheap model in an isolated session. Octopus does not assume every short request is a ping. For a recognised ping, it removes the main conversation history and cache markers before sending the provider request, so the ping does not pay to load the full working conversation.
+5. **It estimates the job.** A new task may be classified for difficulty, tool use, image use, reasoning, and likely input/output size. Identical classifier inputs are briefly cached, so parallel repeats do not pay for the same classification again. If classification fails, Octopus uses conservative defaults rather than blocking the main request.
+6. **It removes models that cannot do the work.** A model is ineligible if it lacks a required ability, cannot fit the context or expected answer, or violates the configured local-only privacy policy.
+7. **It compares the eligible models.** Quality, estimated dollar cost, speed, and reasoning support contribute to a weighted score. The default cost calculation uses actual catalogue prices rather than merely comparing every model with the cheapest model in the current set.
+8. **It considers the rest of the task, not only this turn.** Under the default `amortized` strategy, Octopus estimates how many turns remain. It changes models only when the expected saving across those turns is large and credible enough to repay any cold-cache cost.
+9. **It translates and sends the request.** Octopus converts the common request into the selected provider's wire format while preserving supported tools, images, reasoning blocks, and cache instructions.
+10. **It handles safe failures.** If a provider fails before any response bytes are sent, Octopus can try the next eligible model. Once a streamed response has begun, it cannot silently swap providers without corrupting the response.
+11. **It learns from the result.** Provider-reported token and cache usage updates the session forecast. Logs and Insights record the routed model, estimated cost, alternative cost, cache outcome, and estimated saving without storing prompt or response text.
+
+### Why staying can be cheaper than switching
+
+Suppose a long conversation is already cached on Model A. Model B may have a lower price per token, but its first turn must usually process and cache the whole conversation again. Octopus therefore compares:
+
+```text
+stay cost   = the remaining turns on Model A using its warm cache
+switch cost = one cold/cache-write turn on Model B
+              + later turns on Model B using its warm cache
+```
+
+If the task is almost finished, staying may be cheaper. If several turns remain, the lower price of Model B may repay the one-off switch cost. This is an estimate: Octopus cannot know exactly how many turns the task will take or whether one model will solve it in fewer turns than another.
+
+The three strategies make different trade-offs:
+
+| Strategy | Plain-English behaviour |
+|---|---|
+| `amortized` | Default. Switch only when the predicted whole-task saving repays the cache change and clears the configured confidence and saving thresholds. |
+| `sticky` | Keep the first successful model for the session while it remains capable. Simple and cache-friendly, but it does not reconsider price or quality on normal follow-ups. |
+| `per_turn` | Score every turn independently. Responsive to changes, but more likely to move between models and rebuild caches. |
+
+For example, a short question with no tools may skip classification and go to a fast, inexpensive model. A difficult coding request can exclude models without tool support and apply the high-difficulty quality floor. A long conversation may remain on its current model even when another model is cheaper per token, because the one-off cache rebuild would not be recovered before the task ends.
+
+The weights express influence, not hard commands. Raising the quality weight makes quality matter more, but does not guarantee that the highest-quality model wins; cost, speed, eligibility, the task forecast, and an existing warm cache can still change the result. Use `routing.high_quality_floor` when lower-quality models should be excluded from high-difficulty work.
+
+### Parallel subagents
+
+Each subagent conversation with a distinct session ID gets its own incumbent and cache state. This prevents one subagent from pretending it owns another's cache. A client may also send the same `X-Octopus-Workflow-ID` for related subagents. Octopus can then prefer a model that has worked well for that workflow, while still keeping each conversation's cache accounting separate.
+
+### What Octopus cannot know
+
+Octopus works from configured model ratings, prices, request shape, provider usage, and recent session history. It cannot inspect the future, guarantee that the cheapest model will finish in the same number of turns, or turn estimated Insights savings into an exact provider invoice. Good routing still depends on keeping the catalogue and prices realistic.
 
 ## Quick start
 
@@ -220,6 +297,7 @@ The menu contains exactly two items:
 2. **Quit Octopus** stops the router and settings server, then exits.
 
 There is no Dock icon and no application-window menu. The settings server binds to a random loopback port and is available only while Octopus is running.
+
 ### Settings and live reload
 
 The app always reads and writes `~/.octopus/config.yaml`. If the file does not exist, Settings opens with safe defaults; the file is created on the first successful save. The containing directory is created with mode `0700` and the file is written atomically with mode `0600`.
@@ -290,7 +368,9 @@ Quit Octopus, remove `Octopus.app`, and optionally remove `~/.octopus` if you no
 
 ## Prompt caching
 
-Octopus preserves cache metadata rather than regenerating it. For Anthropic-shaped requests it supports:
+A long AI conversation repeatedly sends much of the same text: system instructions, tool definitions, and earlier messages. Some providers can keep that stable beginning in a temporary prompt cache. The first use costs more because the provider creates the cache; later reads can cost much less.
+
+Octopus does not store that provider cache itself. It passes the client's cache instructions through, remembers the cache usage reported by the provider, and uses that evidence when deciding whether staying or switching is cheaper. For Anthropic-shaped requests it supports:
 
 - Top-level `cache_control` for automatic caching.
 - Individual system text block markers without flattening the system array.
@@ -346,7 +426,9 @@ Two outcomes follow, both limited to that one request:
 
 Either way, the response carries real `cache_creation_input_tokens`/`cache_read_input_tokens` usage, and `Router.Observe` immediately repopulates the incumbent and that model's cache state. The effect is therefore confined to the first post-restart request for an active session. There is no snapshot/restore for the session table; only the deterministic session identity survives independently of process memory.
 
-## Routing behavior
+## Routing details
+
+The earlier [How Octopus works](#how-octopus-works) section gives the everyday mental model. This section records the exact routing rules for operators who need to tune or troubleshoot them.
 
 Each request passes through the following pipeline:
 
@@ -410,18 +492,26 @@ Models are first filtered by hard requirements:
 - Enough context for estimated input plus output.
 - An output limit, when `caps.max_output_tokens` declares one, at least as large as the estimated response.
 
-For high-difficulty tasks, models below the `0.85` quality floor are removed when at least one otherwise-eligible model clears the floor. This floor never empties the eligible set by itself.
+For high-difficulty tasks, models below `routing.high_quality_floor` are removed when at least one otherwise-eligible model clears the floor. This floor never empties the eligible set by itself.
 
 Remaining models receive a normalized weighted score:
 
 ```text
-quality × normalized_quality
-+ cost × normalized_cost_efficiency
-+ speed × normalized_speed
+quality × quality_utility
++ cost × cost_utility
++ speed × speed_utility
 + optional reasoning preference
 ```
 
-Weights need not sum to one; Octopus normalizes them. Free models receive the maximum cost-efficiency score. Catalog order is the deterministic tie-breaker.
+Weights need not sum to one; Octopus normalizes them. In the default `absolute` mode, catalogue quality and speed remain on their declared `0..1` scales and request cost uses `1 / (1 + estimated_cost_usd / cost_reference_usd)`. This makes one model's score stable when an unrelated model enters or leaves the eligible set. `relative` preserves the earlier catalogue-relative normalization. Catalogue order is the deterministic tie-breaker.
+
+Classifier results are cached in memory for five minutes in a bounded 1,024-entry LRU and concurrent identical classifications are coalesced. Keys are SHA-256 digests over the exact classifier input and prompt version; prompt text is not retained. Sticky follow-ups skip classification entirely while their incumbent remains deterministically eligible.
+
+### Background requests and subagent workflows
+
+Octopus does not treat every small, non-streaming, tool-free request as a background ping. Such a request can still be a genuine user turn. Background routing matches only entries in `routing.background.signatures`, using the endpoint and SHA-256 digest of the exact final user text. Tools, tool traffic, images, streaming mismatches, or a signature not explicitly marked `conversation_independent` prevent a match. A matched request receives an isolated routing session and cannot replace or refresh the main conversation's incumbent/cache record.
+
+Independent Claude Code subagents can share placement preference by sending the same `X-Octopus-Workflow-ID`. Octopus remembers only a hash-to-model preference after a successful request. Each subagent retains its own session ID and prompt-cache state; workflow affinity never treats one conversation's cache as another's.
 
 ### Routing strategies and amortisation
 
@@ -593,6 +683,12 @@ The section is optional; these defaults are applied when it is omitted.
 | `min_switch_savings_usd` | `0.01` | Minimum absolute forecast saving required to switch. |
 | `min_switch_savings_pct` | `0.10` | Minimum forecast saving as a fraction of incumbent stay cost, `0..1`. |
 | `switch_confidence` | `0.60` | Minimum turn-estimate confidence required to switch, `0..1`. |
+| `cost_mode` | `absolute` | Stable `absolute` dollar utility or legacy eligible-set-relative scoring. |
+| `cost_reference_usd` | `0.10` | Request cost at which absolute cost utility is `0.5`. Must be positive. |
+| `high_quality_floor` | `0.85` | Quality floor for high-difficulty requests when at least one model clears it. |
+| `reasoning_bonus` | `0.05` | Explicit preference for eligible models with native reasoning; `0` disables it. |
+| `workflow_affinity` | `true` | Prefer the last successful eligible model for sessions sharing an explicit `X-Octopus-Workflow-ID`; caches remain independent. |
+| `background` | disabled | Exact SHA-256 allowlist for conversation-independent maintenance requests. |
 | `max_attempts` | `3` | Maximum backends one request may try. Every failure consumes an attempt except a malformed request and a cancelled request, which stop immediately. Must not be negative; `0` is treated as omitted. |
 
 Legacy files using `session_sticky: true` are translated to `strategy: sticky`; `false` becomes `strategy: per_turn`. When both fields are present, the explicit `strategy` takes precedence. Settings rewrites saved files using `strategy`.

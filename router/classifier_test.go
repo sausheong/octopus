@@ -7,6 +7,12 @@ import (
 	"github.com/sausheong/harness/llm"
 )
 
+func isolateClassifierCache(t *testing.T) {
+	t.Helper()
+	processClassifierCache.reset()
+	t.Cleanup(processClassifierCache.reset)
+}
+
 // fakeProvider returns a scripted stream for ChatStream.
 type fakeProvider struct {
 	text    string
@@ -30,6 +36,7 @@ func (f *fakeProvider) ChatStream(ctx context.Context, req llm.ChatRequest) (<-c
 }
 
 func TestClassifyWithUsageReturnsClassifierOverhead(t *testing.T) {
+	isolateClassifierCache(t)
 	want := &llm.Usage{InputTokens: 120, OutputTokens: 18}
 	p := &fakeProvider{
 		text:  `{"difficulty":"low","needs_reasoning":false,"needs_vision":false,"needs_tools":false,"est_tokens_in":50,"est_tokens_out":100,"domain":"qa","expected_remaining_turns":3,"estimate_confidence":0.8}`,
@@ -46,6 +53,7 @@ type errString2 string
 func (e errString2) Error() string { return string(e) }
 
 func TestClassifyParsesJSON(t *testing.T) {
+	isolateClassifierCache(t)
 	p := &fakeProvider{text: `{"difficulty":"high","needs_reasoning":true,"needs_vision":false,"needs_tools":false,"est_tokens_in":1200,"est_tokens_out":800,"domain":"code","expected_remaining_turns":6,"estimate_confidence":0.9}`}
 	prof := Classify(context.Background(), p, "anthropic/haiku", 256, llm.Message{Role: "user", Content: "refactor this"})
 	if prof.Difficulty != "high" || !prof.NeedsReasoning || prof.Domain != "code" {
@@ -60,6 +68,7 @@ func TestClassifyParsesJSON(t *testing.T) {
 }
 
 func TestClassifyJSONWithPreamble(t *testing.T) {
+	isolateClassifierCache(t)
 	// Model wraps complete JSON in prose; extractor should find the object.
 	full := `{"difficulty":"low","needs_reasoning":false,"needs_vision":false,"needs_tools":false,"est_tokens_in":50,"est_tokens_out":100,"domain":"qa","expected_remaining_turns":2,"estimate_confidence":0.7}`
 	p := &fakeProvider{text: "Here is the classification:\n" + full + "\nDone."}
@@ -70,6 +79,7 @@ func TestClassifyJSONWithPreamble(t *testing.T) {
 }
 
 func TestClassifyIncompleteJSONFallsBack(t *testing.T) {
+	isolateClassifierCache(t)
 	// Partial JSON (missing required fields) must fall back to DefaultProfile.
 	p := &fakeProvider{text: `{"difficulty":"low","domain":"qa"}`}
 	prof := Classify(context.Background(), p, "m", 256, llm.Message{Role: "user", Content: "hi"})
@@ -79,6 +89,7 @@ func TestClassifyIncompleteJSONFallsBack(t *testing.T) {
 }
 
 func TestClassifyFallbackOnProviderError(t *testing.T) {
+	isolateClassifierCache(t)
 	p := &fakeProvider{failNew: true}
 	prof := Classify(context.Background(), p, "m", 256, llm.Message{Role: "user", Content: "hi"})
 	def := DefaultProfile()
@@ -88,6 +99,7 @@ func TestClassifyFallbackOnProviderError(t *testing.T) {
 }
 
 func TestClassifyFallbackOnGarbage(t *testing.T) {
+	isolateClassifierCache(t)
 	p := &fakeProvider{text: "no json here at all"}
 	prof := Classify(context.Background(), p, "m", 256, llm.Message{Role: "user", Content: "hi"})
 	if prof != DefaultProfile() {

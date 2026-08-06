@@ -1,6 +1,7 @@
 package router
 
 import (
+	"math"
 	"sort"
 
 	"github.com/sausheong/harness/llm"
@@ -13,6 +14,54 @@ import (
 // quality alone. This keeps hard tasks on capable models without a fragile
 // score penalty that cheap+fast models can overwhelm.
 const HighQualityFloor = 0.85
+
+// CostMode controls how request cost is converted to a score. Relative keeps
+// the historical catalogue-relative behaviour. Absolute uses a stable dollar
+// reference, so unrelated catalogue changes cannot alter a model's utility.
+type CostMode string
+
+const (
+	CostModeRelative CostMode = "relative"
+	CostModeAbsolute CostMode = "absolute"
+)
+
+// ScoringOptions provides an opt-in path to stable, dollar-aware scoring while
+// preserving the existing Score APIs. Its zero value selects legacy scoring.
+type ScoringOptions struct {
+	CostMode         CostMode
+	ReferenceCostUSD float64
+	QualityFloors    map[string]float64
+	ReasoningBonus   *float64
+}
+
+// AbsoluteScoringOptions returns conservative defaults for stable scoring.
+func AbsoluteScoringOptions() ScoringOptions {
+	return ScoringOptions{
+		CostMode:         CostModeAbsolute,
+		ReferenceCostUSD: 0.10,
+		QualityFloors:    map[string]float64{"high": HighQualityFloor},
+	}
+}
+
+// CandidateBreakdown is safe to log: it contains catalogue values and numeric
+// scoring inputs, but no prompt, response, API key, or session identifier.
+type CandidateBreakdown struct {
+	ModelID              string   `json:"model_id"`
+	Eligible             bool     `json:"eligible"`
+	RejectionReasons     []string `json:"rejection_reasons,omitempty"`
+	RequestCostUSD       float64  `json:"request_cost_usd"`
+	InputPriceMultiplier float64  `json:"input_price_multiplier"`
+	QualityRaw           float64  `json:"quality_raw"`
+	QualityUtility       float64  `json:"quality_utility"`
+	CostUtility          float64  `json:"cost_utility"`
+	SpeedRaw             float64  `json:"speed_raw"`
+	SpeedUtility         float64  `json:"speed_utility"`
+	QualityContribution  float64  `json:"quality_contribution"`
+	CostContribution     float64  `json:"cost_contribution"`
+	SpeedContribution    float64  `json:"speed_contribution"`
+	ReasoningBonus       float64  `json:"reasoning_bonus"`
+	TotalScore           float64  `json:"total_score"`
+}
 
 // Decision is the structured record of one routing choice. Logged per request.
 type Decision struct {
@@ -39,6 +88,19 @@ type Decision struct {
 	// for initial, sticky, and ordinary per-turn choices.
 	Strategy  string
 	Economics *SwitchEconomics
+	// Breakdowns explains both rejected and scored catalogue candidates.
+	Breakdowns                        map[string]CandidateBreakdown `json:"breakdowns,omitempty"`
+	CostMode                          CostMode                      `json:"cost_mode,omitempty"`
+	Background                        bool                          `json:"background,omitempty"`
+	BackgroundName                    string                        `json:"background_name,omitempty"`
+	BackgroundConversationIndependent bool                          `json:"-"`
+	WorkflowAffinity                  bool                          `json:"workflow_affinity,omitempty"`
+	// RoutingSessionID is internal metadata used to isolate an allowlisted
+	// background request from the main conversation's incumbent/cache state.
+	RoutingSessionID string `json:"-"`
+	WorkflowID       string `json:"-"`
+	LegacyChosen     string `json:"legacy_chosen,omitempty"`
+	LegacyChanged    bool   `json:"legacy_changed,omitempty"`
 }
 
 // SwitchEconomics is safe to log and persist: it contains model IDs and
@@ -65,22 +127,27 @@ type SwitchEconomics struct {
 // satisfies every capability the profile requires and can hold the estimated
 // token footprint.
 func eligible(p TaskProfile, e config.CatalogEntry) bool {
+	return len(eligibilityReasons(p, e)) == 0
+}
+
+func eligibilityReasons(p TaskProfile, e config.CatalogEntry) []string {
+	var reasons []string
 	if p.NeedsVision && !e.Caps.Vision {
-		return false
+		reasons = append(reasons, "vision capability required")
 	}
 	if p.NeedsTools && !e.Caps.Tools {
-		return false
+		reasons = append(reasons, "tool capability required")
 	}
 	if p.EstTokensIn+p.EstTokensOut > e.Caps.MaxContext {
-		return false
+		reasons = append(reasons, "estimated tokens exceed context limit")
 	}
 	// A model whose output limit is below the expected response would reject
 	// the request outright, so filter it out here rather than discovering it
 	// at the backend. Zero means the catalog entry declares no output limit.
 	if e.Caps.MaxOutputTokens > 0 && p.EstTokensOut > e.Caps.MaxOutputTokens {
-		return false
+		reasons = append(reasons, "estimated output exceeds output limit")
 	}
-	return true
+	return reasons
 }
 
 func reqCostWithInputMultiplier(p TaskProfile, e config.CatalogEntry, inputMultiplier float64) float64 {
@@ -121,22 +188,54 @@ func Score(p TaskProfile, catalog []config.CatalogEntry, w config.Weights) Decis
 // ScoreWithInputMultipliers applies per-model input-token price multipliers.
 // Missing entries use ordinary uncached pricing (1x).
 func ScoreWithInputMultipliers(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, multipliers map[string]float64) Decision {
+	return ScoreWithOptions(p, catalog, w, multipliers, ScoringOptions{})
+}
+
+// ScoreWithOptions scores candidates with explicit policy options. This is the
+// integration point for configuration-backed absolute scoring.
+func ScoreWithOptions(p TaskProfile, catalog []config.CatalogEntry, w config.Weights, multipliers map[string]float64, opts ScoringOptions) Decision {
+	mode := opts.CostMode
+	if mode == "" {
+		mode = CostModeRelative
+	}
+	if mode != CostModeRelative && mode != CostModeAbsolute {
+		mode = CostModeRelative
+	}
+	breakdowns := make(map[string]CandidateBreakdown, len(catalog))
 	var elig []config.CatalogEntry
 	for _, e := range catalog {
-		if eligible(p, e) {
+		multiplier := inputMultiplier(e.ID, multipliers)
+		b := CandidateBreakdown{
+			ModelID: e.ID, QualityRaw: e.Quality, SpeedRaw: e.Speed,
+			InputPriceMultiplier: multiplier,
+			RequestCostUSD:       reqCostWithInputMultiplier(p, e, multiplier),
+		}
+		b.RejectionReasons = eligibilityReasons(p, e)
+		b.Eligible = len(b.RejectionReasons) == 0
+		breakdowns[e.ID] = b
+		if b.Eligible {
 			elig = append(elig, e)
 		}
 	}
 	// High-difficulty quality floor, applied as a filter only when it leaves
 	// at least one model standing — never empties the set on quality alone.
-	if p.Difficulty == "high" {
+	floor, applyFloor := qualityFloor(p.Difficulty, opts)
+	if applyFloor {
 		var aboveFloor []config.CatalogEntry
 		for _, e := range elig {
-			if e.Quality >= HighQualityFloor {
+			if e.Quality >= floor {
 				aboveFloor = append(aboveFloor, e)
 			}
 		}
 		if len(aboveFloor) > 0 {
+			for _, e := range elig {
+				if e.Quality < floor {
+					b := breakdowns[e.ID]
+					b.Eligible = false
+					b.RejectionReasons = append(b.RejectionReasons, "below quality floor")
+					breakdowns[e.ID] = b
+				}
+			}
 			elig = aboveFloor
 		}
 	}
@@ -149,6 +248,8 @@ func ScoreWithInputMultipliers(p TaskProfile, catalog []config.CatalogEntry, w c
 			Weights:    w,
 			Reason:     "no eligible model",
 			NoEligible: true,
+			Breakdowns: breakdowns,
+			CostMode:   mode,
 		}
 	}
 
@@ -161,14 +262,13 @@ func ScoreWithInputMultipliers(p TaskProfile, catalog []config.CatalogEntry, w c
 	speeds := make([]float64, len(elig))
 	var paidInvCosts []float64
 	paidIdx := make([]int, 0, len(elig))
+	requestCosts := make([]float64, len(elig))
 	for i, e := range elig {
 		qualities[i] = e.Quality
 		speeds[i] = e.Speed
-		multiplier := multipliers[e.ID]
-		if multiplier == 0 {
-			multiplier = 1
-		}
+		multiplier := inputMultiplier(e.ID, multipliers)
 		c := reqCostWithInputMultiplier(p, e, multiplier)
+		requestCosts[i] = c
 		if c > 0 {
 			paidInvCosts = append(paidInvCosts, 1/c)
 			paidIdx = append(paidIdx, i)
@@ -181,26 +281,38 @@ func ScoreWithInputMultipliers(p TaskProfile, catalog []config.CatalogEntry, w c
 	// cheapest paid model in the cost dimension alone. 0.5 means a free model
 	// needs at least half the cost weight less in other dimensions to win,
 	// which is a meaningful preference without completely overriding quality.
-	const maxPaidNorm = 0.5
-	if len(paidInvCosts) > 0 {
-		normed := normalize(paidInvCosts)
-		for k, i := range paidIdx {
-			costScores[i] = normed[k] * maxPaidNorm
+	if mode == CostModeAbsolute {
+		reference := opts.ReferenceCostUSD
+		if reference <= 0 || math.IsNaN(reference) || math.IsInf(reference, 0) {
+			reference = 0.10
 		}
-	}
-	for i := range elig {
-		// Free model: cost score is 1.0, beating every paid model.
-		multiplier := multipliers[elig[i].ID]
-		if multiplier == 0 {
-			multiplier = 1
+		for i, cost := range requestCosts {
+			costScores[i] = 1 / (1 + cost/reference)
 		}
-		if costScores[i] == 0 && reqCostWithInputMultiplier(p, elig[i], multiplier) <= 0 {
-			costScores[i] = 1.0
+	} else {
+		const maxPaidNorm = 0.5
+		if len(paidInvCosts) > 0 {
+			normed := normalize(paidInvCosts)
+			for k, i := range paidIdx {
+				costScores[i] = normed[k] * maxPaidNorm
+			}
+		}
+		for i := range elig {
+			if costScores[i] == 0 && requestCosts[i] <= 0 {
+				costScores[i] = 1.0
+			}
 		}
 	}
 	qn := normalize(qualities)
 	cn := costScores // already in [0,1] — free=1.0, paid in [0,0.99]
 	sn := normalize(speeds)
+	if mode == CostModeAbsolute {
+		// Quality and speed are catalogue values on a stable 0..1 scale.
+		for i := range elig {
+			qn[i] = clamp01(qualities[i])
+			sn[i] = clamp01(speeds[i])
+		}
+	}
 
 	wsum := w.Quality + w.Cost + w.Speed
 	if wsum == 0 {
@@ -213,13 +325,23 @@ func ScoreWithInputMultipliers(p TaskProfile, catalog []config.CatalogEntry, w c
 	bestIdx := 0
 	bestScore := -1.0
 	for i, e := range elig {
-		s := wq*qn[i] + wc*cn[i] + ws*sn[i]
+		qc, cc, sc := wq*qn[i], wc*cn[i], ws*sn[i]
+		s := qc + cc + sc
 		// Keep this bonus deliberately modest. It breaks otherwise close choices
 		// in favour of native reasoning without making that optional feature
 		// outweigh the configured quality/cost/speed policy.
+		bonus := reasoningBonus(opts)
 		if p.NeedsReasoning && e.Caps.Reasoning {
-			s += 0.1
+			s += bonus
 		}
+		b := breakdowns[e.ID]
+		b.QualityUtility, b.CostUtility, b.SpeedUtility = qn[i], cn[i], sn[i]
+		b.QualityContribution, b.CostContribution, b.SpeedContribution = qc, cc, sc
+		if p.NeedsReasoning && e.Caps.Reasoning {
+			b.ReasoningBonus = bonus
+		}
+		b.TotalScore = s
+		breakdowns[e.ID] = b
 		scores[e.ID] = s
 		eligIDs[i] = e.ID
 		// Strictly greater keeps the earliest (catalog-order) entry on ties.
@@ -237,11 +359,49 @@ func ScoreWithInputMultipliers(p TaskProfile, catalog []config.CatalogEntry, w c
 	})
 
 	return Decision{
-		Chosen:   elig[bestIdx].ID,
-		Profile:  p,
-		Eligible: eligIDs,
-		Scores:   scores,
-		Weights:  w,
-		Reason:   "highest balanced score",
+		Chosen:     elig[bestIdx].ID,
+		Profile:    p,
+		Eligible:   eligIDs,
+		Scores:     scores,
+		Weights:    w,
+		Reason:     "highest balanced score",
+		Breakdowns: breakdowns,
+		CostMode:   mode,
 	}
+}
+
+func inputMultiplier(modelID string, multipliers map[string]float64) float64 {
+	m := multipliers[modelID]
+	if m <= 0 || math.IsNaN(m) || math.IsInf(m, 0) {
+		return 1
+	}
+	return m
+}
+
+func qualityFloor(difficulty string, opts ScoringOptions) (float64, bool) {
+	if opts.QualityFloors != nil {
+		floor, ok := opts.QualityFloors[difficulty]
+		return floor, ok && floor > 0
+	}
+	if difficulty == "high" {
+		return HighQualityFloor, true
+	}
+	return 0, false
+}
+
+func reasoningBonus(opts ScoringOptions) float64 {
+	if opts.ReasoningBonus != nil {
+		return *opts.ReasoningBonus
+	}
+	return 0.1
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
 }

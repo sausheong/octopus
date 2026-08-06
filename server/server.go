@@ -323,7 +323,7 @@ func (s *Server) observeEvents(chat llm.ChatRequest, model string, decision rout
 		for ev := range in {
 			if ev.Type == llm.EventDone {
 				if s.rt != nil && s.rt.NeedsObservation() {
-					s.rt.Observe(chat, model, ev.Usage)
+					s.rt.ObserveDecision(chat, model, ev.Usage, decision)
 				}
 				if s.usageObserver != nil && ev.Usage != nil {
 					s.usageObserver(insights.Observation{
@@ -461,7 +461,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	dec := s.rt.Route(ctx, dr.Chat)
+	dec := s.rt.RouteWithMetadata(ctx, dr.Chat, router.RequestMetadata{
+		Endpoint: "/v1/messages", Stream: dr.Stream, WorkflowID: r.Header.Get(router.WorkflowIDHeader),
+	})
+	dr.Chat = router.RequestForDecision(dr.Chat, dec)
 
 	if dec.NoEligible {
 		writeError(w, anthropicio.NewAPIError("invalid_request", noEligibleMessage(dec)))
@@ -539,7 +542,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	chat.Messages = msgs
 
 	ctx := r.Context()
-	dec := s.rt.Route(ctx, chat)
+	dec := s.rt.RouteWithMetadata(ctx, chat, router.RequestMetadata{
+		Endpoint: "/v1/chat/completions", Stream: stream, WorkflowID: r.Header.Get(router.WorkflowIDHeader),
+	})
+	chat = router.RequestForDecision(chat, dec)
 
 	if dec.NoEligible {
 		writeOAIError(w, http.StatusUnprocessableEntity, "invalid_request_error", noEligibleMessage(dec))

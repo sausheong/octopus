@@ -30,15 +30,21 @@ type ClassifierDocument struct {
 }
 
 type RoutingDocument struct {
-	Strategy              string  `json:"strategy"`
-	DataPolicy            string  `json:"data_policy"`
-	SessionTTL            string  `json:"session_ttl"`
-	CacheAware            bool    `json:"cache_aware"`
-	MaxAttempts           int     `json:"max_attempts"`
-	DefaultRemainingTurns int     `json:"default_remaining_turns"`
-	MinSwitchSavingsUSD   float64 `json:"min_switch_savings_usd"`
-	MinSwitchSavingsPct   float64 `json:"min_switch_savings_pct"`
-	SwitchConfidence      float64 `json:"switch_confidence"`
+	Strategy              string               `json:"strategy"`
+	DataPolicy            string               `json:"data_policy"`
+	SessionTTL            string               `json:"session_ttl"`
+	CacheAware            bool                 `json:"cache_aware"`
+	MaxAttempts           int                  `json:"max_attempts"`
+	DefaultRemainingTurns int                  `json:"default_remaining_turns"`
+	MinSwitchSavingsUSD   float64              `json:"min_switch_savings_usd"`
+	MinSwitchSavingsPct   float64              `json:"min_switch_savings_pct"`
+	SwitchConfidence      float64              `json:"switch_confidence"`
+	CostMode              string               `json:"cost_mode"`
+	CostReferenceUSD      float64              `json:"cost_reference_usd"`
+	HighQualityFloor      float64              `json:"high_quality_floor"`
+	ReasoningBonus        float64              `json:"reasoning_bonus"`
+	WorkflowAffinity      bool                 `json:"workflow_affinity"`
+	Background            config.BackgroundCfg `json:"background"`
 }
 
 type ProviderDocument struct {
@@ -68,6 +74,8 @@ func defaultDocument() Document {
 			Strategy: config.RoutingStrategyAmortized, DataPolicy: config.DataPolicyAllowRemote,
 			SessionTTL: "1h", CacheAware: true, MaxAttempts: 3,
 			DefaultRemainingTurns: 4, MinSwitchSavingsUSD: 0.01, MinSwitchSavingsPct: 0.10, SwitchConfidence: 0.60,
+			CostMode: config.CostModeAbsolute, CostReferenceUSD: 0.10, HighQualityFloor: 0.85, ReasoningBonus: 0.05,
+			WorkflowAffinity: true,
 		},
 		Providers: []ProviderDocument{{
 			Name: "anthropic", Kind: "anthropic", Location: config.ProviderLocationRemote, APIKeyEnv: "ANTHROPIC_API_KEY",
@@ -95,6 +103,12 @@ func documentFromConfig(cfg *config.Config) Document {
 			MinSwitchSavingsUSD:   cfg.Routing.MinSwitchSavingsUSD,
 			MinSwitchSavingsPct:   cfg.Routing.MinSwitchSavingsPct,
 			SwitchConfidence:      cfg.Routing.SwitchConfidence,
+			CostMode:              cfg.Routing.CostMode,
+			CostReferenceUSD:      cfg.Routing.CostReferenceUSD,
+			HighQualityFloor:      cfg.Routing.HighQualityFloor,
+			ReasoningBonus:        cfg.Routing.ReasoningBonus,
+			WorkflowAffinity:      cfg.Routing.WorkflowAffinity,
+			Background:            cfg.Routing.Background,
 		},
 		Catalog: make([]CatalogDocument, 0, len(cfg.Catalog)),
 	}
@@ -129,6 +143,10 @@ func (d Document) config() (*config.Config, error) {
 			MaxAttempts: d.Routing.MaxAttempts, DefaultRemainingTurns: d.Routing.DefaultRemainingTurns,
 			MinSwitchSavingsUSD: d.Routing.MinSwitchSavingsUSD, MinSwitchSavingsPct: d.Routing.MinSwitchSavingsPct,
 			SwitchConfidence: d.Routing.SwitchConfidence,
+			CostMode:         d.Routing.CostMode, CostReferenceUSD: d.Routing.CostReferenceUSD,
+			HighQualityFloor: d.Routing.HighQualityFloor,
+			ReasoningBonus:   d.Routing.ReasoningBonus,
+			WorkflowAffinity: d.Routing.WorkflowAffinity, Background: d.Routing.Background,
 		},
 		Providers: make(map[string]config.ProviderCreds, len(d.Providers)),
 		Catalog:   make([]config.CatalogEntry, 0, len(d.Catalog)),

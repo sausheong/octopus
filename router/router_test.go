@@ -42,6 +42,63 @@ func TestRouteKeepsStickySessionOnSuccessfulModel(t *testing.T) {
 	}
 }
 
+func TestStickyFollowUpSkipsClassifierWhenIncumbentIsDeterministicallyEligible(t *testing.T) {
+	cfg := testCfg()
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	chat := llm.ChatRequest{SessionID: "sticky-fast", MaxTokens: 10, Messages: []llm.Message{{Role: "user", Content: strings.Repeat("x", 600)}}}
+	r.Observe(chat, "anthropic/opus", &llm.Usage{})
+	calls := 0
+	r.SetClassifier(func(context.Context, llm.LLMProvider, string, int, llm.Message) TaskProfile {
+		calls++
+		return DefaultProfile()
+	})
+	d := r.Route(context.Background(), chat)
+	if calls != 0 || d.Chosen != "anthropic/opus" || d.Reason != "sticky session affinity" {
+		t.Fatalf("calls=%d decision=%+v", calls, d)
+	}
+}
+
+func TestBackgroundObservationDoesNotReplaceMainIncumbent(t *testing.T) {
+	cfg := testCfg()
+	sig := ExactBackgroundSignature("claude-ping", "/v1/messages", "status ping")
+	cfg.Routing.Background = config.BackgroundCfg{Enabled: true, Model: "anthropic/haiku", Signatures: []config.BackgroundSignatureCfg{{
+		Name: sig.Name, Endpoint: sig.Endpoint, LastUserSHA256: sig.LastUserSHA256,
+		RequireNonStreaming: true, ConversationIndependent: true,
+	}}}
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	chat := llm.ChatRequest{SessionID: "main", MaxTokens: 10, Messages: []llm.Message{{Role: "user", Content: "status ping"}}}
+	r.Observe(chat, "anthropic/opus", &llm.Usage{})
+	d := r.RouteWithMetadata(context.Background(), chat, RequestMetadata{Endpoint: "/v1/messages", Stream: false})
+	if !d.Background || d.Chosen != "anthropic/haiku" || !strings.HasPrefix(d.RoutingSessionID, "background:") {
+		t.Fatalf("background decision=%+v", d)
+	}
+	r.ObserveDecision(chat, "anthropic/haiku", &llm.Usage{}, d)
+	ordinary := r.Route(context.Background(), chat)
+	if ordinary.Chosen != "anthropic/opus" || ordinary.Reason != "sticky session affinity" {
+		t.Fatalf("main incumbent was replaced: %+v", ordinary)
+	}
+}
+
+func TestWorkflowAffinityKeepsSessionsSeparateButPrefersSuccessfulModel(t *testing.T) {
+	cfg := testCfg()
+	cfg.Routing.WorkflowAffinity = true
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	first := llm.ChatRequest{SessionID: "subagent-1", MaxTokens: 10, Messages: []llm.Message{{Role: "user", Content: "first"}}}
+	firstDecision := r.RouteWithMetadata(context.Background(), first, RequestMetadata{WorkflowID: "workflow-1"})
+	r.ObserveDecision(first, "anthropic/opus", &llm.Usage{}, firstDecision)
+	second := llm.ChatRequest{SessionID: "subagent-2", MaxTokens: 10, Messages: []llm.Message{{Role: "user", Content: "second"}}}
+	d := r.RouteWithMetadata(context.Background(), second, RequestMetadata{WorkflowID: "workflow-1"})
+	if d.Chosen != "anthropic/opus" || !d.WorkflowAffinity {
+		t.Fatalf("workflow affinity decision=%+v", d)
+	}
+	if SessionID(first) == SessionID(second) {
+		t.Fatal("workflow affinity must not merge session/cache identities")
+	}
+}
+
 func placementCfg(policy string) *config.Config {
 	return &config.Config{
 		ServerAddr: "127.0.0.1:8787",

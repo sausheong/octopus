@@ -125,6 +125,7 @@
                 <div class="savings-row"><span>Quality-baseline savings</span><strong id="insight-routing-savings">$0.00</strong></div>
                 <div class="savings-row"><span>Prompt caching</span><strong id="insight-cache-savings">$0.00</strong></div>
                 <div class="savings-row"><span>Classifier overhead</span><strong id="insight-classifier-cost">$0.00</strong></div>
+                <div class="savings-row"><span>Classifier cache</span><strong id="insight-classifier-cache">0 hits</strong></div>
                 <div class="savings-row"><span>Cache hit rate</span><strong id="insight-cache-hit">0%</strong></div>
                 <div class="savings-row"><span>Amortised switches</span><strong id="insight-switch-count">0 of 0 decisions</strong></div>
               </section>
@@ -142,6 +143,22 @@
                   <table>
                     <thead><tr><th>Decision</th><th>Models</th><th>Stay/switch turns</th><th>Stay</th><th>Switch</th><th>Forecast saving</th><th>Break-even</th><th>Cache outcome</th></tr></thead>
                     <tbody id="routing-economics-body"></tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="group routing-economics" aria-labelledby="why-model-title">
+                <div class="group-heading">
+                  <h2 id="why-model-title">Why this model?</h2>
+                  <p>Recent prompt-free routing reasons and weighted score contributions.</p>
+                </div>
+                <div class="empty-state compact-empty is-hidden" id="why-model-empty">
+                  <strong>No routing decisions yet</strong>
+                </div>
+                <div class="table-scroll">
+                  <table>
+                    <thead><tr><th>Served by</th><th>Reason</th><th>Cost mode</th><th>Score contributions</th><th>Special handling</th></tr></thead>
+                    <tbody id="why-model-body"></tbody>
                   </table>
                 </div>
               </section>
@@ -224,6 +241,37 @@
               <label class="setting-row" for="cache-aware">
                 <span><strong>Cache-aware scoring</strong><small>Price expected prompt cache reads and writes</small></span>
                 <input class="switch" id="cache-aware" type="checkbox">
+              </label>
+              <label class="setting-row" for="cost-mode">
+                <span><strong>Cost scoring</strong><small>Absolute uses stable request-dollar utility; relative preserves legacy catalogue-relative scoring</small></span>
+                <select id="cost-mode">
+                  <option value="absolute">Absolute dollar utility</option>
+                  <option value="relative">Legacy relative utility</option>
+                </select>
+              </label>
+              <label class="setting-row compact" for="cost-reference-usd">
+                <span><strong>Cost reference</strong><small>USD request cost corresponding to half utility</small></span>
+                <input id="cost-reference-usd" type="number" min="0.000001" step="0.001" required>
+              </label>
+              <label class="setting-row compact" for="high-quality-floor">
+                <span><strong>Hard-task quality floor</strong><small>Minimum quality for high-difficulty requests when a qualifying model exists</small></span>
+                <input id="high-quality-floor" type="number" min="0" max="1" step="0.01" required>
+              </label>
+              <label class="setting-row compact" for="reasoning-bonus">
+                <span><strong>Reasoning preference</strong><small>Small explicit bonus for models with native reasoning; set 0 to disable</small></span>
+                <input id="reasoning-bonus" type="number" min="0" max="1" step="0.01" required>
+              </label>
+              <label class="setting-row" for="workflow-affinity">
+                <span><strong>Workflow affinity</strong><small>Keep explicitly grouped subagents on one eligible model without sharing their caches</small></span>
+                <input class="switch" id="workflow-affinity" type="checkbox">
+              </label>
+              <label class="setting-row" for="background-enabled">
+                <span><strong>Background routing</strong><small>Route only exact SHA-256 allowlisted maintenance requests separately</small></span>
+                <input class="switch" id="background-enabled" type="checkbox">
+              </label>
+              <label class="setting-row" for="background-model">
+                <span><strong>Background model</strong><small>provider/model; signatures are managed in Advanced YAML</small></span>
+                <input id="background-model" autocomplete="off" placeholder="deepseek/deepseek-v4-flash">
               </label>
               <div id="amortized-fields">
                 <label class="setting-row compact" for="default-remaining-turns">

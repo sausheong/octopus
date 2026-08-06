@@ -30,36 +30,47 @@ type ClassifierDocument struct {
 }
 
 type RoutingDocument struct {
-	SessionSticky bool   `json:"session_sticky"`
-	SessionTTL    string `json:"session_ttl"`
-	CacheAware    bool   `json:"cache_aware"`
-	MaxAttempts   int    `json:"max_attempts"`
+	Strategy              string  `json:"strategy"`
+	DataPolicy            string  `json:"data_policy"`
+	SessionTTL            string  `json:"session_ttl"`
+	CacheAware            bool    `json:"cache_aware"`
+	MaxAttempts           int     `json:"max_attempts"`
+	DefaultRemainingTurns int     `json:"default_remaining_turns"`
+	MinSwitchSavingsUSD   float64 `json:"min_switch_savings_usd"`
+	MinSwitchSavingsPct   float64 `json:"min_switch_savings_pct"`
+	SwitchConfidence      float64 `json:"switch_confidence"`
 }
 
 type ProviderDocument struct {
 	Name      string `json:"name"`
 	Kind      string `json:"kind"`
+	Location  string `json:"location"`
 	APIKeyEnv string `json:"api_key_env"`
 	APIKey    string `json:"api_key"`
 	BaseURL   string `json:"base_url"`
 }
 
 type CatalogDocument struct {
-	ID             string      `json:"id"`
-	Quality        float64     `json:"quality"`
-	CostPerMTokIn  float64     `json:"cost_per_mtok_in"`
-	CostPerMTokOut float64     `json:"cost_per_mtok_out"`
-	Speed          float64     `json:"speed"`
-	Caps           config.Caps `json:"caps"`
+	ID             string                `json:"id"`
+	Quality        float64               `json:"quality"`
+	CostPerMTokIn  float64               `json:"cost_per_mtok_in"`
+	CostPerMTokOut float64               `json:"cost_per_mtok_out"`
+	Speed          float64               `json:"speed"`
+	Caps           config.Caps           `json:"caps"`
+	TurnEfficiency config.TurnEfficiency `json:"turn_efficiency"`
 }
 
 func defaultDocument() Document {
 	return Document{
 		ServerAddr: "127.0.0.1:8787",
 		Weights:    config.Weights{Quality: 0.5, Cost: 0.3, Speed: 0.2},
-		Routing:    RoutingDocument{SessionSticky: true, SessionTTL: "1h", CacheAware: true, MaxAttempts: 3},
+		Routing: RoutingDocument{
+			Strategy: config.RoutingStrategyAmortized, DataPolicy: config.DataPolicyAllowRemote,
+			SessionTTL: "1h", CacheAware: true, MaxAttempts: 3,
+			DefaultRemainingTurns: 4, MinSwitchSavingsUSD: 0.01, MinSwitchSavingsPct: 0.10, SwitchConfidence: 0.60,
+		},
 		Providers: []ProviderDocument{{
-			Name: "anthropic", Kind: "anthropic", APIKeyEnv: "ANTHROPIC_API_KEY",
+			Name: "anthropic", Kind: "anthropic", Location: config.ProviderLocationRemote, APIKeyEnv: "ANTHROPIC_API_KEY",
 		}},
 		Catalog: []CatalogDocument{{
 			ID: "anthropic/claude-sonnet", Quality: 0.9, CostPerMTokIn: 3, CostPerMTokOut: 15, Speed: 0.75,
@@ -78,23 +89,26 @@ func documentFromConfig(cfg *config.Config) Document {
 		},
 		Weights: cfg.Weights,
 		Routing: RoutingDocument{
-			SessionSticky: cfg.Routing.SessionSticky,
-			SessionTTL:    cfg.Routing.SessionTTL.String(),
-			CacheAware:    cfg.Routing.CacheAware,
-			MaxAttempts:   cfg.Routing.MaxAttempts,
+			Strategy: cfg.Routing.Strategy, DataPolicy: cfg.Routing.DataPolicy, SessionTTL: cfg.Routing.SessionTTL.String(),
+			CacheAware: cfg.Routing.CacheAware, MaxAttempts: cfg.Routing.MaxAttempts,
+			DefaultRemainingTurns: cfg.Routing.DefaultRemainingTurns,
+			MinSwitchSavingsUSD:   cfg.Routing.MinSwitchSavingsUSD,
+			MinSwitchSavingsPct:   cfg.Routing.MinSwitchSavingsPct,
+			SwitchConfidence:      cfg.Routing.SwitchConfidence,
 		},
 		Catalog: make([]CatalogDocument, 0, len(cfg.Catalog)),
 	}
 	for name, provider := range cfg.Providers {
 		doc.Providers = append(doc.Providers, ProviderDocument{
-			Name: name, Kind: provider.Kind, APIKeyEnv: provider.APIKeyEnv, APIKey: provider.APIKey, BaseURL: provider.BaseURL,
+			Name: name, Kind: provider.Kind, Location: provider.Location,
+			APIKeyEnv: provider.APIKeyEnv, APIKey: provider.APIKey, BaseURL: provider.BaseURL,
 		})
 	}
 	sort.Slice(doc.Providers, func(i, j int) bool { return doc.Providers[i].Name < doc.Providers[j].Name })
 	for _, entry := range cfg.Catalog {
 		doc.Catalog = append(doc.Catalog, CatalogDocument{
 			ID: entry.ID, Quality: entry.Quality, CostPerMTokIn: entry.CostPerMTokIn,
-			CostPerMTokOut: entry.CostPerMTokOut, Speed: entry.Speed, Caps: entry.Caps,
+			CostPerMTokOut: entry.CostPerMTokOut, Speed: entry.Speed, Caps: entry.Caps, TurnEfficiency: entry.TurnEfficiency,
 		})
 	}
 	return doc
@@ -110,10 +124,11 @@ func (d Document) config() (*config.Config, error) {
 		AuthTokenEnv: d.AuthTokenEnv,
 		Weights:      d.Weights,
 		Routing: config.RoutingCfg{
-			SessionSticky: d.Routing.SessionSticky,
-			SessionTTL:    ttl,
-			CacheAware:    d.Routing.CacheAware,
-			MaxAttempts:   d.Routing.MaxAttempts,
+			Strategy: d.Routing.Strategy, DataPolicy: d.Routing.DataPolicy,
+			SessionTTL: ttl, CacheAware: d.Routing.CacheAware,
+			MaxAttempts: d.Routing.MaxAttempts, DefaultRemainingTurns: d.Routing.DefaultRemainingTurns,
+			MinSwitchSavingsUSD: d.Routing.MinSwitchSavingsUSD, MinSwitchSavingsPct: d.Routing.MinSwitchSavingsPct,
+			SwitchConfidence: d.Routing.SwitchConfidence,
 		},
 		Providers: make(map[string]config.ProviderCreds, len(d.Providers)),
 		Catalog:   make([]config.CatalogEntry, 0, len(d.Catalog)),
@@ -133,13 +148,14 @@ func (d Document) config() (*config.Config, error) {
 			return nil, fmt.Errorf("provider %q is duplicated", provider.Name)
 		}
 		cfg.Providers[provider.Name] = config.ProviderCreds{
-			Kind: provider.Kind, APIKeyEnv: provider.APIKeyEnv, APIKey: provider.APIKey, BaseURL: provider.BaseURL,
+			Kind: provider.Kind, Location: provider.Location,
+			APIKeyEnv: provider.APIKeyEnv, APIKey: provider.APIKey, BaseURL: provider.BaseURL,
 		}
 	}
 	for _, entry := range d.Catalog {
 		cfg.Catalog = append(cfg.Catalog, config.CatalogEntry{
 			ID: entry.ID, Quality: entry.Quality, CostPerMTokIn: entry.CostPerMTokIn,
-			CostPerMTokOut: entry.CostPerMTokOut, Speed: entry.Speed, Caps: entry.Caps,
+			CostPerMTokOut: entry.CostPerMTokOut, Speed: entry.Speed, Caps: entry.Caps, TurnEfficiency: entry.TurnEfficiency,
 		})
 	}
 	if err := cfg.Validate(); err != nil {

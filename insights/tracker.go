@@ -17,7 +17,8 @@ import (
 	"github.com/sausheong/octopus/router"
 )
 
-const ledgerVersion = 1
+const ledgerVersion = 2
+const maxRecentDecisions = 200
 
 // Observation is the completed, provider-reported usage needed to calculate
 // request economics. Chat content is used only to identify the cache TTL and
@@ -40,9 +41,10 @@ type Tracker struct {
 }
 
 type ledger struct {
-	Version   int                      `json:"version"`
-	CreatedAt time.Time                `json:"created_at"`
-	Days      map[string]*DayAggregate `json:"days"`
+	Version         int                      `json:"version"`
+	CreatedAt       time.Time                `json:"created_at"`
+	Days            map[string]*DayAggregate `json:"days"`
+	RecentDecisions []RoutingDecision        `json:"recent_decisions,omitempty"`
 }
 
 // DayAggregate is persisted by local calendar date.
@@ -60,6 +62,9 @@ type DayAggregate struct {
 	ClassifierOverheadUSD float64                    `json:"classifier_overhead_usd"`
 	NetSavingsUSD         float64                    `json:"net_savings_usd"`
 	Models                map[string]*ModelAggregate `json:"models"`
+	AmortizedDecisions    int64                      `json:"amortized_decisions"`
+	AmortizedSwitches     int64                      `json:"amortized_switches"`
+	ForecastSavingsUSD    float64                    `json:"forecast_savings_usd"`
 }
 
 // ModelAggregate supports the model breakdown without storing request data.
@@ -72,12 +77,13 @@ type ModelAggregate struct {
 
 // Report is the range-filtered API view used by Settings.
 type Report struct {
-	RangeDays   int            `json:"range_days"`
-	Summary     Summary        `json:"summary"`
-	Days        []DayPoint     `json:"days"`
-	Models      []ModelSummary `json:"models"`
-	Methodology string         `json:"methodology"`
-	LastError   string         `json:"last_error,omitempty"`
+	RangeDays        int               `json:"range_days"`
+	Summary          Summary           `json:"summary"`
+	Days             []DayPoint        `json:"days"`
+	Models           []ModelSummary    `json:"models"`
+	RoutingDecisions []RoutingDecision `json:"routing_decisions"`
+	Methodology      string            `json:"methodology"`
+	LastError        string            `json:"last_error,omitempty"`
 }
 
 type Summary struct {
@@ -95,6 +101,30 @@ type Summary struct {
 	NetSavingsUSD         float64 `json:"net_savings_usd"`
 	SavingsPercent        float64 `json:"savings_percent"`
 	CacheHitPercent       float64 `json:"cache_hit_percent"`
+	AmortizedDecisions    int64   `json:"amortized_decisions"`
+	AmortizedSwitches     int64   `json:"amortized_switches"`
+	ForecastSavingsUSD    float64 `json:"forecast_savings_usd"`
+}
+
+// RoutingDecision is the prompt-free audit trail behind the Switch economics
+// table. It records forecasts and actual cache-token outcomes only.
+type RoutingDecision struct {
+	Timestamp              time.Time `json:"timestamp"`
+	Strategy               string    `json:"strategy"`
+	ActualModel            string    `json:"actual_model"`
+	Incumbent              string    `json:"incumbent"`
+	Candidate              string    `json:"candidate"`
+	Decision               string    `json:"decision"`
+	ExpectedTurnsIncumbent int       `json:"expected_turns_incumbent"`
+	ExpectedTurnsCandidate int       `json:"expected_turns_candidate"`
+	Confidence             float64   `json:"confidence"`
+	StayCostUSD            float64   `json:"stay_cost_usd"`
+	SwitchCostUSD          float64   `json:"switch_cost_usd"`
+	EstimatedSavingsUSD    float64   `json:"estimated_savings_usd"`
+	BreakEvenTurns         float64   `json:"break_even_turns,omitempty"`
+	CandidateCacheWarm     bool      `json:"candidate_cache_warm"`
+	CacheCreationTokens    int       `json:"cache_creation_tokens"`
+	CacheReadTokens        int       `json:"cache_read_tokens"`
 }
 
 type DayPoint struct {
@@ -131,13 +161,14 @@ func newTracker(path string, now func() time.Time) *Tracker {
 		return t
 	}
 	var loaded ledger
-	if err := json.Unmarshal(data, &loaded); err != nil || loaded.Version != ledgerVersion || loaded.Days == nil {
+	if err := json.Unmarshal(data, &loaded); err != nil || (loaded.Version != 1 && loaded.Version != ledgerVersion) || loaded.Days == nil {
 		if err == nil {
 			err = fmt.Errorf("unsupported ledger version %d", loaded.Version)
 		}
 		t.lastErr = fmt.Sprintf("load insights: %v", err)
 		return t
 	}
+	loaded.Version = ledgerVersion
 	t.ledger = loaded
 	return t
 }
@@ -155,6 +186,9 @@ func (t *Tracker) Record(observation Observation) {
 		day = &DayAggregate{Models: make(map[string]*ModelAggregate)}
 		t.ledger.Days[dayKey] = day
 	}
+	if day.Models == nil {
+		day.Models = make(map[string]*ModelAggregate)
+	}
 	day.Requests++
 	if calculation.priced {
 		day.PricedRequests++
@@ -169,6 +203,25 @@ func (t *Tracker) Record(observation Observation) {
 	day.CacheSavingsUSD += calculation.cacheSavings
 	day.ClassifierOverheadUSD += calculation.classifierOverhead
 	day.NetSavingsUSD += calculation.netSavings
+	if economics := observation.Decision.Economics; economics != nil {
+		day.AmortizedDecisions++
+		if economics.Decision == "switch" {
+			day.AmortizedSwitches++
+		}
+		day.ForecastSavingsUSD += economics.EstimatedSavingsUSD
+		t.ledger.RecentDecisions = append(t.ledger.RecentDecisions, RoutingDecision{
+			Timestamp: t.now(), Strategy: observation.Decision.Strategy, ActualModel: observation.Model,
+			Incumbent: economics.Incumbent, Candidate: economics.Candidate, Decision: economics.Decision,
+			ExpectedTurnsIncumbent: economics.ExpectedTurnsIncumbent, ExpectedTurnsCandidate: economics.ExpectedTurnsCandidate,
+			Confidence: economics.Confidence, StayCostUSD: economics.StayCostUSD, SwitchCostUSD: economics.SwitchCostUSD,
+			EstimatedSavingsUSD: economics.EstimatedSavingsUSD, BreakEvenTurns: economics.BreakEvenTurns,
+			CandidateCacheWarm:  economics.CandidateCacheWarm,
+			CacheCreationTokens: calculation.cacheCreationTokens, CacheReadTokens: calculation.cacheReadTokens,
+		})
+		if len(t.ledger.RecentDecisions) > maxRecentDecisions {
+			t.ledger.RecentDecisions = append([]RoutingDecision(nil), t.ledger.RecentDecisions[len(t.ledger.RecentDecisions)-maxRecentDecisions:]...)
+		}
+	}
 	model := day.Models[observation.Model]
 	if model == nil {
 		model = &ModelAggregate{}
@@ -276,12 +329,19 @@ func (t *Tracker) Report(days int) Report {
 	report := Report{
 		RangeDays: days,
 		Days:      make([]DayPoint, 0, days),
-		Methodology: "Net savings compare each completed request with the highest-quality eligible catalog model at uncached list price. " +
+		Methodology: "Quality-baseline savings compare each completed request with the highest-quality eligible catalog model at uncached list price. " +
 			"Actual cost uses provider-reported tokens, configured model prices, prompt-cache read/write multipliers, and classifier overhead.",
 		LastError: t.lastErr,
 	}
-	modelTotals := make(map[string]*ModelAggregate)
 	today := dateOnly(t.now())
+	start := today.AddDate(0, 0, -(days - 1))
+	for index := len(t.ledger.RecentDecisions) - 1; index >= 0; index-- {
+		decision := t.ledger.RecentDecisions[index]
+		if !dateOnly(decision.Timestamp).Before(start) {
+			report.RoutingDecisions = append(report.RoutingDecisions, decision)
+		}
+	}
+	modelTotals := make(map[string]*ModelAggregate)
 	for offset := days - 1; offset >= 0; offset-- {
 		date := today.AddDate(0, 0, -offset)
 		key := date.Format("2006-01-02")
@@ -341,6 +401,9 @@ func addDay(summary *Summary, day *DayAggregate) {
 	summary.CacheSavingsUSD += day.CacheSavingsUSD
 	summary.ClassifierOverheadUSD += day.ClassifierOverheadUSD
 	summary.NetSavingsUSD += day.NetSavingsUSD
+	summary.AmortizedDecisions += day.AmortizedDecisions
+	summary.AmortizedSwitches += day.AmortizedSwitches
+	summary.ForecastSavingsUSD += day.ForecastSavingsUSD
 }
 
 func dateOnly(value time.Time) time.Time {

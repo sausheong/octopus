@@ -25,14 +25,22 @@ weights:
   cost: 0.3
   speed: 0.2
 
-# Keep a conversation on the same backend so provider prompt-cache entries
-# remain reusable. Cache-aware scoring uses 0.1x input pricing for known reads,
-# 1.25x for 5-minute writes, and 2x for 1-hour writes. These are enabled by
-# default when omitted.
+# Amortized routing compares the incumbent model's expected warm cost to
+# completion with each candidate's cold first turn plus warm later turns.
+# "sticky" preserves hard affinity and "per_turn" uses the balanced scorer on
+# every turn. Legacy session_sticky YAML is still accepted and translated.
 routing:
-  session_sticky: true
+  strategy: "amortized"
+  # allow_remote: all eligible providers may be used (backwards-compatible default)
+  # prefer_local: use eligible local providers when possible, otherwise remote
+  # local_only: never send request content to a remote provider; fail closed
+  data_policy: "allow_remote"
   session_ttl: "1h"
   cache_aware: true
+  default_remaining_turns: 4
+  min_switch_savings_usd: 0.01
+  min_switch_savings_pct: 0.10
+  switch_confidence: 0.60
   # Maximum backends one request may try before giving up. Every failure
   # consumes an attempt except a malformed request and a cancelled request,
   # which stop immediately. Defaults to 3 when omitted.
@@ -55,6 +63,7 @@ providers:
   # Add api_key_env if your server requires authentication.
   mlx:
     kind: openai
+    location: local
     base_url: "http://localhost:8080/v1"
 
   # Providers may use any name and declare a `kind` to pick the client type.
@@ -76,6 +85,8 @@ catalog:
     speed: 0.4
     # max_output_tokens is optional; omit it (or use 0) for no output limit.
     caps: { tools: true, vision: true, reasoning: true, max_context: 1000000, max_output_tokens: 32000 }
+    # Optional work-per-turn priors. Omitted or zero values are neutral (1.0).
+    turn_efficiency: { trivial: 1.0, low: 1.0, medium: 1.0, high: 1.0 }
   - id: "anthropic/claude-haiku-3-5-20241022"
     quality: 0.70
     cost_per_mtok_in: 1.0

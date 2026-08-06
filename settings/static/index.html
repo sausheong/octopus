@@ -122,10 +122,28 @@
                   <h2 id="savings-detail-title">What contributed</h2>
                   <p>Routing and cache benefits, less the cost of classification.</p>
                 </div>
-                <div class="savings-row"><span>Model routing</span><strong id="insight-routing-savings">$0.00</strong></div>
+                <div class="savings-row"><span>Quality-baseline savings</span><strong id="insight-routing-savings">$0.00</strong></div>
                 <div class="savings-row"><span>Prompt caching</span><strong id="insight-cache-savings">$0.00</strong></div>
                 <div class="savings-row"><span>Classifier overhead</span><strong id="insight-classifier-cost">$0.00</strong></div>
                 <div class="savings-row"><span>Cache hit rate</span><strong id="insight-cache-hit">0%</strong></div>
+                <div class="savings-row"><span>Amortised switches</span><strong id="insight-switch-count">0 of 0 decisions</strong></div>
+              </section>
+
+              <section class="group routing-economics" aria-labelledby="routing-economics-title">
+                <div class="group-heading">
+                  <h2 id="routing-economics-title">Switch economics</h2>
+                  <p>Recent incumbent-versus-candidate forecasts and measured cache outcomes.</p>
+                </div>
+                <div class="empty-state compact-empty is-hidden" id="routing-economics-empty">
+                  <strong>No amortised decisions yet</strong>
+                  <span>A decision appears after a continuing session has an incumbent model.</span>
+                </div>
+                <div class="table-scroll" id="routing-economics-table-wrap">
+                  <table>
+                    <thead><tr><th>Decision</th><th>Models</th><th>Stay/switch turns</th><th>Stay</th><th>Switch</th><th>Forecast saving</th><th>Break-even</th><th>Cache outcome</th></tr></thead>
+                    <tbody id="routing-economics-body"></tbody>
+                  </table>
+                </div>
               </section>
 
               <section class="group model-usage" aria-labelledby="model-usage-title">
@@ -144,8 +162,8 @@
               <details class="methodology">
                 <summary>How savings are calculated</summary>
                 <p id="insights-methodology"></p>
-                <p>Routing savings compare uncached costs. Cache savings compare the chosen model’s uncached and measured cache-adjusted costs. Classifier usage is subtracted as overhead. Figures are estimates based on configured catalog prices and provider-reported tokens.</p>
-                <p>Only daily totals and per-model aggregates are stored in <code>~/.octopus/insights.json</code>. Prompts, responses, session identifiers, and credentials are never recorded.</p>
+                <p>Quality-baseline savings compare uncached costs. Cache savings compare the chosen model’s uncached and measured cache-adjusted costs. Switch economics instead forecasts cost to completion: the incumbent stays warm, while a new candidate pays a cold first turn before later warm turns unless that candidate still has a live cache.</p>
+                <p>Daily totals, per-model aggregates, and up to 200 recent numeric switch decisions are stored in <code>~/.octopus/insights.json</code>. Prompts, responses, session identifiers, and credentials are never recorded.</p>
               </details>
             </div>
           </section>
@@ -179,9 +197,21 @@
                 <span><strong>Speed weight</strong></span>
                 <input id="weight-speed" type="number" min="0" step="0.05" required>
               </label>
-              <label class="setting-row" for="session-sticky">
-                <span><strong>Sticky sessions</strong><small>Keep conversations on the backend that owns their cache</small></span>
-                <input class="switch" id="session-sticky" type="checkbox">
+              <label class="setting-row" for="routing-strategy">
+                <span><strong>Routing strategy</strong><small>Amortised compares expected task cost before switching</small></span>
+                <select id="routing-strategy">
+                  <option value="amortized">Amortised cost to completion</option>
+                  <option value="sticky">Sticky session</option>
+                  <option value="per_turn">Score every turn</option>
+                </select>
+              </label>
+              <label class="setting-row" for="data-policy">
+                <span><strong>Data policy</strong><small>Controls whether request content may reach cloud providers</small></span>
+                <select id="data-policy">
+                  <option value="allow_remote">Allow remote providers</option>
+                  <option value="prefer_local">Prefer eligible local providers</option>
+                  <option value="local_only">Local only — fail closed</option>
+                </select>
               </label>
               <label class="setting-row compact" for="session-ttl">
                 <span><strong>Session lifetime</strong><small>Go duration, such as 30m or 1h</small></span>
@@ -195,6 +225,24 @@
                 <span><strong>Cache-aware scoring</strong><small>Price expected prompt cache reads and writes</small></span>
                 <input class="switch" id="cache-aware" type="checkbox">
               </label>
+              <div id="amortized-fields">
+                <label class="setting-row compact" for="default-remaining-turns">
+                  <span><strong>Default remaining turns</strong><small>Fallback horizon when classification is unavailable</small></span>
+                  <input id="default-remaining-turns" type="number" min="1" max="50" step="1" required>
+                </label>
+                <label class="setting-row compact" for="min-switch-savings-usd">
+                  <span><strong>Minimum switch saving</strong><small>Absolute USD margin required before switching</small></span>
+                  <input id="min-switch-savings-usd" type="number" min="0" step="0.001" required>
+                </label>
+                <label class="setting-row compact" for="min-switch-savings-pct">
+                  <span><strong>Minimum saving fraction</strong><small>Fraction of stay cost, such as 0.10 for 10%</small></span>
+                  <input id="min-switch-savings-pct" type="number" min="0" max="1" step="0.01" required>
+                </label>
+                <label class="setting-row compact" for="switch-confidence">
+                  <span><strong>Forecast confidence</strong><small>Minimum classifier confidence required to switch</small></span>
+                  <input id="switch-confidence" type="number" min="0" max="1" step="0.05" required>
+                </label>
+              </div>
             </div>
 
             <div class="group">
@@ -278,6 +326,7 @@
       <div class="field-grid two">
         <label><span>Name</span><input data-field="name" required autocomplete="off" placeholder="anthropic"></label>
         <label><span>Kind</span><select data-field="kind"><option value="anthropic">Anthropic</option><option value="openai">OpenAI compatible</option><option value="gemini">Gemini</option><option value="qwen">Qwen</option></select></label>
+        <label><span>Location</span><select data-field="location"><option value="remote">Remote</option><option value="local">Local (loopback only)</option></select></label>
         <label><span>API key environment</span><input data-field="api_key_env" autocomplete="off" placeholder="ANTHROPIC_API_KEY"></label>
         <label><span>Base URL</span><input data-field="base_url" type="url" autocomplete="off" placeholder="https://api.example.com"></label>
       </div>
@@ -305,6 +354,15 @@
         <label><input data-field="reasoning" type="checkbox"> Reasoning</label>
         <label class="context-field"><span>Context</span><input data-field="max_context" type="number" min="1" step="1" required></label>
         <label class="context-field"><span>Max output</span><input data-field="max_output_tokens" type="number" min="0" step="1" autocomplete="off" placeholder="No limit"></label>
+      </div>
+      <div class="efficiency-fields">
+        <span>Turn efficiency <small>Optional progress-per-turn priors; 1.0 is neutral</small></span>
+        <div class="field-grid four">
+          <label><span>Trivial</span><input data-field="efficiency_trivial" type="number" min="0" step="0.05" placeholder="1.0"></label>
+          <label><span>Low</span><input data-field="efficiency_low" type="number" min="0" step="0.05" placeholder="1.0"></label>
+          <label><span>Medium</span><input data-field="efficiency_medium" type="number" min="0" step="0.05" placeholder="1.0"></label>
+          <label><span>High</span><input data-field="efficiency_high" type="number" min="0" step="0.05" placeholder="1.0"></label>
+        </div>
       </div>
     </fieldset>
   </template>

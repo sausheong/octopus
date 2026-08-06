@@ -102,6 +102,13 @@ func candidates(dec router.Decision) []string {
 	return out
 }
 
+func noEligibleMessage(dec router.Decision) string {
+	if dec.DataPolicy == config.DataPolicyLocalOnly {
+		return "no local model can satisfy this request; remote routing is disabled by routing.data_policy=local_only"
+	}
+	return "no catalog model can satisfy this request (context too large or missing capability)"
+}
+
 // prepareAttempt resolves a provider candidate, normalizes tools, and applies
 // the routing decision's reasoning mode to the request.
 func (s *Server) prepareAttempt(id string, chat llm.ChatRequest, dec router.Decision) (llm.LLMProvider, llm.ChatRequest, error) {
@@ -252,10 +259,19 @@ func (s *Server) collectWithFallback(
 			continue
 		}
 
-		ch, err := prov.ChatStream(ctx, attempt)
+		// A buffered client request does not need to make the upstream use SSE.
+		// Prefer the provider's native non-streaming transport when it exposes
+		// that optional capability; providers without it retain the existing
+		// stream-and-collect behaviour.
+		var ch <-chan llm.ChatEvent
+		if nonStreaming, ok := prov.(llm.NonStreamingProvider); ok {
+			ch, err = nonStreaming.ChatNonStreaming(ctx, attempt)
+		} else {
+			ch, err = prov.ChatStream(ctx, attempt)
+		}
 		if err != nil {
 			lastErr = err
-			logAttemptFailure("provider stream open failed, trying fallback", id, err)
+			logAttemptFailure("provider request failed, trying fallback", id, err)
 			attempts++
 			if !anthropicio.Retryable(lastErr) || attempts >= maxTries {
 				break
@@ -448,7 +464,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	dec := s.rt.Route(ctx, dr.Chat)
 
 	if dec.NoEligible {
-		writeError(w, anthropicio.NewAPIError("invalid_request", "no catalog model can satisfy this request (context too large or missing capability)"))
+		writeError(w, anthropicio.NewAPIError("invalid_request", noEligibleMessage(dec)))
 		return
 	}
 
@@ -526,7 +542,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	dec := s.rt.Route(ctx, chat)
 
 	if dec.NoEligible {
-		writeOAIError(w, http.StatusUnprocessableEntity, "invalid_request_error", "no catalog model can satisfy this request (context too large or missing capability)")
+		writeOAIError(w, http.StatusUnprocessableEntity, "invalid_request_error", noEligibleMessage(dec))
 		return
 	}
 

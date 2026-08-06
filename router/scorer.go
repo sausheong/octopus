@@ -24,12 +24,41 @@ type Decision struct {
 	Reason     string
 	Reasoning  llm.ReasoningMode // recommended mode when an attempted candidate supports reasoning
 	NoEligible bool              // true when no catalog model passed the capability filter
+	// DataPolicy records the placement boundary applied to this decision.
+	// RemoteFallbackBlocked is true when every attempted candidate is local.
+	DataPolicy            string
+	RemoteFallbackBlocked bool
 	// ClassifierModel and ClassifierUsage let Insights include routing overhead
 	// in request economics. They are empty when classification was skipped.
 	ClassifierModel string
 	ClassifierUsage *llm.Usage
 	// MaxAttempts bounds provider fallback for this request.
 	MaxAttempts int
+	// Strategy and Economics explain whether a conversation was retained or
+	// switched after comparing expected cost to completion. Economics is nil
+	// for initial, sticky, and ordinary per-turn choices.
+	Strategy  string
+	Economics *SwitchEconomics
+}
+
+// SwitchEconomics is safe to log and persist: it contains model IDs and
+// numeric forecasts, never prompts, responses, or session identifiers.
+type SwitchEconomics struct {
+	Incumbent              string  `json:"incumbent"`
+	Candidate              string  `json:"candidate"`
+	Decision               string  `json:"decision"`
+	ExpectedTurnsIncumbent int     `json:"expected_turns_incumbent"`
+	ExpectedTurnsCandidate int     `json:"expected_turns_candidate"`
+	Confidence             float64 `json:"confidence"`
+	StayCostUSD            float64 `json:"stay_cost_usd"`
+	SwitchCostUSD          float64 `json:"switch_cost_usd"`
+	FirstCandidateCostUSD  float64 `json:"first_candidate_cost_usd"`
+	WarmIncumbentCostUSD   float64 `json:"warm_incumbent_cost_usd"`
+	WarmCandidateCostUSD   float64 `json:"warm_candidate_cost_usd"`
+	EstimatedSavingsUSD    float64 `json:"estimated_savings_usd"`
+	RequiredSavingsUSD     float64 `json:"required_savings_usd"`
+	BreakEvenTurns         float64 `json:"break_even_turns,omitempty"`
+	CandidateCacheWarm     bool    `json:"candidate_cache_warm"`
 }
 
 // eligible applies the hard capability filter: a model survives only if it

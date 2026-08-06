@@ -17,3 +17,5 @@ go.work.sum
 /llmrouter
 /dist/
 .DS_Store
+__pycache__/
+*.pyc

@@ -14,6 +14,7 @@ import (
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	openai "github.com/sashabaranov/go-openai"
 	"github.com/sausheong/harness/llm"
+	"github.com/sausheong/octopus/anthropicio"
 	"github.com/sausheong/octopus/config"
 	"github.com/sausheong/octopus/insights"
 	"github.com/sausheong/octopus/registry"
@@ -43,6 +44,41 @@ func (f *fakeProv) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan 
 	ch <- llm.ChatEvent{Type: llm.EventDone, StopReason: "end_turn", Usage: &llm.Usage{InputTokens: 3, OutputTokens: 1}}
 	close(ch)
 	return ch, nil
+}
+
+// transportAwareProv exposes both Harness transports so tests can verify that
+// Octopus honours the client's stream preference instead of forcing every
+// upstream request through SSE.
+type transportAwareProv struct {
+	streamCalls       int
+	nonStreamingCalls int
+	streamText        string
+	nonStreamingText  string
+	nonStreamingErr   error
+}
+
+func (p *transportAwareProv) Models() []llm.ModelInfo { return nil }
+func (p *transportAwareProv) NormalizeToolSchema(t []llm.ToolDef) ([]llm.ToolDef, []llm.Diagnostic) {
+	return t, nil
+}
+func (p *transportAwareProv) ChatStream(context.Context, llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	p.streamCalls++
+	return completedEvents(p.streamText), nil
+}
+func (p *transportAwareProv) ChatNonStreaming(context.Context, llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	p.nonStreamingCalls++
+	if p.nonStreamingErr != nil {
+		return nil, p.nonStreamingErr
+	}
+	return completedEvents(p.nonStreamingText), nil
+}
+
+func completedEvents(text string) <-chan llm.ChatEvent {
+	ch := make(chan llm.ChatEvent, 2)
+	ch <- llm.ChatEvent{Type: llm.EventTextDelta, Text: text}
+	ch <- llm.ChatEvent{Type: llm.EventDone, StopReason: "end_turn", Usage: &llm.Usage{InputTokens: 3, OutputTokens: 1}}
+	close(ch)
+	return ch
 }
 
 // errProv is a provider whose ChatStream fails with a scripted error, used to
@@ -116,6 +152,68 @@ func buildServer(t *testing.T) *Server {
 		return router.TaskProfile{Difficulty: "low", EstTokensIn: 10, EstTokensOut: 10}
 	})
 	return New(rt, reg, cfg.Catalog)
+}
+
+func TestCollectWithFallbackPrefersNativeNonStreamingTransport(t *testing.T) {
+	prov := &transportAwareProv{streamText: "streamed", nonStreamingText: "buffered"}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"native": prov})
+	s := New(nil, reg, nil)
+	dec := router.Decision{Chosen: "native/model", Eligible: []string{"native/model"}}
+
+	out, chosen, err := s.collectWithFallback(context.Background(), dec, llm.ChatRequest{}, anthropicio.CollectMessage)
+	if err != nil {
+		t.Fatalf("collectWithFallback: %v", err)
+	}
+	if chosen != "native/model" || !strings.Contains(string(out), "buffered") {
+		t.Fatalf("chosen=%q body=%s", chosen, out)
+	}
+	if prov.nonStreamingCalls != 1 || prov.streamCalls != 0 {
+		t.Fatalf("non-streaming calls=%d stream calls=%d, want 1 and 0", prov.nonStreamingCalls, prov.streamCalls)
+	}
+}
+
+func TestCollectWithFallbackRetainsFallbackAfterNativeNonStreamingFailure(t *testing.T) {
+	primary := &transportAwareProv{nonStreamingErr: anthErr(529)}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{
+		"primary":  primary,
+		"fallback": &fakeProv{text: "fallback response"},
+	})
+	s := New(nil, reg, nil)
+	dec := router.Decision{
+		Chosen:   "primary/model",
+		Eligible: []string{"primary/model", "fallback/model"},
+	}
+
+	out, chosen, err := s.collectWithFallback(context.Background(), dec, llm.ChatRequest{}, anthropicio.CollectMessage)
+	if err != nil {
+		t.Fatalf("collectWithFallback: %v", err)
+	}
+	if chosen != "fallback/model" || !strings.Contains(string(out), "fallback response") {
+		t.Fatalf("chosen=%q body=%s", chosen, out)
+	}
+	if primary.nonStreamingCalls != 1 || primary.streamCalls != 0 {
+		t.Fatalf("primary non-streaming calls=%d stream calls=%d, want 1 and 0", primary.nonStreamingCalls, primary.streamCalls)
+	}
+}
+
+func TestTryProvidersStreamContinuesUsingStreamingTransport(t *testing.T) {
+	prov := &transportAwareProv{streamText: "streamed", nonStreamingText: "buffered"}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"native": prov})
+	s := New(nil, reg, nil)
+	dec := router.Decision{Chosen: "native/model", Eligible: []string{"native/model"}}
+
+	ch, chosen, err := s.tryProvidersStream(context.Background(), dec, llm.ChatRequest{})
+	if err != nil {
+		t.Fatalf("tryProvidersStream: %v", err)
+	}
+	for range ch {
+	}
+	if chosen != "native/model" {
+		t.Fatalf("chosen=%q", chosen)
+	}
+	if prov.streamCalls != 1 || prov.nonStreamingCalls != 0 {
+		t.Fatalf("stream calls=%d non-streaming calls=%d, want 1 and 0", prov.streamCalls, prov.nonStreamingCalls)
+	}
 }
 
 func TestPrepareAttemptOnlyEnablesSupportedReasoning(t *testing.T) {
@@ -503,6 +601,66 @@ func TestOAIHandlerFallback(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "fallback ok") {
 		t.Errorf("expected fallback content: %s", rec.Body.String())
+	}
+}
+
+func TestLocalOnlyProviderFailureNeverFallsBackToCloud(t *testing.T) {
+	local := &countingErrProv{err: anthErr(429)}
+	cloud := &countingErrProv{err: anthErr(429)}
+	cfg := &config.Config{
+		ServerAddr: "127.0.0.1:8787",
+		Classifier: config.ClassifierCfg{Model: "cloud/classifier", MaxTokens: 16},
+		Weights:    config.Weights{Quality: 1},
+		Routing: config.RoutingCfg{
+			Strategy: config.RoutingStrategyPerTurn, DataPolicy: config.DataPolicyLocalOnly, MaxAttempts: 3,
+		},
+		Providers: map[string]config.ProviderCreds{
+			"local": {Kind: "openai", Location: config.ProviderLocationLocal, BaseURL: "http://127.0.0.1:11434/v1"},
+			"cloud": {Kind: "anthropic", Location: config.ProviderLocationRemote, APIKey: "test"},
+		},
+		Catalog: []config.CatalogEntry{
+			{ID: "local/model", Quality: 0.8, Speed: 0.5, Caps: config.Caps{MaxContext: 200000}},
+			{ID: "cloud/model", Quality: 0.99, Speed: 0.9, Caps: config.Caps{MaxContext: 200000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"local": local, "cloud": cloud})
+	s := New(router.NewRouter(cfg, reg), reg, cfg.Catalog)
+
+	body := `{"model":"any","messages":[{"role":"user","content":"hi"}]}`
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if local.calls != 1 {
+		t.Fatalf("local calls = %d, want 1", local.calls)
+	}
+	if cloud.calls != 0 {
+		t.Fatalf("cloud calls = %d, want 0 under local_only", cloud.calls)
+	}
+}
+
+func TestLocalOnlyNoEligibleErrorExplainsFailClosedPolicy(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr: "127.0.0.1:8787",
+		Weights:    config.Weights{Quality: 1},
+		Routing: config.RoutingCfg{
+			Strategy: config.RoutingStrategyPerTurn, DataPolicy: config.DataPolicyLocalOnly,
+		},
+		Providers: map[string]config.ProviderCreds{
+			"local": {Kind: "openai", Location: config.ProviderLocationLocal, BaseURL: "http://127.0.0.1:11434/v1"},
+		},
+		Catalog: []config.CatalogEntry{
+			{ID: "local/model", Quality: 0.8, Speed: 0.5, Caps: config.Caps{Tools: false, MaxContext: 200000}},
+		},
+	}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{"local": &fakeProv{text: "unused"}})
+	s := New(router.NewRouter(cfg, reg), reg, cfg.Catalog)
+	body := `{"model":"any","tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"use lookup"}]}`
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "remote routing is disabled") {
+		t.Fatalf("fail-closed explanation missing: %s", rec.Body.String())
 	}
 }
 

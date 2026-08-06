@@ -63,6 +63,10 @@ func Decode(body []byte) (DecodedRequest, error) {
 	// metadata.user_id identifies a user, not a conversation. Tagging it keeps
 	// it out of the explicit-session path, where it would otherwise collapse
 	// all of one user's conversations onto a single sticky model and cache.
+	// Harness ChatRequest currently has no end-user metadata field and documents
+	// SessionID as routing-only, so this value cannot yet be forwarded upstream.
+	// Do not repurpose another provider-visible field: add an explicit Harness
+	// field before implementing that propagation.
 	if wr.Metadata.UserID != "" {
 		chat.SessionID = "user:" + wr.Metadata.UserID
 	}

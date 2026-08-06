@@ -36,17 +36,17 @@ func TestDocumentCarriesEveryConfigField(t *testing.T) {
 		},
 		Weights: config.Weights{Quality: 0.51, Cost: 0.31, Speed: 0.21},
 		Routing: config.RoutingCfg{
-			SessionSticky: true,
-			SessionTTL:    42 * time.Minute,
-			CacheAware:    true,
-			MaxAttempts:   7,
+			Strategy: config.RoutingStrategySticky, DataPolicy: config.DataPolicyPreferLocal, SessionSticky: true,
+			SessionTTL: 42 * time.Minute, CacheAware: true, MaxAttempts: 7,
+			DefaultRemainingTurns: 9, MinSwitchSavingsUSD: 0.023,
+			MinSwitchSavingsPct: 0.17, SwitchConfidence: 0.73,
 		},
 		Providers: map[string]config.ProviderCreds{
 			// APIKey is set here even though a committed config should use
 			// APIKeyEnv instead: Document does round-trip an inline key, so
 			// dropping it would lose a credential the user had configured.
 			"p": {
-				Kind: "anthropic", APIKeyEnv: "K", APIKey: "inline-key",
+				Kind: "anthropic", Location: config.ProviderLocationRemote, APIKeyEnv: "K", APIKey: "inline-key",
 				BaseURL: "https://example.invalid",
 			},
 		},
@@ -56,6 +56,7 @@ func TestDocumentCarriesEveryConfigField(t *testing.T) {
 				Tools: true, Vision: true, Reasoning: true,
 				MaxContext: 1000, MaxOutputTokens: 4096,
 			},
+			TurnEfficiency: config.TurnEfficiency{Trivial: 0.8, Low: 0.9, Medium: 1.1, High: 1.3},
 		}},
 	}
 

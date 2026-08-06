@@ -3,7 +3,9 @@ CMD       := ./cmd/octopus
 GONOSUMDB := GONOSUMDB=github.com/sausheong/harness
 GOFLAGS   := GOWORK=off
 UNAME_S   := $(shell uname -s)
-RELEASE_GOALS   := $(filter v%,$(MAKECMDGOALS))
+# GNU make's v% pattern also matches the ordinary `vet` target, so exclude it
+# before treating remaining v-prefixed goals as release versions.
+RELEASE_GOALS   := $(filter-out vet,$(filter v%,$(MAKECMDGOALS)))
 RELEASE_VERSION := $(if $(VERSION),$(VERSION),$(RELEASE_GOALS))
 
 .PHONY: all build app installer release notary-profile open-app test test-race vet tidy run clean help

@@ -347,13 +347,16 @@ input:disabled { opacity: 0.5; }
 .savings-row strong { font-size: 0.88rem; font-variant-numeric: tabular-nums; }
 
 .table-scroll { overflow-x: auto; }
-.model-usage table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-.model-usage th, .model-usage td { padding: 11px 16px; border-bottom: 1px solid var(--line-soft); text-align: right; white-space: nowrap; }
-.model-usage tr:last-child th, .model-usage tr:last-child td { border-bottom: 0; }
+.model-usage table, .routing-economics table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.model-usage th, .model-usage td, .routing-economics th, .routing-economics td { padding: 11px 16px; border-bottom: 1px solid var(--line-soft); text-align: right; white-space: nowrap; }
+.model-usage tr:last-child th, .model-usage tr:last-child td, .routing-economics tr:last-child th, .routing-economics tr:last-child td { border-bottom: 0; }
 .model-usage th:first-child { width: 100%; text-align: left; }
-.model-usage thead th { color: var(--muted); font-size: 0.72rem; font-weight: 500; }
-.model-usage tbody th { font-weight: 500; }
-.model-usage td { font-variant-numeric: tabular-nums; }
+.routing-economics th:first-child, .routing-economics td:first-child { text-align: left; text-transform: capitalize; }
+.model-usage thead th, .routing-economics thead th { color: var(--muted); font-size: 0.72rem; font-weight: 500; }
+.model-usage tbody th, .routing-economics tbody th { font-weight: 500; }
+.model-usage td, .routing-economics td { font-variant-numeric: tabular-nums; }
+.routing-economics td.is-negative { color: var(--danger); }
+.compact-empty { padding: 32px 20px; border: 0; border-radius: 0; }
 
 .methodology { margin: 4px 2px 28px; color: var(--muted); font-size: 0.78rem; line-height: 1.5; }
 .methodology summary { width: max-content; color: var(--text); cursor: default; font-weight: 500; }
@@ -414,6 +417,17 @@ input:disabled { opacity: 0.5; }
 .capability-row > label { display: flex; align-items: center; gap: 6px; }
 .context-field { margin-left: auto; }
 .context-field input { width: 110px; }
+
+.efficiency-fields {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.efficiency-fields > span small { margin-left: 5px; }
 
 .empty-state {
   display: grid;

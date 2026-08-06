@@ -2,9 +2,9 @@
 
 ![Octopus logo](octopus.png)
 
-Octopus is a local LLM routing gateway for coding agents and OpenAI-compatible applications. It exposes Anthropic and OpenAI APIs on one loopback-only server, classifies each request, filters models by capability and context size, and chooses a backend using configurable quality, cost, and speed weights.
+Octopus is a local LLM routing gateway for coding agents and OpenAI-compatible applications. It exposes Anthropic and OpenAI APIs on one loopback-only server, classifies each request, filters models by capability and context size, and chooses a backend using configurable quality, cost, speed, and cost-to-completion policies.
 
-It is designed to work particularly well with Claude Code: Anthropic prompt-cache markers are preserved end to end, conversations remain on the backend that owns their cache, and cache creation/read usage is included in responses and logs.
+It is designed to work particularly well with Claude Code: Anthropic prompt-cache markers are preserved end to end, routing accounts for each backend's warm or cold cache, and cache creation/read usage is included in responses, logs, and Insights.
 
 ## Contents
 
@@ -35,7 +35,7 @@ It is designed to work particularly well with Claude Code: Anthropic prompt-cach
 - Optional low-cost classifier with a zero-call short circuit for trivial requests.
 - Hard tool, vision, context-window, and output-limit eligibility checks.
 - Quality/cost/speed scoring with deterministic fallback order.
-- Sticky conversation routing for prompt-cache continuity.
+- Amortised routing that switches only when expected task savings repay the cache change; sticky and per-turn strategies remain available.
 - Full Anthropic `cache_control` preservation, including `5m` and `1h` TTLs.
 - Extended-thinking/reasoning mapping and thinking-block round trips.
 - Tool calls, parallel tool results, images, streaming usage, and refusal propagation.
@@ -87,9 +87,14 @@ weights:
   speed: 0.2
 
 routing:
-  session_sticky: true
+  strategy: "amortized"
+  data_policy: "allow_remote"
   session_ttl: "1h"
   cache_aware: true
+  default_remaining_turns: 4
+  min_switch_savings_usd: 0.01
+  min_switch_savings_pct: 0.10
+  switch_confidence: 0.60
 
 providers:
   anthropic:
@@ -157,7 +162,7 @@ Claude Code requests a specific model, but Octopus treats the inbound model as a
 
 #### Verify prompt caching
 
-1. Enable `routing.session_sticky` and `routing.cache_aware`, or omit them to use their `true` defaults.
+1. Enable `routing.cache_aware` and use the default `routing.strategy: amortized` (or choose `sticky` for hard affinity).
 2. Start a session with a large, stable prompt prefix.
 3. Send at least two turns within the cache TTL.
 4. Look for `prompt cache usage` in the Octopus log.
@@ -221,11 +226,11 @@ The app always reads and writes `~/.octopus/config.yaml`. If the file does not e
 
 Settings has five sections:
 
-- **General** controls the router address, classifier, scoring weights, session/cache behavior, and the fallback attempt limit.
+- **General** controls the router address, classifier, scoring weights, routing strategy, forecast thresholds, cache behavior, and the fallback attempt limit.
 - **Providers** configures provider kinds, endpoints, environment-variable names, and optional inline credentials. Inline credentials are stored locally in the YAML file; prefer environment variables when practical.
-- **Models** edits the routing catalog, pricing, capabilities, and context and output limits.
+- **Models** edits the routing catalog, pricing, capabilities, context and output limits, and optional work-per-turn efficiency priors.
 - **Advanced YAML** edits the complete configuration directly.
-- **Insights** shows request volume, token usage, estimated spend, savings over time, cache efficiency, and model usage.
+- **Insights** shows request volume, token usage, estimated spend, savings over time, cache efficiency, model usage, and recent switch economics.
 
 Saving requires a CSRF token that is generated fresh each time Octopus starts and embedded in the page when it loads. A settings page left open across a restart therefore holds a token the new process will not accept, and must be reopened from the menu bar before it can save.
 
@@ -239,7 +244,9 @@ The settings interface follows the macOS light or dark appearance and supports k
 
 Insights is the last item in the Settings sidebar. It records one aggregate observation each time a provider completes a request with final token usage, over the last 7, 30, 90, or 365 days. Tracking starts when an Insights-capable build first runs; history is not reconstructed from logs.
 
-It reports net savings, actual and baseline cost, request and token counts, savings over time, cache hit rate, and a per-model usage breakdown. Savings are split three ways: **model routing** (choosing a cheaper model than the baseline), **prompt caching** (cache reads against the chosen model's uncached cost), and **classifier overhead**, which is subtracted. Negative values are kept rather than clamped — a cache write or a classifier call really can cost more than it saved in a given period.
+It reports net savings, actual and baseline cost, request and token counts, savings over time, cache hit rate, and a per-model usage breakdown. Savings are split three ways: **quality-baseline savings** (choosing a cheaper model than the highest-quality eligible baseline), **prompt caching** (cache reads against the chosen model's uncached cost), and **classifier overhead**, which is subtracted. Negative values are kept rather than clamped — a cache write or a classifier call really can cost more than it saved in a given period.
+
+The **Switch economics** table is a different measurement. It explains recent amortised decisions: incumbent and candidate, forecast turns on each model, warm stay cost, candidate switch cost, estimated saving, break-even turns, decision, confidence, and the provider's actual cache-write or cache-read token outcome. This is the evidence for whether a switch was expected to pay back; it is not mixed into the quality-baseline counterfactual.
 
 #### Baseline selection
 
@@ -253,9 +260,9 @@ With `Pᵢ`/`Pₒ` the configured per-million input and output prices, and `I`, 
 uncached(model)  = (I + W + R)/1e6 × Pᵢ(model) + O/1e6 × Pₒ(model)
 chosen measured  = (I + W×write_mult + R×0.10)/1e6 × Pᵢ(chosen) + O/1e6 × Pₒ(chosen)
 
-routing savings  = uncached(baseline) - uncached(chosen)
+quality-baseline savings = uncached(baseline) - uncached(chosen)
 cache savings    = uncached(chosen)  - chosen measured
-net savings      = routing savings + cache savings - classifier overhead
+net savings      = quality-baseline savings + cache savings - classifier overhead
 actual cost      = chosen measured + classifier overhead
 ```
 
@@ -263,7 +270,7 @@ actual cost      = chosen measured + classifier overhead
 
 #### Privacy and accuracy
 
-Daily totals and per-model aggregates live in `~/.octopus/insights.json`, written atomically with mode `0600` inside a `0700` directory. The ledger holds dates, model IDs, token totals, request counts, and USD amounts — no prompts, responses, tool definitions, session identifiers, or credentials. Quit Octopus before deleting it to reset history.
+Daily totals, per-model aggregates, and a bounded list of the 200 most recent switch decisions live in `~/.octopus/insights.json`, written atomically with mode `0600` inside a `0700` directory. The ledger holds dates, model IDs, token totals, request counts, forecasts, cache outcomes, and USD amounts — no prompts, responses, tool definitions, session identifiers, or credentials. Quit Octopus before deleting it to reset history. Existing version-1 ledgers are upgraded in place when the next observation is written.
 
 These are estimates, not invoices. They use your catalog prices and provider-reported usage, so requests that never report final usage are not counted, and price edits apply only to future observations. The counterfactual also reuses the chosen model's measured token counts for the baseline, which a different model would not have reproduced exactly. Taxes, volume and batch discounts, and tiered pricing are outside the calculation.
 
@@ -308,36 +315,36 @@ Anthropic cache pricing is represented with these input multipliers:
 | One-hour cache write | `2.00×` |
 | Uncached input | `1.00×` |
 
-After a successful response, Octopus records the reported ratio of cached to uncached input. Subsequent scores blend the cache-read and ordinary-input prices instead of assuming the entire request is cached.
+After a successful response, Octopus records the provider-reported ratio of cached to uncached input for that model. The session keeps a separate live-cache record for every model it has used, so switching away does not erase knowledge that an earlier model may still be warm. Returning to that model before its cache expires is priced as a cache read rather than another cold write.
 
-### Session affinity
+### Session state and affinity
 
-Sticky routing records the successful model for a conversation and selects it again while it remains eligible. Session identity is resolved in this order:
+Octopus records the successful model as the session incumbent, plus per-model cache expiry and coverage, turn count, recent input growth, and recent output size. The `amortized` strategy uses that state for forecasts; the `sticky` strategy always selects the incumbent while it remains eligible. Session identity is resolved in this order:
 
 1. `X-Octopus-Session-ID` HTTP header, or the legacy `X-LLMRouter-Session-ID` header. Either is the explicit session key: it alone determines the session.
 2. A deterministic SHA-256 identifier derived from the system prompt, tools, and first genuine user turn.
 
-Anthropic `metadata.user_id` and the OpenAI `user` field are not explicit keys. They contribute to the derived hash instead, so two users sending the same opening prompt stay separated, while one user's distinct conversations are not merged onto a single model and a false prompt-cache prediction.
+Anthropic `metadata.user_id` and the OpenAI `user` field are not explicit session keys. They contribute to the derived hash instead, so two users sending the same opening prompt stay separated, while one user's distinct conversations are not merged onto a single model and a false prompt-cache prediction. They are currently routing-only and are not forwarded upstream because Harness has no provider-visible end-user metadata field.
 
 Explicit identifiers are hashed before being stored. The in-memory session table is concurrency-safe, expires entries, and has a hard size bound. Session state is process-local and is reset when Octopus restarts.
 
-If the sticky model is no longer eligible because of tools, vision, or context size, normal scoring selects another model. A successful fallback becomes the new sticky model.
+If the incumbent is no longer eligible because of tools, vision, context size, or output limit, normal scoring selects another model regardless of strategy. A successful fallback becomes the new incumbent.
 
 ### Restart behavior
 
-Octopus does not cache prompts itself — caching happens on the provider (e.g. Anthropic), keyed to the exact byte prefix it received. Octopus's own job is to avoid routing a conversation away from the backend holding its warm cache, and to price a routing decision honestly when it might cost a cache write. Both of those depend entirely on the in-memory session table, which is not persisted, so a process restart resets it to empty while any conversation it was tracking keeps going.
+Octopus does not cache prompts itself — caching happens on the provider (for example Anthropic), based on the stable prompt prefix it receives. Octopus rebuilds requests into the selected provider's wire format, but preserves supported prompt content and cache markers deterministically. It tracks enough local state to price staying, switching, and switching back. That state is in memory and is not persisted, so a process restart resets it while provider-side cache entries may still exist.
 
 The next request in each affected session after a restart is scored without that memory:
 
-- **Sticky affinity is unknown.** `stickyModelForSession` finds no entry, so the request is scored fresh instead of pinned to whichever model it was already using.
-- **Cache fraction is unknown.** `cacheInputMultipliersForSession` has no `CacheUntil`/`CacheFraction` to blend in, so every cache-capable model is scored as if this request needs a full cache write (`1.25×`/`2.00×`), even for the model that actually still holds the warm cache at the provider.
+- **The incumbent is unknown.** The request follows the initial-routing path: it starts from the balanced score and may choose a lower cost-to-completion model when the horizon is confident and the saving margins are met.
+- **Per-model cache coverage is unknown.** A cache-capable candidate is conservatively treated as requiring a full cache write (`1.25×`/`2.00×`) even if the provider may still hold a warm prefix.
 
 Two outcomes follow, both limited to that one request:
 
-1. Scoring still lands on the same model the conversation was already using. The provider's cache is likely still warm (if within its TTL), so the real bill reflects a cache hit — but Octopus's internal cost/savings accounting for that request overstates the cost, because it assumed a cold write. This is a bookkeeping inaccuracy in Insights, not an extra charge.
+1. Scoring still lands on the same model the conversation was already using. The provider's cache may still be warm, so the real bill reflects a cache hit even though the pre-request forecast could not know it.
 2. Scoring lands on a different model. This is a genuine cache-losing switch — a real cold write at whatever provider is now serving the conversation, no different from any other mid-conversation switch.
 
-Either way, the response from the provider carries real `cache_creation_input_tokens`/`cache_read_input_tokens` usage, and `Router.Observe` repopulates the session table from it immediately after. So the effect of a restart is confined to one request per active session: the process self-corrects from the next turn onward. There is currently no snapshot/restore for the session table (unlike the Insights ledger, which is persisted to disk on every write) — a conversation's sticky/cache state does not survive a restart, only its session identity does, since `SessionID` is a pure deterministic hash of the request and needs no stored state to recompute.
+Either way, the response carries real `cache_creation_input_tokens`/`cache_read_input_tokens` usage, and `Router.Observe` immediately repopulates the incumbent and that model's cache state. The effect is therefore confined to the first post-restart request for an active session. There is no snapshot/restore for the session table; only the deterministic session identity survives independently of process memory.
 
 ## Routing behavior
 
@@ -356,13 +363,13 @@ Classify task or apply deterministic shortcut
 Enforce tools, vision, and context constraints
         │
         ▼
-Estimate request cost, including expected cache state
+Build warm/cold cost-to-completion forecasts
         │
         ▼
-Rank eligible catalog models
+Apply the configured routing strategy
         │
         ▼
-Apply valid session affinity
+Choose or retain the model
         │
         ▼
 Normalize tools and call provider
@@ -382,6 +389,8 @@ The classifier returns this task profile:
 - `needs_tools`.
 - `est_tokens_in` and `est_tokens_out`.
 - `domain`: `code`, `writing`, `qa`, `math`, or `other`.
+- `expected_remaining_turns`: `1..50`, including the current turn.
+- `estimate_confidence`: `0..1`, used as the switch-confidence gate.
 
 The classifier is skipped when either of these conditions applies:
 
@@ -413,6 +422,38 @@ quality × normalized_quality
 ```
 
 Weights need not sum to one; Octopus normalizes them. Free models receive the maximum cost-efficiency score. Catalog order is the deterministic tie-breaker.
+
+### Routing strategies and amortisation
+
+`routing.strategy` controls what happens after eligibility:
+
+| Strategy | Behaviour |
+|---|---|
+| `amortized` | Recommended and default. Keep or change the incumbent by comparing expected cost to complete the task, including the first cold cache write. |
+| `sticky` | Keep the incumbent for the session lifetime whenever it remains eligible. Balanced scores after turn one do not change the model. |
+| `per_turn` | Run the balanced quality/cost/speed scorer every turn, with current cache multipliers. It is greedy and does not amortise a switch over future turns. |
+
+The initial request has no incumbent. Octopus starts from the balanced-score choice, then uses a confident task horizon and efficiency priors to move to a lower cost-to-completion model only when the same saving margins are met; otherwise it keeps the balanced choice. On later amortised requests it splits predicted input into a cacheable prefix `K` and uncached tail `U`, and predicts output `O`:
+
+```text
+cold(model) = ((K × write_mult + U) × Pᵢ + O × Pₒ) / 1e6
+warm(model) = ((K × 0.10       + U) × Pᵢ + O × Pₒ) / 1e6
+
+stay(A)   = forecast N_A warm turns on incumbent A
+switch(B) = one cold B turn + forecast N_B-1 warm B turns
+```
+
+If B already has its own unexpired cache record, its first turn is warm too. Forecast input grows by the observed input-growth moving average, and forecast output uses the larger of the classified estimate and observed output moving average. For equal work-per-turn, the simple crossover is:
+
+```text
+break_even_turns = (cold(B) - warm(B)) / (warm(A) - warm(B))
+```
+
+Different models may need different numbers of turns. `catalog[].turn_efficiency` supplies optional progress-per-turn priors by difficulty, and Octopus uses `ceil(expected_remaining_turns / efficiency)` for each model. The neutral prior is `1.0`. This lets a more capable but dearer model be represented as requiring fewer turns instead of pretending that every model finishes in the same `N`.
+
+A switch occurs only when the classifier confidence meets `switch_confidence` and its forecast saving is greater than both `min_switch_savings_usd` and `stay(A) × min_switch_savings_pct`. Otherwise the incumbent is retained. Quality, speed, tools, vision, context, output limits, and the high-difficulty quality floor still define which models are acceptable; dollars decide between those eligible models during the switch comparison.
+
+This is a forecast, not clairvoyance. The classifier cannot know the true remaining turn count, and turn-efficiency priors are operator estimates. The confidence and saving margins are deliberate safeguards against oscillation and false precision. Insights records both the forecast and subsequent provider cache-token outcome so the priors can be calibrated from real work.
 
 ### Reasoning
 
@@ -495,7 +536,9 @@ OpenAI buffered usage includes `prompt_tokens_details.cached_tokens` when the pr
 - Anthropic thinking blocks and signatures.
 - Streaming text and tool-input deltas, plus Anthropic terminal usage, stop reasons, and refusals.
 
-This is a compatibility gateway, not a claim of complete coverage of every field in either upstream API. Unsupported request content is rejected explicitly rather than silently reinterpreted.
+This is a compatibility gateway, not a claim of complete coverage of every field in either upstream API. Octopus guarantees the documented fields above; clients should not rely on undocumented request fields surviving cross-provider translation.
+
+For buffered client requests, Octopus uses a provider's native non-streaming transport when Harness exposes one. Providers without that optional capability still use an internal stream that Octopus collects before returning buffered JSON. Streaming client requests always use the provider's streaming transport.
 
 ## Configuration reference
 
@@ -542,10 +585,19 @@ The section is optional; these defaults are applied when it is omitted.
 
 | Field | Default | Description |
 |---|---:|---|
-| `session_sticky` | `true` | Keep a conversation on its last successful eligible model. |
-| `session_ttl` | `1h` | Lifetime of model affinity. Must not be negative. |
-| `cache_aware` | `true` | Include expected cache writes/reads in cost scoring. |
+| `strategy` | `amortized` | `amortized`, `sticky`, or `per_turn`. |
+| `data_policy` | `allow_remote` | `allow_remote`, `prefer_local`, or fail-closed `local_only`. |
+| `session_ttl` | `1h` | Inactivity lifetime of the in-memory incumbent and per-model cache records. Must not be negative. |
+| `cache_aware` | `true` | Include expected cache writes/reads in scoring and cost forecasts. |
+| `default_remaining_turns` | `4` | Fallback task horizon, `1..50`, when classification is unavailable. |
+| `min_switch_savings_usd` | `0.01` | Minimum absolute forecast saving required to switch. |
+| `min_switch_savings_pct` | `0.10` | Minimum forecast saving as a fraction of incumbent stay cost, `0..1`. |
+| `switch_confidence` | `0.60` | Minimum turn-estimate confidence required to switch, `0..1`. |
 | `max_attempts` | `3` | Maximum backends one request may try. Every failure consumes an attempt except a malformed request and a cancelled request, which stop immediately. Must not be negative; `0` is treated as omitted. |
+
+Legacy files using `session_sticky: true` are translated to `strategy: sticky`; `false` becomes `strategy: per_turn`. When both fields are present, the explicit `strategy` takes precedence. Settings rewrites saved files using `strategy`.
+
+`data_policy` is a placement boundary, not a scoring preference. `prefer_local` restricts scoring and fallback to eligible local providers whenever one can satisfy the request, but permits remote models when none can. `local_only` removes every remote model before scoring, sticky affinity, amortised comparison, and fallback. It also skips a remote classifier. If no local model has the required context or capabilities, Octopus returns an error without contacting the cloud.
 
 ### `providers`
 
@@ -563,6 +615,7 @@ Each provider supports these fields:
 | Field | Description |
 |---|---|
 | `kind` | Client kind. When omitted, defaults to the provider map key. |
+| `location` | `remote` (default) or `local`. A local provider must use an absolute HTTP(S) loopback `base_url`. |
 | `api_key_env` | Environment variable containing the provider credential. |
 | `api_key` | Inline credential. Takes precedence; use only in ignored local configuration. |
 | `base_url` | Provider endpoint override. A local endpoint may use this without a key. |
@@ -581,6 +634,7 @@ providers:
 
   local:
     kind: openai
+    location: local
     base_url: "http://127.0.0.1:8080/v1"
 
   coding_gateway:
@@ -607,10 +661,14 @@ Every entry requires a unique `provider/model` ID. The provider prefix must exis
 | `caps.reasoning` | Boolean | Native extended reasoning support. |
 | `caps.max_context` | Positive integer | Maximum combined context capacity. |
 | `caps.max_output_tokens` | Optional, `>= 0` | Maximum response tokens the model accepts. Omitted or `0` means unconstrained. |
+| `turn_efficiency.trivial` | Optional, `>= 0` | Relative work per turn for trivial tasks; omitted or `0` means `1.0`. |
+| `turn_efficiency.low` | Optional, `>= 0` | Relative work per turn for low-difficulty tasks. |
+| `turn_efficiency.medium` | Optional, `>= 0` | Relative work per turn for medium-difficulty tasks. |
+| `turn_efficiency.high` | Optional, `>= 0` | Relative work per turn for high-difficulty tasks. |
 
 `caps.max_output_tokens` is a hard eligibility filter alongside `caps.max_context`: a model whose declared output limit is below the estimated response size is removed before scoring, rather than being discovered at the backend. The estimate is floored at the client's requested `max_tokens` (or `1024` when unset), so a client that habitually requests a generous `max_tokens` it never fills can exclude models that would in practice have coped.
 
-Catalog prices and capabilities are operator-maintained. Keep them synchronized with provider documentation; Octopus does not fetch pricing or model metadata automatically.
+Catalog prices, capabilities, and efficiency priors are operator-maintained. Keep prices and model metadata synchronized with provider documentation, and calibrate efficiency from your own completed-task data; Octopus does not fetch or infer these values automatically.
 
 Setting `caps.tools: false` on a catalog entry to work around a real or suspected provider incompatibility removes that model from every tool-using request — which, for coding-agent traffic, is effectively all requests. Gemini entries in particular can be declared with `caps.tools: true` safely; see [Cross-provider tool-call IDs](#cross-provider-tool-call-ids).
 
@@ -688,8 +746,9 @@ Octopus emits structured `slog` text records to standard error. Useful entries i
 
 ### Every request uses the same model
 
-- Sticky routing intentionally keeps a valid session on its successful model.
-- Use a different `X-Octopus-Session-ID`, wait for `session_ttl`, restart Octopus, or disable `routing.session_sticky` to compare fresh routes.
+- Check `routing.strategy`. `sticky` intentionally keeps a valid session on its successful model.
+- With `amortized`, Insights explains whether low forecast confidence, too few remaining turns, a still-warm incumbent, efficiency priors, or the minimum-saving margins retained it.
+- Use a different `X-Octopus-Session-ID`, wait for `session_ttl`, restart Octopus, or select `strategy: per_turn` to compare fresh greedy routes.
 
 ## Local and mixed-provider recipes
 
@@ -705,12 +764,14 @@ weights:
   speed: 0.2
 
 routing:
-  session_sticky: false
+  strategy: per_turn
+  data_policy: local_only
   cache_aware: false
 
 providers:
   local:
     kind: openai
+    location: local
     base_url: "http://127.0.0.1:8080/v1"
 
 catalog:
@@ -737,11 +798,16 @@ weights:
   cost: 0.4
   speed: 0.1
 
+routing:
+  strategy: amortized
+  data_policy: prefer_local
+
 providers:
   anthropic:
     api_key_env: "ANTHROPIC_API_KEY"
   local:
     kind: openai
+    location: local
     base_url: "http://127.0.0.1:8080/v1"
 
 catalog:
@@ -760,7 +826,9 @@ catalog:
     caps: {tools: true, vision: false, reasoning: false, max_context: 32768}
 ```
 
-The free local model has the strongest cost score, while high-difficulty tasks can apply the quality floor and move to the cloud model.
+With `prefer_local`, an eligible local model is used even when a remote model would have a higher balanced score. The cloud becomes eligible only when no local model can satisfy the request. Use `allow_remote` instead if quality/cost/speed and amortised economics should choose freely across both placements; use `local_only` when cloud fallback must never occur.
+
+The classifier receives request content before the final model is selected. Under `local_only`, configure a classifier whose provider is marked `location: local`, or omit `classifier`; a remote classifier is skipped automatically. `prefer_local` does not provide a privacy guarantee and may still use the configured remote classifier.
 
 ## Benchmarking
 

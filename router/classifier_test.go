@@ -32,7 +32,7 @@ func (f *fakeProvider) ChatStream(ctx context.Context, req llm.ChatRequest) (<-c
 func TestClassifyWithUsageReturnsClassifierOverhead(t *testing.T) {
 	want := &llm.Usage{InputTokens: 120, OutputTokens: 18}
 	p := &fakeProvider{
-		text:  `{"difficulty":"low","needs_reasoning":false,"needs_vision":false,"needs_tools":false,"est_tokens_in":50,"est_tokens_out":100,"domain":"qa"}`,
+		text:  `{"difficulty":"low","needs_reasoning":false,"needs_vision":false,"needs_tools":false,"est_tokens_in":50,"est_tokens_out":100,"domain":"qa","expected_remaining_turns":3,"estimate_confidence":0.8}`,
 		usage: want,
 	}
 	profile, got := classifyWithUsage(context.Background(), p, "m", 256, llm.Message{Role: "user", Content: "hi"})
@@ -46,7 +46,7 @@ type errString2 string
 func (e errString2) Error() string { return string(e) }
 
 func TestClassifyParsesJSON(t *testing.T) {
-	p := &fakeProvider{text: `{"difficulty":"high","needs_reasoning":true,"needs_vision":false,"needs_tools":false,"est_tokens_in":1200,"est_tokens_out":800,"domain":"code"}`}
+	p := &fakeProvider{text: `{"difficulty":"high","needs_reasoning":true,"needs_vision":false,"needs_tools":false,"est_tokens_in":1200,"est_tokens_out":800,"domain":"code","expected_remaining_turns":6,"estimate_confidence":0.9}`}
 	prof := Classify(context.Background(), p, "anthropic/haiku", 256, llm.Message{Role: "user", Content: "refactor this"})
 	if prof.Difficulty != "high" || !prof.NeedsReasoning || prof.Domain != "code" {
 		t.Fatalf("profile = %+v", prof)
@@ -54,11 +54,14 @@ func TestClassifyParsesJSON(t *testing.T) {
 	if prof.EstTokensIn != 1200 || prof.EstTokensOut != 800 {
 		t.Errorf("tokens = %d/%d", prof.EstTokensIn, prof.EstTokensOut)
 	}
+	if prof.ExpectedRemainingTurns != 6 || prof.EstimateConfidence != 0.9 {
+		t.Errorf("forecast = %d/%v", prof.ExpectedRemainingTurns, prof.EstimateConfidence)
+	}
 }
 
 func TestClassifyJSONWithPreamble(t *testing.T) {
 	// Model wraps complete JSON in prose; extractor should find the object.
-	full := `{"difficulty":"low","needs_reasoning":false,"needs_vision":false,"needs_tools":false,"est_tokens_in":50,"est_tokens_out":100,"domain":"qa"}`
+	full := `{"difficulty":"low","needs_reasoning":false,"needs_vision":false,"needs_tools":false,"est_tokens_in":50,"est_tokens_out":100,"domain":"qa","expected_remaining_turns":2,"estimate_confidence":0.7}`
 	p := &fakeProvider{text: "Here is the classification:\n" + full + "\nDone."}
 	prof := Classify(context.Background(), p, "m", 256, llm.Message{Role: "user", Content: "hi"})
 	if prof.Difficulty != "low" || prof.Domain != "qa" {

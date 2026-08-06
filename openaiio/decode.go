@@ -28,7 +28,9 @@ func Decode(body []byte) (llm.ChatRequest, bool, string, error) {
 
 	chat := llm.ChatRequest{Model: wr.Model}
 	// Same reasoning as the Anthropic endpoint: "user" names a user, not a
-	// conversation.
+	// conversation. Harness ChatRequest currently has no end-user metadata
+	// field and SessionID is deliberately routing-only, so the value cannot be
+	// forwarded upstream without a Harness API addition.
 	if wr.User != "" {
 		chat.SessionID = "user:" + wr.User
 	}

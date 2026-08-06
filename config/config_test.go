@@ -12,13 +12,20 @@ func TestMarshalRoundTrip(t *testing.T) {
 	original := baseValid()
 	// Every defaulted field is set explicitly: Marshal validates a copy, so an
 	// unset field would come back defaulted and not match the original.
-	original.Routing = RoutingCfg{SessionSticky: true, SessionTTL: 45 * time.Minute, CacheAware: false, MaxAttempts: 5}
+	original.Routing = RoutingCfg{
+		Strategy: RoutingStrategySticky, DataPolicy: DataPolicyAllowRemote, SessionSticky: true, SessionTTL: 45 * time.Minute,
+		CacheAware: false, MaxAttempts: 5, DefaultRemainingTurns: 7,
+		MinSwitchSavingsUSD: 0.02, MinSwitchSavingsPct: 0.15, SwitchConfidence: 0.75,
+	}
 	data, err := Marshal(original)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
 	if !bytes.Contains(data, []byte("session_ttl: 45m0s")) {
 		t.Fatalf("marshaled YAML missing duration: %s", data)
+	}
+	if bytes.Contains(data, []byte("session_sticky:")) || !bytes.Contains(data, []byte("strategy: sticky")) {
+		t.Fatalf("marshaled YAML did not migrate strategy: %s", data)
 	}
 	decoded, err := Parse(data)
 	if err != nil {
@@ -58,8 +65,116 @@ func TestLoadValid(t *testing.T) {
 	if !c.Catalog[0].Caps.Vision {
 		t.Errorf("Catalog[0] vision should be true")
 	}
-	if !c.Routing.SessionSticky || !c.Routing.CacheAware || c.Routing.SessionTTL != time.Hour {
+	if c.Routing.Strategy != RoutingStrategyAmortized || c.Routing.SessionSticky || !c.Routing.CacheAware || c.Routing.SessionTTL != time.Hour ||
+		c.Routing.DefaultRemainingTurns != 4 || c.Routing.MinSwitchSavingsUSD != 0.01 || c.Routing.MinSwitchSavingsPct != 0.10 || c.Routing.SwitchConfidence != 0.60 {
 		t.Errorf("Routing defaults = %+v", c.Routing)
+	}
+	if c.Routing.DataPolicy != DataPolicyAllowRemote {
+		t.Errorf("DataPolicy = %q, want default %q", c.Routing.DataPolicy, DataPolicyAllowRemote)
+	}
+}
+
+func TestParseAndMarshalDataPolicyAndProviderLocation(t *testing.T) {
+	cfg, err := Parse([]byte(`
+server: {addr: "127.0.0.1:8787"}
+weights: {quality: 1}
+routing: {data_policy: local_only}
+providers:
+  ollama:
+    kind: openai
+    location: local
+    base_url: http://127.0.0.1:11434/v1
+catalog:
+  - id: ollama/qwen
+    quality: 0.7
+    speed: 0.8
+    caps: {max_context: 32768}
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Routing.DataPolicy != DataPolicyLocalOnly || !cfg.IsLocalModel("ollama/qwen") {
+		t.Fatalf("parsed placement = policy %q local %v", cfg.Routing.DataPolicy, cfg.IsLocalModel("ollama/qwen"))
+	}
+	data, err := Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Contains(data, []byte("data_policy: local_only")) || !bytes.Contains(data, []byte("location: local")) {
+		t.Fatalf("marshaled YAML omitted placement fields:\n%s", data)
+	}
+}
+
+func TestValidateRejectsInvalidDataPolicy(t *testing.T) {
+	c := baseValid()
+	c.Routing.DataPolicy = "sometimes_local"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected invalid data policy to fail")
+	}
+}
+
+func TestValidateLocalProviderRequiresLoopbackBaseURL(t *testing.T) {
+	for _, baseURL := range []string{"", "https://api.example.com/v1", "localhost:11434/v1", "ftp://127.0.0.1/model"} {
+		c := baseValid()
+		c.Providers["local"] = ProviderCreds{Kind: "openai", Location: ProviderLocationLocal, BaseURL: baseURL, APIKey: "x"}
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected local base_url %q to fail", baseURL)
+		}
+	}
+	for _, baseURL := range []string{"http://localhost:11434/v1", "http://127.0.0.1:11434/v1", "http://[::1]:11434/v1"} {
+		c := baseValid()
+		c.Providers["local"] = ProviderCreds{Kind: "openai", Location: ProviderLocationLocal, BaseURL: baseURL}
+		if err := c.Validate(); err != nil {
+			t.Errorf("loopback local base_url %q rejected: %v", baseURL, err)
+		}
+	}
+}
+
+func TestProviderLocationDefaultsRemote(t *testing.T) {
+	c := baseValid()
+	if c.IsLocalModel("anthropic/m") {
+		t.Fatal("legacy provider without location must default to remote")
+	}
+	c.Providers["anthropic"] = ProviderCreds{Kind: "anthropic", Location: ProviderLocationLocal, BaseURL: "http://localhost:1"}
+	if !c.IsLocalModel("anthropic/m") {
+		t.Fatal("explicit local provider should classify catalog model as local")
+	}
+}
+
+func TestParseMigratesLegacySessionSticky(t *testing.T) {
+	for value, want := range map[string]string{"true": RoutingStrategySticky, "false": RoutingStrategyPerTurn} {
+		yaml := []byte("server:\n  addr: 127.0.0.1:8787\nweights:\n  quality: 1\nrouting:\n  session_sticky: " + value + "\nproviders:\n  p:\n    base_url: http://localhost:1\n    kind: openai\ncatalog:\n  - id: p/m\n    quality: 1\n    speed: 1\n    caps:\n      max_context: 1000\n")
+		cfg, err := Parse(yaml)
+		if err != nil {
+			t.Fatalf("session_sticky %s: %v", value, err)
+		}
+		if cfg.Routing.Strategy != want {
+			t.Errorf("session_sticky %s strategy = %q, want %q", value, cfg.Routing.Strategy, want)
+		}
+	}
+}
+
+func TestValidateRejectsInvalidAmortizedSettings(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"strategy", func(c *Config) { c.Routing.Strategy = "clairvoyant" }},
+		{"turn horizon", func(c *Config) { c.Routing.DefaultRemainingTurns = 51 }},
+		{"dollar threshold", func(c *Config) { c.Routing.MinSwitchSavingsUSD = -0.01 }},
+		{"percentage threshold", func(c *Config) { c.Routing.MinSwitchSavingsPct = 1.01 }},
+		{"confidence", func(c *Config) { c.Routing.SwitchConfidence = -0.1 }},
+		{"efficiency", func(c *Config) { c.Catalog[0].TurnEfficiency.High = -1 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := baseValid()
+			cfg.Routing.Strategy = RoutingStrategyAmortized
+			test.mutate(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
 	}
 }
 

@@ -54,10 +54,16 @@ function renderState() {
   setValue("#weight-quality", doc.weights.quality);
   setValue("#weight-cost", doc.weights.cost);
   setValue("#weight-speed", doc.weights.speed);
-  setChecked("#session-sticky", doc.routing.session_sticky);
+  setValue("#routing-strategy", doc.routing.strategy || "amortized");
+  setValue("#data-policy", doc.routing.data_policy || "allow_remote");
   setValue("#session-ttl", doc.routing.session_ttl);
   setValue("#max-attempts", doc.routing.max_attempts);
   setChecked("#cache-aware", doc.routing.cache_aware);
+  setValue("#default-remaining-turns", doc.routing.default_remaining_turns || 4);
+  setValue("#min-switch-savings-usd", doc.routing.min_switch_savings_usd ?? 0.01);
+  setValue("#min-switch-savings-pct", doc.routing.min_switch_savings_pct ?? 0.10);
+  setValue("#switch-confidence", doc.routing.switch_confidence ?? 0.60);
+  toggleRoutingStrategy();
   setChecked("#classifier-enabled", doc.classifier_enabled);
   setValue("#classifier-model", doc.classifier.model);
   setValue("#classifier-tokens", doc.classifier.max_tokens || 256);
@@ -128,10 +134,50 @@ function renderInsights(report) {
   $("#insight-cache-savings").textContent = formatMoney(summary.cache_savings_usd);
   $("#insight-classifier-cost").textContent = formatMoney(-Number(summary.classifier_overhead_usd || 0));
   $("#insight-cache-hit").textContent = formatPercent(summary.cache_hit_percent);
+  $("#insight-switch-count").textContent = `${formatInteger(summary.amortized_switches)} of ${formatInteger(summary.amortized_decisions)} decisions`;
   $("#insights-methodology").textContent = report.methodology || "";
   renderInsightsChart(report.days || []);
   renderInsightModels(report.models || []);
+  renderRoutingEconomics(report.routing_decisions || []);
   if (report.last_error) showNotice(report.last_error, false);
+}
+
+function renderRoutingEconomics(decisions) {
+  const body = $("#routing-economics-body");
+  const empty = $("#routing-economics-empty");
+  const table = $("#routing-economics-table-wrap");
+  body.replaceChildren();
+  empty.classList.toggle("is-hidden", decisions.length !== 0);
+  table.classList.toggle("is-hidden", decisions.length === 0);
+  decisions.slice(0, 50).forEach(item => {
+    const row = document.createElement("tr");
+    const decision = String(item.decision || "retain").replaceAll("_", " ");
+    const turns = `${formatInteger(item.expected_turns_incumbent)} / ${formatInteger(item.expected_turns_candidate)}`;
+    const served = shortModel(item.actual_model);
+    const expected = item.decision === "switch" ? shortModel(item.candidate) : shortModel(item.incumbent);
+    const models = `${shortModel(item.incumbent)} → ${shortModel(item.candidate)}${served !== expected ? ` (served ${served})` : ""}`;
+    const breakEven = Number(item.break_even_turns) > 0 ? `${Number(item.break_even_turns).toFixed(2)} turns` : "—";
+    const cache = Number(item.cache_read_tokens) > 0
+      ? `${formatCompact(item.cache_read_tokens)} read`
+      : Number(item.cache_creation_tokens) > 0
+        ? `${formatCompact(item.cache_creation_tokens)} written`
+        : "No cache tokens";
+    [decision, models, turns, formatMoney(item.stay_cost_usd), formatMoney(item.switch_cost_usd),
+      formatMoney(item.estimated_savings_usd), breakEven, cache].forEach((value, index) => {
+      const cell = document.createElement(index === 0 ? "th" : "td");
+      if (index === 0) cell.scope = "row";
+      cell.textContent = value;
+      if (index === 5 && Number(item.estimated_savings_usd) < 0) cell.classList.add("is-negative");
+      row.append(cell);
+    });
+    body.append(row);
+  });
+}
+
+function shortModel(value) {
+  const model = String(value || "—");
+  const slash = model.indexOf("/");
+  return slash >= 0 ? model.slice(slash + 1) : model;
 }
 
 function formatMoney(value) {
@@ -250,6 +296,7 @@ function addProvider(provider = {}, markDirty = true) {
   const values = {
     name: provider.name || "",
     kind: provider.kind || provider.name || "anthropic",
+    location: provider.location || "remote",
     api_key_env: provider.api_key_env || "",
     // The server sends an opaque placeholder, never the stored key. Round-trip
     // it byte for byte and the server keeps the key belonging to this row —
@@ -289,6 +336,10 @@ function addModel(model = {}, markDirty = true) {
     // Zero means unconstrained, so show it as an empty field with the "No limit"
     // placeholder rather than a bare 0. collectDocument maps it back to 0.
     max_output_tokens: model.caps?.max_output_tokens || "",
+    efficiency_trivial: model.turn_efficiency?.trivial || "",
+    efficiency_low: model.turn_efficiency?.low || "",
+    efficiency_medium: model.turn_efficiency?.medium || "",
+    efficiency_high: model.turn_efficiency?.high || "",
   };
   Object.entries(scalarValues).forEach(([field, value]) => {
     $(`[data-field="${field}"]`, item).value = value;
@@ -306,6 +357,7 @@ function collectDocument() {
   const providers = $$(".provider-item").map(item => ({
     name: $('[data-field="name"]', item).value.trim(),
     kind: $('[data-field="kind"]', item).value,
+    location: $('[data-field="location"]', item).value,
     api_key_env: $('[data-field="api_key_env"]', item).value.trim(),
     api_key: $('[data-field="api_key"]', item).value,
     base_url: $('[data-field="base_url"]', item).value.trim(),
@@ -323,6 +375,12 @@ function collectDocument() {
       max_context: Number($('[data-field="max_context"]', item).value),
       max_output_tokens: Number($('[data-field="max_output_tokens"]', item).value || 0),
     },
+    turn_efficiency: {
+      trivial: Number($('[data-field="efficiency_trivial"]', item).value || 0),
+      low: Number($('[data-field="efficiency_low"]', item).value || 0),
+      medium: Number($('[data-field="efficiency_medium"]', item).value || 0),
+      high: Number($('[data-field="efficiency_high"]', item).value || 0),
+    },
   }));
   return {
     server_addr: $("#server-address").value.trim(),
@@ -337,7 +395,16 @@ function collectDocument() {
       timeout: $("#classifier-timeout").value.trim(),
     },
     weights: {quality: numberValue("#weight-quality"), cost: numberValue("#weight-cost"), speed: numberValue("#weight-speed")},
-    routing: {session_sticky: $("#session-sticky").checked, session_ttl: $("#session-ttl").value.trim(), cache_aware: $("#cache-aware").checked, max_attempts: Number($("#max-attempts").value.trim() || 3)},
+    routing: {
+      strategy: $("#routing-strategy").value,
+      data_policy: $("#data-policy").value,
+      session_ttl: $("#session-ttl").value.trim(), cache_aware: $("#cache-aware").checked,
+      max_attempts: Number($("#max-attempts").value.trim() || 3),
+      default_remaining_turns: numberValue("#default-remaining-turns"),
+      min_switch_savings_usd: numberValue("#min-switch-savings-usd"),
+      min_switch_savings_pct: numberValue("#min-switch-savings-pct"),
+      switch_confidence: numberValue("#switch-confidence"),
+    },
     providers,
     catalog,
   };
@@ -399,6 +466,14 @@ function toggleClassifier() {
   });
 }
 
+function toggleRoutingStrategy() {
+  const amortized = $("#routing-strategy").value === "amortized";
+  $$("input", $("#amortized-fields")).forEach(input => {
+    input.disabled = !amortized;
+    input.required = amortized;
+  });
+}
+
 function showNotice(message, success) {
   const notice = $("#notice");
   notice.textContent = message;
@@ -437,6 +512,7 @@ document.addEventListener("input", event => {
 $("#insights-range").addEventListener("change", loadInsights);
 
 $("#classifier-enabled").addEventListener("change", toggleClassifier);
+$("#routing-strategy").addEventListener("change", toggleRoutingStrategy);
 window.addEventListener("beforeunload", event => {
   if (!dirty) return;
   event.preventDefault();

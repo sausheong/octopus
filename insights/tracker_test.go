@@ -103,6 +103,51 @@ func TestTrackerRecordsConcurrentRequests(t *testing.T) {
 	}
 }
 
+func TestTrackerReportsPromptFreeSwitchEconomics(t *testing.T) {
+	now := time.Date(2026, 8, 6, 1, 0, 0, 0, time.Local)
+	path := filepath.Join(t.TempDir(), "insights.json")
+	tracker := newTracker(path, func() time.Time { return now })
+	tracker.Record(Observation{
+		Chat:  llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: "do not persist me"}}},
+		Model: "p/candidate",
+		Decision: router.Decision{
+			Strategy: config.RoutingStrategyAmortized, Eligible: []string{"p/incumbent", "p/candidate"},
+			Economics: &router.SwitchEconomics{
+				Incumbent: "p/incumbent", Candidate: "p/candidate", Decision: "switch",
+				ExpectedTurnsIncumbent: 4, ExpectedTurnsCandidate: 3, Confidence: 0.8,
+				StayCostUSD: 1.2, SwitchCostUSD: 0.7, EstimatedSavingsUSD: 0.5, BreakEvenTurns: 2.28,
+			},
+		},
+		Usage:   &llm.Usage{InputTokens: 100, OutputTokens: 10, CacheReadInputTokens: 80},
+		Catalog: []config.CatalogEntry{{ID: "p/incumbent", Quality: 1}, {ID: "p/candidate", Quality: 0.8}},
+	})
+	report := tracker.Report(7)
+	if report.Summary.AmortizedDecisions != 1 || report.Summary.AmortizedSwitches != 1 {
+		t.Fatalf("summary = %+v", report.Summary)
+	}
+	if len(report.RoutingDecisions) != 1 || report.RoutingDecisions[0].BreakEvenTurns != 2.28 || report.RoutingDecisions[0].CacheReadTokens != 80 {
+		t.Fatalf("routing decisions = %+v", report.RoutingDecisions)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "do not persist me") {
+		t.Fatal("switch ledger retained request content")
+	}
+}
+
+func TestTrackerMigratesVersionOneLedger(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "insights.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"created_at":"2026-07-20T00:00:00Z","days":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tracker := newTracker(path, time.Now)
+	if tracker.lastErr != "" || tracker.ledger.Version != ledgerVersion {
+		t.Fatalf("migration failed: version=%d error=%q", tracker.ledger.Version, tracker.lastErr)
+	}
+}
+
 func closeEnough(t *testing.T, got, want float64) {
 	t.Helper()
 	if math.Abs(got-want) > 1e-9 {

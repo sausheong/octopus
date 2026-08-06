@@ -16,6 +16,11 @@ type TaskProfile struct {
 	EstTokensIn    int    `json:"est_tokens_in"`
 	EstTokensOut   int    `json:"est_tokens_out"`
 	Domain         string `json:"domain"`
+	// ExpectedRemainingTurns is the classifier's task horizon, including the
+	// current turn. EstimateConfidence controls whether amortized routing may
+	// move away from an eligible incumbent.
+	ExpectedRemainingTurns int     `json:"expected_remaining_turns"`
+	EstimateConfidence     float64 `json:"estimate_confidence"`
 }
 
 // DefaultProfile is the conservative fallback used when the classifier call
@@ -28,6 +33,9 @@ func DefaultProfile() TaskProfile {
 		EstTokensIn:    4000,
 		EstTokensOut:   2000,
 		Domain:         "other",
+		// Zero lets Router apply routing.default_remaining_turns.
+		ExpectedRemainingTurns: 0,
+		EstimateConfidence:     0.25,
 	}
 }
 
@@ -35,10 +43,12 @@ func DefaultProfile() TaskProfile {
 // Routes toward cheap/fast models; no special capabilities assumed.
 func TrivialProfile() TaskProfile {
 	return TaskProfile{
-		Difficulty:   "trivial",
-		EstTokensIn:  100,
-		EstTokensOut: 200,
-		Domain:       "other",
+		Difficulty:             "trivial",
+		EstTokensIn:            100,
+		EstTokensOut:           200,
+		Domain:                 "other",
+		ExpectedRemainingTurns: 1,
+		EstimateConfidence:     1,
 	}
 }
 

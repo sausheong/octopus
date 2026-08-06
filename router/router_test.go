@@ -18,7 +18,7 @@ func testCfg() *config.Config {
 		ServerAddr:   "x",
 		Classifier:   config.ClassifierCfg{Model: "anthropic/haiku", MaxTokens: 256, Timeout: time.Second},
 		Weights:      config.Weights{Quality: 0.5, Cost: 0.3, Speed: 0.2},
-		Routing:      config.RoutingCfg{SessionSticky: true, SessionTTL: time.Hour, CacheAware: true},
+		Routing:      config.RoutingCfg{Strategy: config.RoutingStrategySticky, SessionSticky: true, SessionTTL: time.Hour, CacheAware: true},
 		DefaultModel: "anthropic/haiku",
 		Providers:    map[string]config.ProviderCreds{"anthropic": {APIKeyEnv: "RT_ANTHROPIC"}},
 		Catalog: []config.CatalogEntry{
@@ -42,8 +42,131 @@ func TestRouteKeepsStickySessionOnSuccessfulModel(t *testing.T) {
 	}
 }
 
+func placementCfg(policy string) *config.Config {
+	return &config.Config{
+		ServerAddr: "127.0.0.1:8787",
+		Classifier: config.ClassifierCfg{Model: "cloud/classifier", MaxTokens: 64, Timeout: time.Second},
+		Weights:    config.Weights{Cost: 1},
+		Routing: config.RoutingCfg{
+			Strategy: config.RoutingStrategyPerTurn, DataPolicy: policy,
+			DefaultRemainingTurns: 4, MaxAttempts: 3,
+		},
+		Providers: map[string]config.ProviderCreds{
+			"local": {Kind: "openai", Location: config.ProviderLocationLocal, BaseURL: "http://127.0.0.1:11434/v1"},
+			"cloud": {Kind: "anthropic", Location: config.ProviderLocationRemote, APIKey: "test"},
+		},
+		Catalog: []config.CatalogEntry{
+			{ID: "cloud/cheap", Quality: 0.8, CostPerMTokIn: 0.1, CostPerMTokOut: 0.1, Speed: 1, Caps: config.Caps{Tools: true, MaxContext: 100000}},
+			{ID: "local/model", Quality: 0.5, CostPerMTokIn: 10, CostPerMTokOut: 10, Speed: 0.5, Caps: config.Caps{MaxContext: 100000}},
+		},
+	}
+}
+
+func TestLocalOnlyBlocksRemoteClassifierAndCatalog(t *testing.T) {
+	cfg := placementCfg(config.DataPolicyLocalOnly)
+	reg, err := registry.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewRouter(cfg, reg)
+	classifierCalled := false
+	r.classifyFn = func(context.Context, llm.LLMProvider, string, int, llm.Message) TaskProfile {
+		classifierCalled = true
+		return TrivialProfile()
+	}
+	d := r.Route(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: strings.Repeat("x", 600)}}})
+	if classifierCalled {
+		t.Fatal("remote classifier was called under local_only")
+	}
+	if d.Chosen != "local/model" || len(d.Eligible) != 1 || d.Eligible[0] != "local/model" {
+		t.Fatalf("local-only decision escaped local catalog: %+v", d)
+	}
+	if d.ClassifierModel != "" || d.DataPolicy != config.DataPolicyLocalOnly || !d.RemoteFallbackBlocked {
+		t.Fatalf("decision placement metadata = %+v", d)
+	}
+}
+
+func TestLocalOnlyAllowsExplicitlyLocalClassifier(t *testing.T) {
+	cfg := placementCfg(config.DataPolicyLocalOnly)
+	cfg.Classifier.Model = "local/model"
+	reg, err := registry.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewRouter(cfg, reg)
+	classifierCalled := false
+	r.classifyFn = func(context.Context, llm.LLMProvider, string, int, llm.Message) TaskProfile {
+		classifierCalled = true
+		return TaskProfile{Difficulty: "low", EstTokensIn: 100, EstTokensOut: 100, ExpectedRemainingTurns: 1, EstimateConfidence: 1}
+	}
+	d := r.Route(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: strings.Repeat("x", 600)}}})
+	if !classifierCalled || d.ClassifierModel != "local/model" {
+		t.Fatalf("explicit local classifier was not used: called=%v decision=%+v", classifierCalled, d)
+	}
+}
+
+func TestLocalOnlyDoesNotRetainRemoteStickyIncumbent(t *testing.T) {
+	cfg := placementCfg(config.DataPolicyLocalOnly)
+	cfg.Routing.Strategy = config.RoutingStrategySticky
+	reg, err := registry.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewRouter(cfg, reg)
+	chat := llm.ChatRequest{SessionID: "placement-session", Messages: []llm.Message{{Role: "user", Content: "hello"}}}
+	r.Observe(chat, "cloud/cheap", &llm.Usage{})
+	d := r.Route(context.Background(), chat)
+	if d.Chosen != "local/model" {
+		t.Fatalf("remote sticky incumbent escaped local_only: %+v", d)
+	}
+}
+
+func TestLocalOnlyFailsClosedWhenLocalModelIneligible(t *testing.T) {
+	cfg := placementCfg(config.DataPolicyLocalOnly)
+	reg, err := registry.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewRouter(cfg, reg)
+	d := r.Route(context.Background(), llm.ChatRequest{
+		Tools:    []llm.ToolDef{{Name: "lookup", Parameters: []byte(`{"type":"object"}`)}},
+		Messages: []llm.Message{{Role: "user", Content: "use the tool"}},
+	})
+	if !d.NoEligible || d.Chosen != "" || len(d.Eligible) != 0 {
+		t.Fatalf("local_only should fail closed, got %+v", d)
+	}
+}
+
+func TestPreferLocalUsesLocalWhenEligible(t *testing.T) {
+	cfg := placementCfg(config.DataPolicyPreferLocal)
+	reg, err := registry.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewRouter(cfg, reg).Route(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: "hello"}}})
+	if d.Chosen != "local/model" || len(d.Eligible) != 1 {
+		t.Fatalf("prefer_local did not restrict eligible set to local: %+v", d)
+	}
+}
+
+func TestPreferLocalAllowsRemoteWhenNoLocalModelEligible(t *testing.T) {
+	cfg := placementCfg(config.DataPolicyPreferLocal)
+	reg, err := registry.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewRouter(cfg, reg).Route(context.Background(), llm.ChatRequest{
+		Tools:    []llm.ToolDef{{Name: "lookup", Parameters: []byte(`{"type":"object"}`)}},
+		Messages: []llm.Message{{Role: "user", Content: "use the tool"}},
+	})
+	if d.Chosen != "cloud/cheap" || len(d.Eligible) != 1 {
+		t.Fatalf("prefer_local did not allow remote fallback when local was ineligible: %+v", d)
+	}
+}
+
 func TestRoutePricesKnownCacheReadBelowNewCacheWrite(t *testing.T) {
 	cfg := testCfg()
+	cfg.Routing.Strategy = config.RoutingStrategyPerTurn
 	cfg.Routing.SessionSticky = false
 	cfg.Weights = config.Weights{Cost: 1}
 	cfg.Catalog = []config.CatalogEntry{
@@ -62,6 +185,24 @@ func TestRoutePricesKnownCacheReadBelowNewCacheWrite(t *testing.T) {
 	d := r.Route(context.Background(), chat)
 	if d.Chosen != "anthropic/cached" {
 		t.Fatalf("chosen = %q, scores = %+v", d.Chosen, d.Scores)
+	}
+}
+
+func TestNeedsObservationByStrategy(t *testing.T) {
+	for _, test := range []struct {
+		strategy   string
+		cacheAware bool
+		want       bool
+	}{
+		{config.RoutingStrategyAmortized, false, true},
+		{config.RoutingStrategySticky, false, true},
+		{config.RoutingStrategyPerTurn, true, true},
+		{config.RoutingStrategyPerTurn, false, false},
+	} {
+		r := &Router{cfg: &config.Config{Routing: config.RoutingCfg{Strategy: test.strategy, CacheAware: test.cacheAware}}}
+		if got := r.NeedsObservation(); got != test.want {
+			t.Errorf("strategy=%s cache=%v got %v, want %v", test.strategy, test.cacheAware, got, test.want)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sausheong/octopus/config"
 	"github.com/sausheong/octopus/desktop"
 	"github.com/sausheong/octopus/insights"
 )
@@ -49,7 +50,12 @@ func TestSettingsStructuredSavePreservesAttemptsAndOutputCap(t *testing.T) {
 	server := NewServer(store, func(_ context.Context) error { return nil }, nil)
 	doc := defaultDocument()
 	doc.Routing.MaxAttempts = 7
+	doc.Routing.DefaultRemainingTurns = 8
+	doc.Routing.MinSwitchSavingsUSD = 0.025
+	doc.Routing.MinSwitchSavingsPct = 0.2
+	doc.Routing.SwitchConfidence = 0.75
 	doc.Catalog[0].Caps.MaxOutputTokens = 8192
+	doc.Catalog[0].TurnEfficiency = config.TurnEfficiency{Trivial: 0.8, Low: 0.9, Medium: 1.1, High: 1.3}
 	body, err := json.Marshal(doc)
 	if err != nil {
 		t.Fatal(err)
@@ -73,6 +79,13 @@ func TestSettingsStructuredSavePreservesAttemptsAndOutputCap(t *testing.T) {
 	}
 	if saved.Catalog[0].Caps.MaxOutputTokens != 8192 {
 		t.Errorf("caps.max_output_tokens = %d after save, want 8192", saved.Catalog[0].Caps.MaxOutputTokens)
+	}
+	if saved.Routing.DefaultRemainingTurns != 8 || saved.Routing.MinSwitchSavingsUSD != 0.025 ||
+		saved.Routing.MinSwitchSavingsPct != 0.2 || saved.Routing.SwitchConfidence != 0.75 {
+		t.Errorf("amortized routing fields were not preserved: %+v", saved.Routing)
+	}
+	if saved.Catalog[0].TurnEfficiency != doc.Catalog[0].TurnEfficiency {
+		t.Errorf("turn efficiency = %+v, want %+v", saved.Catalog[0].TurnEfficiency, doc.Catalog[0].TurnEfficiency)
 	}
 }
 
@@ -109,6 +122,33 @@ func TestSettingsStateUsesBrowserFieldNames(t *testing.T) {
 	routing := document["routing"].(map[string]any)
 	if routing["max_attempts"] != float64(3) {
 		t.Errorf("routing.max_attempts = %#v, want 3", routing["max_attempts"])
+	}
+	for key := range map[string]bool{
+		"strategy": true, "data_policy": true, "default_remaining_turns": true, "min_switch_savings_usd": true,
+		"min_switch_savings_pct": true, "switch_confidence": true,
+	} {
+		if _, ok := routing[key]; !ok {
+			t.Errorf("routing is missing %s: %#v", key, routing)
+		}
+	}
+	if _, ok := catalog[0].(map[string]any)["turn_efficiency"]; !ok {
+		t.Errorf("catalog is missing turn_efficiency: %#v", catalog[0])
+	}
+}
+
+func TestBrowserRoundTripsAmortizedRoutingFields(t *testing.T) {
+	data, err := staticFiles.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, field := range []string{
+		"strategy", "data_policy", "location", "default_remaining_turns",
+		"min_switch_savings_usd", "min_switch_savings_pct", "switch_confidence", "turn_efficiency",
+	} {
+		if !strings.Contains(source, field) {
+			t.Errorf("app.js does not round-trip %s", field)
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -34,14 +35,45 @@ type Caps struct {
 	MaxOutputTokens int `yaml:"max_output_tokens" json:"max_output_tokens"`
 }
 
+// TurnEfficiency estimates how much task progress a model makes per turn at
+// each difficulty. A value of 1 is the neutral prior; 2 means the model is
+// expected to finish the same work in half as many turns. Zero in YAML means
+// "unspecified" and is treated as 1 for backwards compatibility.
+type TurnEfficiency struct {
+	Trivial float64 `yaml:"trivial,omitempty" json:"trivial"`
+	Low     float64 `yaml:"low,omitempty" json:"low"`
+	Medium  float64 `yaml:"medium,omitempty" json:"medium"`
+	High    float64 `yaml:"high,omitempty" json:"high"`
+}
+
+// ForDifficulty returns the configured prior, defaulting to the neutral 1.0.
+func (e TurnEfficiency) ForDifficulty(difficulty string) float64 {
+	value := 0.0
+	switch difficulty {
+	case "trivial":
+		value = e.Trivial
+	case "low":
+		value = e.Low
+	case "medium":
+		value = e.Medium
+	case "high":
+		value = e.High
+	}
+	if value <= 0 {
+		return 1
+	}
+	return value
+}
+
 // CatalogEntry is one candidate model. ID is "provider/model".
 type CatalogEntry struct {
-	ID             string  `yaml:"id"`
-	Quality        float64 `yaml:"quality"`
-	CostPerMTokIn  float64 `yaml:"cost_per_mtok_in"`
-	CostPerMTokOut float64 `yaml:"cost_per_mtok_out"`
-	Speed          float64 `yaml:"speed"`
-	Caps           Caps    `yaml:"caps"`
+	ID             string         `yaml:"id"`
+	Quality        float64        `yaml:"quality"`
+	CostPerMTokIn  float64        `yaml:"cost_per_mtok_in"`
+	CostPerMTokOut float64        `yaml:"cost_per_mtok_out"`
+	Speed          float64        `yaml:"speed"`
+	Caps           Caps           `yaml:"caps"`
+	TurnEfficiency TurnEfficiency `yaml:"turn_efficiency,omitempty"`
 }
 
 // ProviderCreds names the env var holding a provider's API key, plus an
@@ -60,6 +92,9 @@ type ProviderCreds struct {
 	APIKeyEnv string `yaml:"api_key_env"`
 	BaseURL   string `yaml:"base_url"`
 	Kind      string `yaml:"kind"`
+	// Location declares whether requests stay on this machine. Providers are
+	// remote by default; local providers must use a loopback base URL.
+	Location string `yaml:"location,omitempty"`
 }
 
 // Key returns the resolved API key: the inline APIKey if set, otherwise the
@@ -74,6 +109,18 @@ func (p ProviderCreds) Key() string {
 	return ""
 }
 
+// IsLocalModel reports whether the provider named by a provider/model catalog
+// ID is explicitly configured as local. Missing and legacy locations are
+// deliberately remote: local-only routing must fail closed.
+func (c *Config) IsLocalModel(id string) bool {
+	provider, ok := providerOf(id)
+	if !ok {
+		return false
+	}
+	creds, ok := c.Providers[provider]
+	return ok && creds.Location == ProviderLocationLocal
+}
+
 // ClassifierCfg configures the fixed classifier model call.
 type ClassifierCfg struct {
 	Model     string        `yaml:"model"`
@@ -81,11 +128,37 @@ type ClassifierCfg struct {
 	Timeout   time.Duration `yaml:"timeout"`
 }
 
+const (
+	RoutingStrategyAmortized = "amortized"
+	RoutingStrategySticky    = "sticky"
+	RoutingStrategyPerTurn   = "per_turn"
+)
+
+const (
+	DataPolicyAllowRemote  = "allow_remote"
+	DataPolicyPreferLocal  = "prefer_local"
+	DataPolicyLocalOnly    = "local_only"
+	ProviderLocationLocal  = "local"
+	ProviderLocationRemote = "remote"
+)
+
 // RoutingCfg controls conversation affinity and cache-aware request pricing.
 type RoutingCfg struct {
-	SessionSticky bool          `yaml:"session_sticky"`
-	SessionTTL    time.Duration `yaml:"session_ttl"`
-	CacheAware    bool          `yaml:"cache_aware"`
+	// Strategy selects hard affinity, greedy per-turn scoring, or a
+	// cost-to-completion comparison that amortises the first cold cache write.
+	Strategy string `yaml:"strategy"`
+	// DataPolicy controls whether remote providers may receive request data.
+	DataPolicy string `yaml:"data_policy"`
+	// SessionSticky is retained as an in-memory compatibility field for code
+	// constructing Config directly. Parsed legacy YAML is translated to
+	// Strategy and newly marshalled YAML writes strategy instead.
+	SessionSticky         bool          `yaml:"session_sticky"`
+	SessionTTL            time.Duration `yaml:"session_ttl"`
+	CacheAware            bool          `yaml:"cache_aware"`
+	DefaultRemainingTurns int           `yaml:"default_remaining_turns"`
+	MinSwitchSavingsUSD   float64       `yaml:"min_switch_savings_usd"`
+	MinSwitchSavingsPct   float64       `yaml:"min_switch_savings_pct"`
+	SwitchConfidence      float64       `yaml:"switch_confidence"`
 	// MaxAttempts bounds how many backends one request may try. Without it,
 	// worst-case latency and spend grow with catalog size.
 	MaxAttempts int `yaml:"max_attempts"`
@@ -143,10 +216,16 @@ type yamlConfig struct {
 }
 
 type yamlRoutingCfg struct {
-	SessionSticky *bool         `yaml:"session_sticky"`
-	SessionTTL    time.Duration `yaml:"session_ttl"`
-	CacheAware    *bool         `yaml:"cache_aware"`
-	MaxAttempts   *int          `yaml:"max_attempts"`
+	Strategy              string        `yaml:"strategy,omitempty"`
+	DataPolicy            string        `yaml:"data_policy,omitempty"`
+	SessionSticky         *bool         `yaml:"session_sticky,omitempty"`
+	SessionTTL            time.Duration `yaml:"session_ttl"`
+	CacheAware            *bool         `yaml:"cache_aware"`
+	MaxAttempts           *int          `yaml:"max_attempts"`
+	DefaultRemainingTurns *int          `yaml:"default_remaining_turns"`
+	MinSwitchSavingsUSD   *float64      `yaml:"min_switch_savings_usd"`
+	MinSwitchSavingsPct   *float64      `yaml:"min_switch_savings_pct"`
+	SwitchConfidence      *float64      `yaml:"switch_confidence"`
 }
 
 // Load reads, parses, and validates the config at path.
@@ -166,9 +245,21 @@ func Parse(data []byte) (*Config, error) {
 	if err := dec.Decode(&yc); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	sticky, cacheAware := true, true
-	if yc.Routing.SessionSticky != nil {
-		sticky = *yc.Routing.SessionSticky
+	cacheAware := true
+	strategy := yc.Routing.Strategy
+	if strategy == "" {
+		strategy = RoutingStrategyAmortized
+		if yc.Routing.SessionSticky != nil {
+			if *yc.Routing.SessionSticky {
+				strategy = RoutingStrategySticky
+			} else {
+				strategy = RoutingStrategyPerTurn
+			}
+		}
+	}
+	dataPolicy := yc.Routing.DataPolicy
+	if dataPolicy == "" {
+		dataPolicy = DataPolicyAllowRemote
 	}
 	if yc.Routing.CacheAware != nil {
 		cacheAware = *yc.Routing.CacheAware
@@ -181,16 +272,38 @@ func Parse(data []byte) (*Config, error) {
 	if yc.Routing.MaxAttempts != nil {
 		maxAttempts = *yc.Routing.MaxAttempts
 	}
+	defaultRemainingTurns := 4
+	if yc.Routing.DefaultRemainingTurns != nil {
+		defaultRemainingTurns = *yc.Routing.DefaultRemainingTurns
+	}
+	minSwitchSavingsUSD := 0.01
+	if yc.Routing.MinSwitchSavingsUSD != nil {
+		minSwitchSavingsUSD = *yc.Routing.MinSwitchSavingsUSD
+	}
+	minSwitchSavingsPct := 0.10
+	if yc.Routing.MinSwitchSavingsPct != nil {
+		minSwitchSavingsPct = *yc.Routing.MinSwitchSavingsPct
+	}
+	switchConfidence := 0.60
+	if yc.Routing.SwitchConfidence != nil {
+		switchConfidence = *yc.Routing.SwitchConfidence
+	}
 	c := &Config{
 		ServerAddr:   yc.Server.Addr,
 		AuthTokenEnv: yc.Server.AuthTokenEnv,
 		Classifier:   yc.Classifier,
 		Weights:      yc.Weights,
 		Routing: RoutingCfg{
-			SessionSticky: sticky,
-			SessionTTL:    sessionTTL,
-			CacheAware:    cacheAware,
-			MaxAttempts:   maxAttempts,
+			Strategy:              strategy,
+			DataPolicy:            dataPolicy,
+			SessionSticky:         strategy == RoutingStrategySticky,
+			SessionTTL:            sessionTTL,
+			CacheAware:            cacheAware,
+			MaxAttempts:           maxAttempts,
+			DefaultRemainingTurns: defaultRemainingTurns,
+			MinSwitchSavingsUSD:   minSwitchSavingsUSD,
+			MinSwitchSavingsPct:   minSwitchSavingsPct,
+			SwitchConfidence:      switchConfidence,
 		},
 		DefaultModel: yc.DefaultModel,
 		Providers:    yc.Providers,
@@ -211,12 +324,19 @@ func Marshal(c *Config) ([]byte, error) {
 	if err := copyCfg.Validate(); err != nil {
 		return nil, err
 	}
-	sticky := copyCfg.Routing.SessionSticky
 	cacheAware := copyCfg.Routing.CacheAware
 	yc := yamlConfig{
-		Classifier:   copyCfg.Classifier,
-		Weights:      copyCfg.Weights,
-		Routing:      yamlRoutingCfg{SessionSticky: &sticky, SessionTTL: copyCfg.Routing.SessionTTL, CacheAware: &cacheAware, MaxAttempts: &copyCfg.Routing.MaxAttempts},
+		Classifier: copyCfg.Classifier,
+		Weights:    copyCfg.Weights,
+		Routing: yamlRoutingCfg{
+			Strategy:   copyCfg.Routing.Strategy,
+			DataPolicy: copyCfg.Routing.DataPolicy,
+			SessionTTL: copyCfg.Routing.SessionTTL, CacheAware: &cacheAware, MaxAttempts: &copyCfg.Routing.MaxAttempts,
+			DefaultRemainingTurns: &copyCfg.Routing.DefaultRemainingTurns,
+			MinSwitchSavingsUSD:   &copyCfg.Routing.MinSwitchSavingsUSD,
+			MinSwitchSavingsPct:   &copyCfg.Routing.MinSwitchSavingsPct,
+			SwitchConfidence:      &copyCfg.Routing.SwitchConfidence,
+		},
 		DefaultModel: copyCfg.DefaultModel,
 		Providers:    copyCfg.Providers,
 		Catalog:      copyCfg.Catalog,
@@ -269,8 +389,44 @@ func (c *Config) Validate() error {
 	if c.Routing.SessionTTL < 0 {
 		return fmt.Errorf("routing.session_ttl must not be negative")
 	}
-	if c.Routing.SessionSticky && c.Routing.SessionTTL == 0 {
+	if c.Routing.Strategy == "" {
+		if c.Routing.SessionSticky {
+			c.Routing.Strategy = RoutingStrategySticky
+		} else {
+			c.Routing.Strategy = RoutingStrategyAmortized
+		}
+	}
+	switch c.Routing.Strategy {
+	case RoutingStrategyAmortized, RoutingStrategySticky, RoutingStrategyPerTurn:
+	default:
+		return fmt.Errorf("routing.strategy must be amortized, sticky, or per_turn")
+	}
+	if c.Routing.DataPolicy == "" {
+		c.Routing.DataPolicy = DataPolicyAllowRemote
+	}
+	switch c.Routing.DataPolicy {
+	case DataPolicyAllowRemote, DataPolicyPreferLocal, DataPolicyLocalOnly:
+	default:
+		return fmt.Errorf("routing.data_policy must be allow_remote, prefer_local, or local_only")
+	}
+	c.Routing.SessionSticky = c.Routing.Strategy == RoutingStrategySticky
+	if c.Routing.SessionTTL == 0 {
 		c.Routing.SessionTTL = time.Hour
+	}
+	if c.Routing.DefaultRemainingTurns == 0 {
+		c.Routing.DefaultRemainingTurns = 4
+	}
+	if c.Routing.DefaultRemainingTurns < 1 || c.Routing.DefaultRemainingTurns > 50 {
+		return fmt.Errorf("routing.default_remaining_turns must be in [1,50]")
+	}
+	if !finite(c.Routing.MinSwitchSavingsUSD) || c.Routing.MinSwitchSavingsUSD < 0 {
+		return fmt.Errorf("routing.min_switch_savings_usd must be a finite non-negative number")
+	}
+	if !finite(c.Routing.MinSwitchSavingsPct) || c.Routing.MinSwitchSavingsPct < 0 || c.Routing.MinSwitchSavingsPct > 1 {
+		return fmt.Errorf("routing.min_switch_savings_pct must be in [0,1]")
+	}
+	if !finite(c.Routing.SwitchConfidence) || c.Routing.SwitchConfidence < 0 || c.Routing.SwitchConfidence > 1 {
+		return fmt.Errorf("routing.switch_confidence must be in [0,1]")
 	}
 	if c.Routing.MaxAttempts < 0 {
 		return fmt.Errorf("routing.max_attempts must not be negative")
@@ -295,6 +451,30 @@ func (c *Config) Validate() error {
 		}
 		if creds.APIKey == "" && creds.APIKeyEnv == "" && creds.BaseURL == "" {
 			return fmt.Errorf("provider %q must set api_key, api_key_env, or base_url", name)
+		}
+		location := creds.Location
+		if location == "" {
+			location = ProviderLocationRemote
+		}
+		switch location {
+		case ProviderLocationRemote:
+		case ProviderLocationLocal:
+			if creds.BaseURL == "" {
+				return fmt.Errorf("provider %q: local location requires a loopback base_url", name)
+			}
+			u, err := url.Parse(creds.BaseURL)
+			if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
+				return fmt.Errorf("provider %q: local base_url must be an absolute loopback URL", name)
+			}
+			host := u.Hostname()
+			if !strings.EqualFold(host, "localhost") {
+				ip := net.ParseIP(host)
+				if ip == nil || !ip.IsLoopback() {
+					return fmt.Errorf("provider %q: local base_url must use a loopback host", name)
+				}
+			}
+		default:
+			return fmt.Errorf("provider %q has unknown location %q (want local|remote)", name, location)
 		}
 	}
 	// Every catalog id must be provider/model, its provider configured, and
@@ -323,6 +503,14 @@ func (c *Config) Validate() error {
 		}
 		if e.CostPerMTokIn < 0 || e.CostPerMTokOut < 0 {
 			return fmt.Errorf("catalog id %q: costs must be non-negative", e.ID)
+		}
+		for difficulty, efficiency := range map[string]float64{
+			"trivial": e.TurnEfficiency.Trivial, "low": e.TurnEfficiency.Low,
+			"medium": e.TurnEfficiency.Medium, "high": e.TurnEfficiency.High,
+		} {
+			if !finite(efficiency) || efficiency < 0 {
+				return fmt.Errorf("catalog id %q: turn_efficiency.%s must be a finite non-negative number", e.ID, difficulty)
+			}
 		}
 		if e.Caps.MaxContext <= 0 {
 			return fmt.Errorf("catalog id %q: caps.max_context must be > 0", e.ID)

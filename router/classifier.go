@@ -17,6 +17,8 @@ Read the user's request and respond with ONLY a JSON object (no prose, no code f
 - "est_tokens_in": integer estimate of input size in tokens
 - "est_tokens_out": integer estimate of expected output size in tokens
 - "domain": one of "code","writing","qa","math","other"
+- "expected_remaining_turns": integer estimate from 1 to 50, including this turn
+- "estimate_confidence": number from 0 to 1 expressing confidence in that turn estimate
 Respond with the JSON object only.`
 
 // Classify runs the fixed classifier model on the given user turn and returns
@@ -61,13 +63,15 @@ func classifyWithUsage(ctx context.Context, prov llm.LLMProvider, model string, 
 // rawProfile is the wire type for classifier JSON — pointer fields let us
 // distinguish missing keys from zero/false values.
 type rawProfile struct {
-	Difficulty     *string `json:"difficulty"`
-	NeedsReasoning *bool   `json:"needs_reasoning"`
-	NeedsVision    *bool   `json:"needs_vision"`
-	NeedsTools     *bool   `json:"needs_tools"`
-	EstTokensIn    *int    `json:"est_tokens_in"`
-	EstTokensOut   *int    `json:"est_tokens_out"`
-	Domain         *string `json:"domain"`
+	Difficulty             *string  `json:"difficulty"`
+	NeedsReasoning         *bool    `json:"needs_reasoning"`
+	NeedsVision            *bool    `json:"needs_vision"`
+	NeedsTools             *bool    `json:"needs_tools"`
+	EstTokensIn            *int     `json:"est_tokens_in"`
+	EstTokensOut           *int     `json:"est_tokens_out"`
+	Domain                 *string  `json:"domain"`
+	ExpectedRemainingTurns *int     `json:"expected_remaining_turns"`
+	EstimateConfidence     *float64 `json:"estimate_confidence"`
 }
 
 // parseProfile extracts the first JSON object from s, validates required
@@ -89,16 +93,18 @@ func parseProfile(s string) (TaskProfile, bool) {
 	// an incomplete response — treat it as a failure and use DefaultProfile.
 	if raw.Difficulty == nil || raw.NeedsReasoning == nil || raw.NeedsVision == nil ||
 		raw.NeedsTools == nil || raw.EstTokensIn == nil || raw.EstTokensOut == nil ||
-		raw.Domain == nil {
+		raw.Domain == nil || raw.ExpectedRemainingTurns == nil || raw.EstimateConfidence == nil {
 		return TaskProfile{}, false
 	}
 
 	p := TaskProfile{
-		NeedsReasoning: *raw.NeedsReasoning,
-		NeedsVision:    *raw.NeedsVision,
-		NeedsTools:     *raw.NeedsTools,
-		EstTokensIn:    *raw.EstTokensIn,
-		EstTokensOut:   *raw.EstTokensOut,
+		NeedsReasoning:         *raw.NeedsReasoning,
+		NeedsVision:            *raw.NeedsVision,
+		NeedsTools:             *raw.NeedsTools,
+		EstTokensIn:            *raw.EstTokensIn,
+		EstTokensOut:           *raw.EstTokensOut,
+		ExpectedRemainingTurns: *raw.ExpectedRemainingTurns,
+		EstimateConfidence:     *raw.EstimateConfidence,
 	}
 
 	// Clamp difficulty to known values; unknown → conservative "high".
@@ -127,6 +133,18 @@ func parseProfile(s string) (TaskProfile, bool) {
 	}
 	if p.EstTokensOut > 1_000_000 {
 		p.EstTokensOut = 1_000_000
+	}
+	if p.ExpectedRemainingTurns < 1 {
+		p.ExpectedRemainingTurns = 1
+	}
+	if p.ExpectedRemainingTurns > 50 {
+		p.ExpectedRemainingTurns = 50
+	}
+	if p.EstimateConfidence < 0 {
+		p.EstimateConfidence = 0
+	}
+	if p.EstimateConfidence > 1 {
+		p.EstimateConfidence = 1
 	}
 
 	return p, true

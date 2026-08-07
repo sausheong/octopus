@@ -71,9 +71,6 @@ jobs:
       GOFLAGS: -mod=readonly
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          # Gitleaks scans committed history, not only the checked-out tip.
-          fetch-depth: 0
       - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
         with:
           go-version: '1.25.1'
@@ -81,14 +78,17 @@ jobs:
       - name: Install pinned security tools
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          go install github.com/gitleaks/gitleaks/v8@v8.30.1
+          go install github.com/zricethezav/gitleaks/v8@v8.30.1
           go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
       - name: Go vulnerability scan
         run: |
           "$(go env GOPATH)/bin/govulncheck" ./...
       - name: Secret scan
         run: |
-          "$(go env GOPATH)/bin/gitleaks" git --redact --no-banner .
+          scan_dir=$(mktemp -d)
+          trap 'rm -rf "$scan_dir"' EXIT
+          git archive HEAD | tar -x -C "$scan_dir"
+          "$(go env GOPATH)/bin/gitleaks" dir --redact --no-banner "$scan_dir"
       - name: Generate and validate CycloneDX SBOM
         run: |
           "$(go env GOPATH)/bin/cyclonedx-gomod" mod -json -output-version 1.6 -output /tmp/octopus.cdx.json .

@@ -1,7 +1,7 @@
 BINARY    := octopus
 CMD       := ./cmd/octopus
 GONOSUMDB := GONOSUMDB=github.com/sausheong/harness
-GOFLAGS   := GOWORK=off
+GOENV     := GOWORK=off
 UNAME_S   := $(shell uname -s)
 # GNU make's v% pattern also matches the ordinary `vet` target, so exclude it
 # before treating remaining v-prefixed goals as release versions.
@@ -25,7 +25,7 @@ else
 all: build
 
 build:
-	$(GONOSUMDB) $(GOFLAGS) go build -o $(BINARY) $(CMD)
+	$(GONOSUMDB) $(GOENV) go build -o $(BINARY) $(CMD)
 endif
 
 ## app: build dist/Octopus.app
@@ -60,15 +60,15 @@ open-app: app
 
 ## test: run all tests
 test:
-	$(GONOSUMDB) $(GOFLAGS) go test ./...
+	$(GONOSUMDB) $(GOENV) go test ./...
 
 ## test-race: run all tests with the race detector
 test-race:
-	$(GONOSUMDB) $(GOFLAGS) go test -race ./...
+	$(GONOSUMDB) $(GOENV) go test -race ./...
 
 ## vet: run go vet
 vet:
-	$(GONOSUMDB) $(GOFLAGS) go vet ./...
+	$(GONOSUMDB) $(GOENV) go vet ./...
 
 ## check: run the deterministic pre-release Go and evaluation checks
 check: test test-race vet
@@ -88,8 +88,8 @@ eval-gate:
 
 ## tidy: tidy and verify go.mod / go.sum
 tidy:
-	$(GONOSUMDB) GOPROXY=direct $(GOFLAGS) go mod tidy
-	$(GONOSUMDB) $(GOFLAGS) go mod verify
+	$(GONOSUMDB) GOPROXY=direct $(GOENV) go mod tidy
+	$(GONOSUMDB) $(GOENV) go mod verify
 
 ## run: build and run Octopus for the current system
 ifeq ($(UNAME_S),Darwin)

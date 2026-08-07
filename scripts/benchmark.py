@@ -15,6 +15,7 @@ Measures:
 
 import argparse
 import json
+import os
 import statistics
 import time
 import threading
@@ -39,10 +40,11 @@ ROUTER_BASE    = "http://localhost:8787/v1"
 ROUTER_API_KEY = "local"
 
 # Direct provider — DeepSeek's OpenAI-compatible endpoint.
-# Edit DIRECT_BASE / DIRECT_API_KEY / DIRECT_MODEL to point at any provider
-# that speaks the OpenAI Chat Completions API.
+# Set DIRECT_API_KEY in the environment before benchmarking. Edit DIRECT_BASE /
+# DIRECT_MODEL to point at any provider that speaks the OpenAI Chat Completions
+# API.
 DIRECT_BASE    = "https://api.deepseek.com/v1"
-DIRECT_API_KEY = "sk-74696b6ed30841bf83ab2c1d3ce3740e"
+DIRECT_API_KEY = os.environ.get("DIRECT_API_KEY", "")
 DIRECT_MODEL   = "deepseek-chat"   # DeepSeek's current V3 model alias
 
 # ── types ─────────────────────────────────────────────────────────────────────
@@ -282,6 +284,8 @@ def main():
     parser.add_argument("--output",      type=str, default=None, help="Save results to file")
     parser.add_argument("--router-only", action="store_true",    help="Only benchmark the router")
     args = parser.parse_args()
+    if not args.router_only and not DIRECT_API_KEY:
+        parser.error("DIRECT_API_KEY must be set unless --router-only is used")
 
     print(f"Benchmark: runs={args.runs}  concurrency={args.concurrency}  "
           f"mode={'streaming' if args.streaming else 'buffered'}")

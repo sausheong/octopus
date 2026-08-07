@@ -111,7 +111,10 @@ cleanup() {
   local status="$1"
   [ "$FAIL_COUNT" -gt 0 ] && status=1
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
-  wait 2>/dev/null || true
+  # Wait only for servers started by the harness. A bare `wait` also includes
+  # the process-substitution `tee` on Linux, which cannot exit until this shell
+  # closes stdout and therefore deadlocks cleanup.
+  for p in "${PIDS[@]:-}"; do wait "$p" 2>/dev/null || true; done
   echo "  [cleanup] stopped background processes; work dir: $WORK"
   if ! write_reports "$status"; then
     echo "  [report] ERROR: structured report generation or mandatory-result validation failed"

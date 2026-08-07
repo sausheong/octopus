@@ -1,0 +1,25 @@
+{
+  "mean_quality_delta_min": -0.25,
+  "quality_ci_lower_min": -0.50,
+  "savings_percent_min": 30.0,
+  "high_difficulty_recall_min": 0.95,
+  "minimum_runs": 5,
+  "minimum_judged_scenarios": 50,
+  "minimum_turns_per_run": 200,
+  "max_truncations": 0,
+  "required_arms": ["octopus", "haiku", "sonnet", "opus"],
+  "minimum_objective_assertions": 50,
+  "objective_pass_rate_min": 0.98,
+  "minimum_judge_models": 2,
+  "minimum_concurrency": 50,
+  "minimum_concurrent_streams": 50,
+  "require_provenance": true,
+  "validate_fixed_arms": true,
+  "require_attempt_accounting": true,
+  "high_quality_floor": 0.95,
+  "model_quality": {
+    "claude-haiku-4-5@20251001-global": 0.72,
+    "claude-sonnet-4-6-asia-southeast1": 0.88,
+    "claude-opus-4-8-global": 0.98
+  }
+}

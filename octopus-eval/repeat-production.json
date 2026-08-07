@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "suite": "production",
+  "description": "Predeclared five-run production evaluation. Each paid run must still be started explicitly with run2.sh --yes.",
+  "runs": [
+    {"id": "production-01", "seed": 2026080701, "command": "./run2.sh --yes --suite production --production-evidence --run-id production-01 --seed 2026080701 --output-prefix production-01 --budget-usd $RUN2_BUDGET_USD"},
+    {"id": "production-02", "seed": 2026080702, "command": "./run2.sh --yes --suite production --production-evidence --run-id production-02 --seed 2026080702 --output-prefix production-02 --budget-usd $RUN2_BUDGET_USD"},
+    {"id": "production-03", "seed": 2026080703, "command": "./run2.sh --yes --suite production --production-evidence --run-id production-03 --seed 2026080703 --output-prefix production-03 --budget-usd $RUN2_BUDGET_USD"},
+    {"id": "production-04", "seed": 2026080704, "command": "./run2.sh --yes --suite production --production-evidence --run-id production-04 --seed 2026080704 --output-prefix production-04 --budget-usd $RUN2_BUDGET_USD"},
+    {"id": "production-05", "seed": 2026080705, "command": "./run2.sh --yes --suite production --production-evidence --run-id production-05 --seed 2026080705 --output-prefix production-05 --budget-usd $RUN2_BUDGET_USD"}
+  ],
+  "required_artefacts_per_run": ["run2-results.json", "run2-summary.md", "run2-insights.json", "run2.log"],
+  "aggregate_command": "python3 scripts/production_gate.py production-01-results.json production-02-results.json production-03-results.json production-04-results.json production-05-results.json"
+}

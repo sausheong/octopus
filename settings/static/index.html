@@ -157,7 +157,7 @@
                 </div>
                 <div class="table-scroll">
                   <table>
-                    <thead><tr><th>Served by</th><th>Reason</th><th>Cost mode</th><th>Score contributions</th><th>Special handling</th></tr></thead>
+                    <thead><tr><th>Served by</th><th>Task</th><th>Reason</th><th>Quality policy</th><th>Classification</th><th>Score contributions</th><th>Special handling</th></tr></thead>
                     <tbody id="why-model-body"></tbody>
                   </table>
                 </div>
@@ -253,9 +253,21 @@
                 <span><strong>Cost reference</strong><small>USD request cost corresponding to half utility</small></span>
                 <input id="cost-reference-usd" type="number" min="0.000001" step="0.001" required>
               </label>
-              <label class="setting-row compact" for="high-quality-floor">
-                <span><strong>Hard-task quality floor</strong><small>Minimum quality for high-difficulty requests when a qualifying model exists</small></span>
-                <input id="high-quality-floor" type="number" min="0" max="1" step="0.01" required>
+              <label class="setting-row compact" for="quality-floor-trivial">
+                <span><strong>Trivial quality floor</strong><small>Hard minimum catalogue quality for trivial requests</small></span>
+                <input id="quality-floor-trivial" type="number" min="0" max="1" step="0.01" required>
+              </label>
+              <label class="setting-row compact" for="quality-floor-low">
+                <span><strong>Low quality floor</strong><small>Hard minimum catalogue quality for routine requests</small></span>
+                <input id="quality-floor-low" type="number" min="0" max="1" step="0.01" required>
+              </label>
+              <label class="setting-row compact" for="quality-floor-medium">
+                <span><strong>Medium quality floor</strong><small>Hard minimum catalogue quality for synthesis, coding, and analysis</small></span>
+                <input id="quality-floor-medium" type="number" min="0" max="1" step="0.01" required>
+              </label>
+              <label class="setting-row compact" for="quality-floor-high">
+                <span><strong>High quality floor</strong><small>Strict minimum for hard or critical work; the request fails if no model qualifies</small></span>
+                <input id="quality-floor-high" type="number" min="0" max="1" step="0.01" required>
               </label>
               <label class="setting-row compact" for="reasoning-bonus">
                 <span><strong>Reasoning preference</strong><small>Small explicit bonus for models with native reasoning; set 0 to disable</small></span>

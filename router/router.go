@@ -71,6 +71,11 @@ func NewRouter(cfg *config.Config, reg *registry.Registry) *Router {
 	if cfg.Routing.HighQualityFloor <= 0 {
 		cfg.Routing.HighQualityFloor = HighQualityFloor
 	}
+	if cfg.Routing.QualityFloors == nil {
+		cfg.Routing.QualityFloors = map[string]float64{"high": cfg.Routing.HighQualityFloor}
+	} else if _, ok := cfg.Routing.QualityFloors["high"]; !ok {
+		cfg.Routing.QualityFloors["high"] = cfg.Routing.HighQualityFloor
+	}
 	caching := make(map[string]bool, len(cfg.Catalog))
 	for _, entry := range cfg.Catalog {
 		prov, _, err := reg.Resolve(entry.ID)
@@ -108,11 +113,6 @@ func NewRouter(cfg *config.Config, reg *registry.Registry) *Router {
 	}
 }
 
-// shortCircuitTokens is the content-length threshold (in bytes, used as a
-// proxy for tokens) below which the classifier is skipped. Requests this
-// small are assumed trivial/low-difficulty with no special capability needs.
-const shortCircuitBytes = 500
-
 // Route classifies the last genuine user turn, applies request-derived
 // capability cross-checks, scores the catalog, and returns the Decision.
 func (r *Router) Route(ctx context.Context, chat llm.ChatRequest) Decision {
@@ -131,30 +131,23 @@ func (r *Router) RouteWithMetadata(ctx context.Context, chat llm.ChatRequest, me
 		}
 	}
 
-	// A valid sticky incumbent makes semantic classification irrelevant. Use a
-	// deterministic profile for fallback ordering and avoid the classifier call.
 	sid := ""
 	if r.cfg.Routing.Strategy != config.RoutingStrategyPerTurn || r.cfg.Routing.CacheAware {
 		sid = SessionID(chat)
-	}
-	stickyFastPath := false
-	if r.cfg.Routing.Strategy == config.RoutingStrategySticky {
-		if incumbent := r.stickyModelForSession(sid); incumbent != "" && r.deterministicallyEligible(chat, incumbent) {
-			stickyFastPath = true
-		}
 	}
 	turn, ok := LastUserTurn(chat.Messages)
 	var prof TaskProfile
 	var classifierUsage *llm.Usage
 	classifierModel := ""
-	if stickyFastPath {
+	classificationSource := "conservative_fallback"
+	classificationStatus := "no_user_turn"
+	var classifierLatencyMS int64
+	if background {
 		prof = TrivialProfile()
-		slog.Debug("classifier skipped (eligible sticky incumbent)")
+		classificationSource = "allowlisted_background"
+		classificationStatus = "skipped_allowlisted_background"
 	} else if !ok {
 		prof = DefaultProfile()
-	} else if isTrivial(chat, turn) {
-		prof = TrivialProfile()
-		slog.Debug("classifier skipped (trivial request)")
 	} else {
 		// A classifier receives request content before model scoring. Under a
 		// local-only policy it therefore has to be local too; otherwise skip it
@@ -163,13 +156,17 @@ func (r *Router) RouteWithMetadata(ctx context.Context, chat llm.ChatRequest, me
 		if !classifierAllowed {
 			slog.Info("remote classifier blocked by local-only data policy", "model", r.cfg.Classifier.Model)
 			prof = DefaultProfile()
+			classificationStatus = "blocked_by_data_policy"
 		} else {
 			prov, model, err := r.reg.Resolve(r.cfg.Classifier.Model)
 			if err != nil {
 				slog.Warn("classifier provider unresolved; using default profile", "err", err)
 				prof = DefaultProfile()
+				classificationStatus = "classifier_unavailable"
 			} else {
 				classifierModel = r.cfg.Classifier.Model
+				classificationSource = "classifier"
+				classificationStatus = "completed"
 				cctx := ctx
 				if r.cfg.Classifier.Timeout > 0 {
 					var cancel context.CancelFunc
@@ -177,14 +174,27 @@ func (r *Router) RouteWithMetadata(ctx context.Context, chat llm.ChatRequest, me
 					defer cancel()
 				}
 				classifierTurn := classificationTurn(chat, turn)
+				started := time.Now()
 				if r.classifyFn != nil {
 					prof = r.classifyFn(cctx, prov, model, r.cfg.Classifier.MaxTokens, classifierTurn)
 				} else {
-					prof, classifierUsage = classifyWithUsageIdentity(cctx, prov, model, r.cfg.Classifier.Model, r.cfg.Classifier.MaxTokens, classifierTurn)
+					var observedSource string
+					prof, classifierUsage, observedSource = classifyWithUsageIdentityDetailed(cctx, prov, model, r.cfg.Classifier.Model, r.cfg.Classifier.MaxTokens, classifierTurn)
+					if observedSource == "classifier_cache" || observedSource == "classifier_coalesced" {
+						classificationSource = observedSource
+					}
+				}
+				classifierLatencyMS = time.Since(started).Milliseconds()
+				if prof.ClassificationSource == "conservative_fallback" {
+					classificationSource = "conservative_fallback"
+					classificationStatus = "classifier_failed"
+				} else if prof.ClassificationSource == "" {
+					prof.ClassificationSource = "classifier"
 				}
 			}
 		}
 	}
+	prof.ClassificationSource = classificationSource
 
 	// Request-derived cross-checks override the classifier's guesses: if the
 	// actual request carries images or tools, those capabilities are required.
@@ -221,6 +231,22 @@ func (r *Router) RouteWithMetadata(ctx context.Context, chat llm.ChatRequest, me
 	if prof.EstimateConfidence < 0 || prof.EstimateConfidence > 1 {
 		prof.EstimateConfidence = 0.25
 	}
+	if meta.MinQuality > prof.MinimumQuality {
+		prof.MinimumQuality = meta.MinQuality
+	}
+	// Consequence is independent of semantic difficulty. A critical request
+	// inherits at least the configured high-difficulty floor; an important one
+	// inherits at least the medium floor when present.
+	riskDifficulty := ""
+	switch prof.Risk {
+	case "critical":
+		riskDifficulty = "high"
+	case "important":
+		riskDifficulty = "medium"
+	}
+	if riskFloor := r.cfg.Routing.QualityFloors[riskDifficulty]; riskFloor > prof.MinimumQuality {
+		prof.MinimumQuality = riskFloor
+	}
 
 	var multipliers map[string]float64
 	if r.cfg.Routing.Strategy != config.RoutingStrategyAmortized {
@@ -244,6 +270,9 @@ func (r *Router) RouteWithMetadata(ctx context.Context, chat llm.ChatRequest, me
 	d.RemoteFallbackBlocked = r.cfg.Routing.DataPolicy == config.DataPolicyLocalOnly
 	d.ClassifierModel = classifierModel
 	d.ClassifierUsage = classifierUsage
+	d.ClassificationSource = classificationSource
+	d.ClassificationStatus = classificationStatus
+	d.ClassifierLatencyMS = classifierLatencyMS
 	d.MaxAttempts = r.cfg.Routing.MaxAttempts
 	d.WorkflowID = meta.WorkflowID
 	if background {
@@ -259,7 +288,11 @@ func (r *Router) RouteWithMetadata(ctx context.Context, chat llm.ChatRequest, me
 			}
 		}
 	}
-	if !d.Background && r.cfg.Routing.WorkflowAffinity && meta.WorkflowID != "" {
+	policyOverride := false
+	if !d.Background {
+		policyOverride = applyPolicyOverride(&d, meta, catalog)
+	}
+	if !d.Background && !policyOverride && r.cfg.Routing.WorkflowAffinity && meta.WorkflowID != "" {
 		if _, hasSession := r.sessionSnapshot(sid, time.Now()); !hasSession {
 			if preferred, found := r.affinity.Preferred(meta.WorkflowID); found {
 				for _, id := range d.Eligible {
@@ -273,7 +306,7 @@ func (r *Router) RouteWithMetadata(ctx context.Context, chat llm.ChatRequest, me
 			}
 		}
 	}
-	if !d.Background {
+	if !d.Background && !policyOverride {
 		switch r.cfg.Routing.Strategy {
 		case config.RoutingStrategySticky:
 			if sticky := r.stickyModelForSession(sid); sticky != "" {
@@ -303,6 +336,11 @@ func (r *Router) RouteWithMetadata(ctx context.Context, chat llm.ChatRequest, me
 		"data_policy", d.DataPolicy,
 		"remote_fallback_blocked", d.RemoteFallbackBlocked,
 		"difficulty", d.Profile.Difficulty,
+		"risk", d.Profile.Risk,
+		"classification_source", d.ClassificationSource,
+		"classification_status", d.ClassificationStatus,
+		"classifier_latency_ms", d.ClassifierLatencyMS,
+		"applied_quality_floor", d.AppliedQualityFloor,
 		"expected_remaining_turns", d.Profile.ExpectedRemainingTurns,
 		"estimate_confidence", d.Profile.EstimateConfidence,
 		"needs_reasoning", d.Profile.NeedsReasoning,
@@ -341,12 +379,12 @@ func (r *Router) score(prof TaskProfile, catalog []config.CatalogEntry, multipli
 	reasoningBonus := r.cfg.Routing.ReasoningBonus
 	d := ScoreWithOptions(prof, catalog, r.cfg.Weights, multipliers, ScoringOptions{
 		CostMode: mode, ReferenceCostUSD: r.cfg.Routing.CostReferenceUSD,
-		QualityFloors:  map[string]float64{"high": r.cfg.Routing.HighQualityFloor},
+		QualityFloors:  r.cfg.Routing.QualityFloors,
 		ReasoningBonus: &reasoningBonus,
 	})
 	if mode == CostModeAbsolute {
 		legacy := ScoreWithOptions(prof, catalog, r.cfg.Weights, multipliers, ScoringOptions{
-			CostMode: CostModeRelative, QualityFloors: map[string]float64{"high": r.cfg.Routing.HighQualityFloor},
+			CostMode: CostModeRelative, QualityFloors: r.cfg.Routing.QualityFloors,
 			ReasoningBonus: &reasoningBonus,
 		})
 		d.LegacyChosen = legacy.Chosen
@@ -355,19 +393,52 @@ func (r *Router) score(prof TaskProfile, catalog []config.CatalogEntry, multipli
 	return d
 }
 
-func (r *Router) deterministicallyEligible(chat llm.ChatRequest, model string) bool {
-	prof := TrivialProfile()
-	prof.NeedsVision = requestHasImages(chat)
-	prof.NeedsTools = len(chat.Tools) > 0
-	prof.EstTokensIn = EstimateRequestTokens(chat)
-	prof.EstTokensOut = chat.MaxTokens
-	if prof.EstTokensOut <= 0 {
-		prof.EstTokensOut = 1024
-	}
-	for _, entry := range r.cfg.Catalog {
-		if entry.ID == model {
-			return eligible(prof, entry) && (r.cfg.Routing.DataPolicy != config.DataPolicyLocalOnly || r.cfg.IsLocalModel(model))
+// applyPolicyOverride narrows a policy-safe decision. It never adds a model to
+// Eligible, so capability, context, quality-floor, and placement filters remain
+// authoritative. The return value reports whether affinity/economics must not
+// replace the explicit selection.
+func applyPolicyOverride(d *Decision, meta RequestMetadata, catalog []config.CatalogEntry) bool {
+	if meta.FixedModel != "" {
+		for _, id := range d.Eligible {
+			if id == meta.FixedModel {
+				d.Chosen = id
+				d.Reason = "fixed model policy override"
+				d.PolicyOverride = "fixed_model"
+				return true
+			}
 		}
+		d.Chosen = ""
+		d.NoEligible = true
+		d.Reason = "fixed model policy override is not eligible"
+		d.PolicyOverride = "fixed_model_unavailable"
+		return true
+	}
+	if meta.HighestQuality {
+		eligibleSet := make(map[string]struct{}, len(d.Eligible))
+		for _, id := range d.Eligible {
+			eligibleSet[id] = struct{}{}
+		}
+		best := ""
+		bestQuality := -1.0
+		for _, entry := range catalog {
+			if _, ok := eligibleSet[entry.ID]; ok && entry.Quality > bestQuality {
+				best, bestQuality = entry.ID, entry.Quality
+			}
+		}
+		if best == "" {
+			d.Chosen = ""
+			d.NoEligible = true
+			d.Reason = "highest quality policy override has no eligible model"
+			d.PolicyOverride = "highest_quality_unavailable"
+			return true
+		}
+		d.Chosen = best
+		d.Reason = "highest quality policy override"
+		d.PolicyOverride = "highest_quality"
+		return true
+	}
+	if meta.MinQuality > 0 {
+		d.PolicyOverride = "minimum_quality"
 	}
 	return false
 }

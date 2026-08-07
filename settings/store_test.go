@@ -96,3 +96,20 @@ func TestDocumentRoundTripPreservesAuthTokenEnv(t *testing.T) {
 			back.AuthTokenEnv, "OCTOPUS_AUTH_TOKEN")
 	}
 }
+
+func TestDocumentRoundTripPreservesAbsentQualityFloors(t *testing.T) {
+	cfg := &config.Config{
+		ServerAddr: "127.0.0.1:8787", Weights: config.Weights{Quality: 1},
+		Routing: config.RoutingCfg{SessionSticky: true, SessionTTL: time.Hour, CacheAware: true, MaxAttempts: 3,
+			QualityFloors: map[string]float64{"high": .85}, HighQualityFloor: .85},
+		Providers: map[string]config.ProviderCreds{"p": {Kind: "anthropic", APIKeyEnv: "K"}},
+		Catalog:   []config.CatalogEntry{{ID: "p/m", Quality: .9, Speed: .5, Caps: config.Caps{MaxContext: 1000}}},
+	}
+	back, err := documentFromConfig(cfg).config()
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if len(back.Routing.QualityFloors) != 1 || back.Routing.QualityFloors["high"] != .85 {
+		t.Fatalf("quality floors changed during round trip: %+v", back.Routing.QualityFloors)
+	}
+}

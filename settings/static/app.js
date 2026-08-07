@@ -65,7 +65,15 @@ function renderState() {
   setValue("#switch-confidence", doc.routing.switch_confidence ?? 0.60);
   setValue("#cost-mode", doc.routing.cost_mode || "absolute");
   setValue("#cost-reference-usd", doc.routing.cost_reference_usd || 0.10);
-  setValue("#high-quality-floor", doc.routing.high_quality_floor || 0.85);
+  const qualityFloors = doc.routing.quality_floors || {};
+  const floorDefaults = {trivial: 0.70, low: 0.70, medium: 0.85, high: doc.routing.high_quality_floor ?? 0.95};
+  for (const difficulty of ["trivial", "low", "medium", "high"]) {
+    const input = $(`#quality-floor-${difficulty}`);
+    const present = Object.prototype.hasOwnProperty.call(qualityFloors, difficulty);
+    input.value = present ? qualityFloors[difficulty] : floorDefaults[difficulty];
+    input.dataset.configured = present ? "true" : "false";
+    input.oninput = () => { input.dataset.configured = "true"; };
+  }
   setValue("#reasoning-bonus", doc.routing.reasoning_bonus ?? 0.05);
   setChecked("#workflow-affinity", doc.routing.workflow_affinity ?? true);
   setChecked("#background-enabled", doc.routing.background?.enabled || false);
@@ -162,8 +170,14 @@ function renderWhyModels(decisions) {
     const row = document.createElement("tr");
     const detail = item.breakdowns?.[item.actual_model] || {};
     const contributions = `Q ${Number(detail.quality_contribution || 0).toFixed(3)} · C ${Number(detail.cost_contribution || 0).toFixed(3)} · S ${Number(detail.speed_contribution || 0).toFixed(3)}`;
-    const flags = [item.background ? `background: ${item.background_name || "matched"}` : "", item.workflow_affinity ? "workflow affinity" : "", item.legacy_changed ? `legacy chose ${shortModel(item.legacy_chosen)}` : ""].filter(Boolean).join(" · ");
-    [shortModel(item.actual_model), item.reason || item.decision || "routed", item.cost_mode || "relative", contributions, flags || "—"].forEach((value, index) => {
+    const task = `${item.difficulty || "unknown"} / ${item.risk || "unknown"}${item.domain ? ` · ${item.domain}` : ""}`;
+    const policy = Number(item.applied_quality_floor) > 0
+      ? `${item.quality_policy || "strict"} ≥ ${Number(item.applied_quality_floor).toFixed(2)}`
+      : item.quality_policy || "none";
+    const classification = `${item.classification_source || "unknown"} · ${item.classification_status || "unknown"}${Number(item.classifier_latency_ms) > 0 ? ` · ${formatInteger(item.classifier_latency_ms)} ms` : ""}`;
+    const modelPath = [item.initial_model, item.selected_model, item.actual_model].filter(Boolean).map(shortModel).filter((value, index, values) => index === 0 || value !== values[index - 1]).join(" → ");
+    const flags = [modelPath ? `path: ${modelPath}` : "", item.fallback_observed ? "fallback observed" : "", item.background ? `background: ${item.background_name || "matched"}` : "", item.workflow_affinity ? "workflow affinity" : "", item.legacy_changed ? `legacy chose ${shortModel(item.legacy_chosen)}` : ""].filter(Boolean).join(" · ");
+    [shortModel(item.actual_model), task, item.reason || item.decision || "routed", policy, classification, contributions, flags || "—"].forEach((value, index) => {
       const cell = document.createElement(index === 0 ? "th" : "td");
       if (index === 0) cell.scope = "row";
       cell.textContent = value;
@@ -437,7 +451,10 @@ function collectDocument() {
       switch_confidence: numberValue("#switch-confidence"),
       cost_mode: $("#cost-mode").value,
       cost_reference_usd: numberValue("#cost-reference-usd"),
-      high_quality_floor: numberValue("#high-quality-floor"),
+      quality_floors: Object.fromEntries(["trivial", "low", "medium", "high"]
+        .filter(difficulty => $(`#quality-floor-${difficulty}`).dataset.configured === "true")
+        .map(difficulty => [difficulty, numberValue(`#quality-floor-${difficulty}`)])),
+      high_quality_floor: numberValue("#quality-floor-high"),
       reasoning_bonus: numberValue("#reasoning-bonus"),
       workflow_affinity: $("#workflow-affinity").checked,
       background: {

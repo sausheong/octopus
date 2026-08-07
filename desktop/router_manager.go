@@ -4,6 +4,7 @@ package desktop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -32,13 +33,41 @@ type RouterStatus struct {
 
 // RouterManager owns the reloadable routing HTTP server.
 type RouterManager struct {
+	reloadMu   sync.Mutex
 	mu         sync.RWMutex
 	configPath string
 	environ    map[string]string
 	httpServer *http.Server
 	listener   net.Listener
+	handler    *reloadableHandler
 	status     RouterStatus
 	insights   *insights.Tracker
+}
+
+// reloadableHandler lets a same-address config reload publish a fully built
+// router atomically while the listener and in-flight requests keep running.
+// ServeHTTP copies the current handler under a read lock and releases it before
+// executing the request, so slow streams never block a future swap.
+type reloadableHandler struct {
+	mu      sync.RWMutex
+	current http.Handler
+}
+
+func newReloadableHandler(handler http.Handler) *reloadableHandler {
+	return &reloadableHandler{current: handler}
+}
+
+func (h *reloadableHandler) Swap(handler http.Handler) {
+	h.mu.Lock()
+	h.current = handler
+	h.mu.Unlock()
+}
+
+func (h *reloadableHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	current := h.current
+	h.mu.RUnlock()
+	current.ServeHTTP(w, r)
 }
 
 func NewRouterManager(configPath string) *RouterManager {
@@ -82,12 +111,26 @@ func (m *RouterManager) Insights(days int) insights.Report {
 // the currently running server. A malformed save therefore cannot stop a
 // healthy router.
 func (m *RouterManager) Reload(ctx context.Context) error {
+	// Serialise reloads while doing expensive provider construction as well as
+	// publication; otherwise two simultaneous saves could publish out of order.
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+
 	cfg, err := config.Load(m.configPath)
 	if err != nil {
 		m.setFailure(err)
 		return err
 	}
 	resolved := cloneAndResolve(cfg, m.environ)
+	authToken := ""
+	if resolved.AuthTokenEnv != "" {
+		authToken = m.environ[resolved.AuthTokenEnv]
+	}
+	if resolved.AuthTokenEnv != "" && authToken == "" {
+		err := fmt.Errorf("server.auth_token_env %q is configured but unset", resolved.AuthTokenEnv)
+		m.setFailure(err)
+		return err
+	}
 	reg, err := registry.New(ctx, resolved)
 	if err != nil {
 		m.setFailure(err)
@@ -95,33 +138,36 @@ func (m *RouterManager) Reload(ctx context.Context) error {
 	}
 	rt := router.NewRouter(resolved, reg)
 	srv := server.New(rt, reg, resolved.Catalog, m.insights.Record)
-	// Opt-in: an unconfigured or unset variable yields "", which leaves the
-	// endpoints open exactly as they were before this option existed.
-	if resolved.AuthTokenMisconfigured() {
-		// Especially likely here: a menu bar app launched from Finder never
-		// sources the user's shell profile, so a token exported in .zshrc is
-		// invisible to it.
-		slog.Warn("auth token variable is empty; routing endpoints are UNAUTHENTICATED",
-			"auth_token_env", resolved.AuthTokenEnv)
-	}
-	srv.SetAuthToken(resolved.AuthToken())
-	handler := srv.Handler()
+	srv.SetAuthToken(authToken)
+	nextHandler := srv.Handler()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.httpServer != nil {
-		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_ = m.httpServer.Shutdown(shutdownCtx)
-		cancel()
-		m.httpServer = nil
-		m.listener = nil
+	if m.httpServer != nil && m.status.Address == resolved.ServerAddr {
+		m.handler.Swap(nextHandler)
+		m.status = RouterStatus{
+			Running:     true,
+			ConfigValid: true,
+			Address:     resolved.ServerAddr,
+			ConfigPath:  m.configPath,
+			UpdatedAt:   time.Now(),
+		}
+		m.mu.Unlock()
+		slog.Info("octopus router reloaded", "addr", resolved.ServerAddr, "config", m.configPath)
+		return nil
 	}
+	oldServer := m.httpServer
 
 	listener, err := net.Listen("tcp", resolved.ServerAddr)
 	if err != nil {
-		m.status = RouterStatus{ConfigPath: m.configPath, ConfigValid: true, LastError: err.Error(), UpdatedAt: time.Now()}
+		// Binding the replacement failed. The old listener and handler remain
+		// untouched, and status continues to describe that last-known-good server.
+		m.status.ConfigValid = true
+		m.status.LastError = err.Error()
+		m.status.UpdatedAt = time.Now()
+		m.mu.Unlock()
 		return err
 	}
+	handler := newReloadableHandler(nextHandler)
 	httpServer := &http.Server{
 		Addr:              resolved.ServerAddr,
 		Handler:           handler,
@@ -131,6 +177,7 @@ func (m *RouterManager) Reload(ctx context.Context) error {
 	}
 	m.httpServer = httpServer
 	m.listener = listener
+	m.handler = handler
 	m.status = RouterStatus{
 		Running:     true,
 		ConfigValid: true,
@@ -138,7 +185,18 @@ func (m *RouterManager) Reload(ctx context.Context) error {
 		ConfigPath:  m.configPath,
 		UpdatedAt:   time.Now(),
 	}
+	m.mu.Unlock()
 	go m.serve(httpServer, listener)
+
+	// The new address is already bound and published. Only now drain the old
+	// server; failure to drain cannot take the replacement back down.
+	if oldServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := oldServer.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("old router did not drain cleanly after address change", "err", err)
+		}
+		cancel()
+	}
 	slog.Info("octopus router reloaded", "addr", resolved.ServerAddr, "config", m.configPath)
 	return nil
 }
@@ -154,6 +212,9 @@ func (m *RouterManager) serve(httpServer *http.Server, listener net.Listener) {
 		m.status.Running = false
 		m.status.LastError = err.Error()
 		m.status.UpdatedAt = time.Now()
+		m.httpServer = nil
+		m.listener = nil
+		m.handler = nil
 	}
 	slog.Error("router server stopped", "err", err)
 }
@@ -167,17 +228,22 @@ func (m *RouterManager) setFailure(err error) {
 }
 
 func (m *RouterManager) Shutdown(ctx context.Context) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.httpServer == nil {
-		return nil
-	}
-	err := m.httpServer.Shutdown(ctx)
+	httpServer := m.httpServer
 	m.httpServer = nil
 	m.listener = nil
+	m.handler = nil
 	m.status.Running = false
 	m.status.UpdatedAt = time.Now()
-	return err
+	m.mu.Unlock()
+	var serverErr error
+	if httpServer != nil {
+		serverErr = httpServer.Shutdown(ctx)
+	}
+	insightsErr := m.insights.Close(ctx)
+	return errors.Join(serverErr, insightsErr)
 }
 
 func cloneAndResolve(cfg *config.Config, environ map[string]string) *config.Config {

@@ -1,0 +1,20 @@
+server: { addr: "127.0.0.1:8790" }
+classifier: { model: "", max_tokens: 256, timeout: "10s" }
+weights: { quality: 0.5, cost: 0.3, speed: 0.2 }
+routing: { session_sticky: false, session_ttl: "1h", cache_aware: true, max_attempts: 1 }
+providers:
+  bigA:   { kind: anthropic, base_url: "http://127.0.0.1:9099", api_key: "x" }
+  cheapB: { kind: anthropic, base_url: "http://127.0.0.1:9100", api_key: "x" }
+catalog:
+  - id: "bigA/model"
+    quality: 0.90
+    cost_per_mtok_in: 15.0
+    cost_per_mtok_out: 75.0
+    speed: 0.4
+    caps: { tools: true, vision: true, reasoning: false, max_context: 1000000 }
+  - id: "cheapB/model"
+    quality: 0.90
+    cost_per_mtok_in: 0.1
+    cost_per_mtok_out: 0.5
+    speed: 0.99
+    caps: { tools: true, vision: true, reasoning: false, max_context: 20000 }

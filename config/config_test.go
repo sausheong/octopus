@@ -17,7 +17,7 @@ func TestMarshalRoundTrip(t *testing.T) {
 		Strategy: RoutingStrategySticky, DataPolicy: DataPolicyAllowRemote, SessionSticky: true, SessionTTL: 45 * time.Minute,
 		CacheAware: false, MaxAttempts: 5, DefaultRemainingTurns: 7,
 		MinSwitchSavingsUSD: 0.02, MinSwitchSavingsPct: 0.15, SwitchConfidence: 0.75,
-		CostMode: CostModeAbsolute, CostReferenceUSD: 0.10, HighQualityFloor: 0.85, ReasoningBonus: 0.05,
+		CostMode: CostModeAbsolute, CostReferenceUSD: 0.10, QualityFloors: map[string]float64{"high": 0.85}, HighQualityFloor: 0.85, ReasoningBonus: 0.05,
 		WorkflowAffinity: true,
 	}
 	data, err := Marshal(original)
@@ -42,6 +42,46 @@ func TestMarshalRoundTrip(t *testing.T) {
 func TestParseRejectsUnknownField(t *testing.T) {
 	if _, err := Parse([]byte("unknown: true\n")); err == nil {
 		t.Fatal("expected unknown field to fail")
+	}
+}
+
+func TestParseQualityFloorsAndLegacyCompatibility(t *testing.T) {
+	base := `
+server: {addr: "127.0.0.1:8787"}
+weights: {quality: 1}
+providers: {p: {kind: anthropic, api_key: test}}
+catalog:
+  - id: p/m
+    quality: 0.95
+    speed: 0.5
+    caps: {max_context: 1000}
+`
+	legacy, err := Parse([]byte(base + "routing: {high_quality_floor: 0.91}\n"))
+	if err != nil || legacy.Routing.QualityFloors["high"] != 0.91 {
+		t.Fatalf("legacy floor: cfg=%+v err=%v", legacy, err)
+	}
+	modern, err := Parse([]byte(base + "routing:\n  quality_floors: {trivial: 0.5, low: 0.7, medium: 0.85, high: 0.93}\n"))
+	if err != nil || modern.Routing.QualityFloors["medium"] != 0.85 || modern.Routing.HighQualityFloor != 0.93 {
+		t.Fatalf("modern floors: cfg=%+v err=%v", modern, err)
+	}
+	_, err = Parse([]byte(base + "routing:\n  high_quality_floor: 0.9\n  quality_floors: {high: 0.95}\n"))
+	if err == nil {
+		t.Fatal("expected conflicting legacy and modern high floors to fail")
+	}
+}
+
+func TestValidateRejectsInvalidQualityFloors(t *testing.T) {
+	for name, floors := range map[string]map[string]float64{
+		"unknown": {"extreme": 0.9},
+		"range":   {"medium": 1.1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := baseValid()
+			cfg.Routing.QualityFloors = floors
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected invalid quality floor to fail")
+			}
+		})
 	}
 }
 

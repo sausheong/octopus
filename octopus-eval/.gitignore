@@ -1,0 +1,11 @@
+# Generated evaluation evidence may contain prompts, responses, usage and logs.
+/*-results.json
+/*-results.json.partial
+/*-results.json.partial.tmp
+/*-summary.md
+/*-insights.json
+/*.log
+/current-run-results.json
+/summary.md
+/checklist.md
+/report.html

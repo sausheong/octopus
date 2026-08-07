@@ -42,7 +42,7 @@ func TestRouteKeepsStickySessionOnSuccessfulModel(t *testing.T) {
 	}
 }
 
-func TestStickyFollowUpSkipsClassifierWhenIncumbentIsDeterministicallyEligible(t *testing.T) {
+func TestStickyFollowUpStillClassifiesForQualityEscalation(t *testing.T) {
 	cfg := testCfg()
 	reg, _ := registry.New(context.Background(), cfg)
 	r := NewRouter(cfg, reg)
@@ -54,7 +54,7 @@ func TestStickyFollowUpSkipsClassifierWhenIncumbentIsDeterministicallyEligible(t
 		return DefaultProfile()
 	})
 	d := r.Route(context.Background(), chat)
-	if calls != 0 || d.Chosen != "anthropic/opus" || d.Reason != "sticky session affinity" {
+	if calls != 1 || d.Chosen != "anthropic/opus" || d.Reason != "sticky session affinity" {
 		t.Fatalf("calls=%d decision=%+v", calls, d)
 	}
 }
@@ -68,11 +68,19 @@ func TestBackgroundObservationDoesNotReplaceMainIncumbent(t *testing.T) {
 	}}}
 	reg, _ := registry.New(context.Background(), cfg)
 	r := NewRouter(cfg, reg)
+	classifierCalls := 0
+	r.SetClassifier(func(context.Context, llm.LLMProvider, string, int, llm.Message) TaskProfile {
+		classifierCalls++
+		return DefaultProfile()
+	})
 	chat := llm.ChatRequest{SessionID: "main", MaxTokens: 10, Messages: []llm.Message{{Role: "user", Content: "status ping"}}}
 	r.Observe(chat, "anthropic/opus", &llm.Usage{})
 	d := r.RouteWithMetadata(context.Background(), chat, RequestMetadata{Endpoint: "/v1/messages", Stream: false})
 	if !d.Background || d.Chosen != "anthropic/haiku" || !strings.HasPrefix(d.RoutingSessionID, "background:") {
 		t.Fatalf("background decision=%+v", d)
+	}
+	if classifierCalls != 0 || d.ClassificationStatus != "skipped_allowlisted_background" {
+		t.Fatalf("allowlisted background classification calls=%d status=%q", classifierCalls, d.ClassificationStatus)
 	}
 	r.ObserveDecision(chat, "anthropic/haiku", &llm.Usage{}, d)
 	ordinary := r.Route(context.Background(), chat)
@@ -113,8 +121,8 @@ func placementCfg(policy string) *config.Config {
 			"cloud": {Kind: "anthropic", Location: config.ProviderLocationRemote, APIKey: "test"},
 		},
 		Catalog: []config.CatalogEntry{
-			{ID: "cloud/cheap", Quality: 0.8, CostPerMTokIn: 0.1, CostPerMTokOut: 0.1, Speed: 1, Caps: config.Caps{Tools: true, MaxContext: 100000}},
-			{ID: "local/model", Quality: 0.5, CostPerMTokIn: 10, CostPerMTokOut: 10, Speed: 0.5, Caps: config.Caps{MaxContext: 100000}},
+			{ID: "cloud/cheap", Quality: 0.9, CostPerMTokIn: 0.1, CostPerMTokOut: 0.1, Speed: 1, Caps: config.Caps{Tools: true, MaxContext: 100000}},
+			{ID: "local/model", Quality: 0.9, CostPerMTokIn: 10, CostPerMTokOut: 10, Speed: 0.5, Caps: config.Caps{MaxContext: 100000}},
 		},
 	}
 }
@@ -232,6 +240,9 @@ func TestRoutePricesKnownCacheReadBelowNewCacheWrite(t *testing.T) {
 	}
 	reg, _ := registry.New(context.Background(), cfg)
 	r := NewRouter(cfg, reg)
+	r.SetClassifier(func(context.Context, llm.LLMProvider, string, int, llm.Message) TaskProfile {
+		return TaskProfile{Difficulty: "low", Risk: "ordinary"}
+	})
 	chat := llm.ChatRequest{
 		SessionID:    "session-cache",
 		MaxTokens:    1,
@@ -318,24 +329,66 @@ func TestRouteCrossChecksTools(t *testing.T) {
 	}
 }
 
-func TestRouteShortCircuitSkipsClassifier(t *testing.T) {
+func TestRouteShortRequestStillUsesClassifier(t *testing.T) {
 	cfg := testCfg()
 	reg, _ := registry.New(context.Background(), cfg)
 	r := NewRouter(cfg, reg)
 	called := false
 	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
 		called = true
-		return TaskProfile{}
+		return TaskProfile{Difficulty: "high", Risk: "critical", EstTokensIn: 10, EstTokensOut: 10}
 	}
 	chat := llm.ChatRequest{
 		Messages: []llm.Message{{Role: "user", Content: "hi"}}, // short, no images, no tools
 	}
 	d := r.Route(context.Background(), chat)
-	if called {
-		t.Error("classifier should not be called for a trivial request")
+	if !called {
+		t.Error("classifier should be called even for a short request")
 	}
-	if d.Profile.Difficulty != "trivial" {
-		t.Errorf("Difficulty = %q, want trivial", d.Profile.Difficulty)
+	if d.Profile.Difficulty != "high" {
+		t.Errorf("Difficulty = %q, want high", d.Profile.Difficulty)
+	}
+}
+
+func TestRoutePolicyOverridesRemainInsideEligibleSet(t *testing.T) {
+	cfg := testCfg()
+	cfg.Routing.Strategy = config.RoutingStrategyPerTurn
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	r.SetClassifier(func(context.Context, llm.LLMProvider, string, int, llm.Message) TaskProfile {
+		return TaskProfile{Difficulty: "low", Risk: "ordinary", EstTokensIn: 100, EstTokensOut: 100}
+	})
+	chat := llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: "hello"}}}
+
+	fixed := r.RouteWithMetadata(context.Background(), chat, RequestMetadata{FixedModel: "anthropic/haiku"})
+	if fixed.Chosen != "anthropic/haiku" || fixed.PolicyOverride != "fixed_model" {
+		t.Fatalf("fixed override = %+v", fixed)
+	}
+	highest := r.RouteWithMetadata(context.Background(), chat, RequestMetadata{HighestQuality: true})
+	if highest.Chosen != "anthropic/opus" || highest.PolicyOverride != "highest_quality" {
+		t.Fatalf("highest override = %+v", highest)
+	}
+	minimum := r.RouteWithMetadata(context.Background(), chat, RequestMetadata{MinQuality: 0.9})
+	if minimum.Chosen != "anthropic/opus" || minimum.AppliedQualityFloor != 0.9 {
+		t.Fatalf("minimum-quality override = %+v", minimum)
+	}
+	unavailable := r.RouteWithMetadata(context.Background(), chat, RequestMetadata{FixedModel: "other/model"})
+	if !unavailable.NoEligible || unavailable.Chosen != "" || unavailable.PolicyOverride != "fixed_model_unavailable" {
+		t.Fatalf("unavailable fixed override = %+v", unavailable)
+	}
+}
+
+func TestCriticalRiskInheritsHighQualityFloor(t *testing.T) {
+	cfg := testCfg()
+	cfg.Routing.Strategy = config.RoutingStrategyPerTurn
+	reg, _ := registry.New(context.Background(), cfg)
+	r := NewRouter(cfg, reg)
+	r.SetClassifier(func(context.Context, llm.LLMProvider, string, int, llm.Message) TaskProfile {
+		return TaskProfile{Difficulty: "low", Risk: "critical", EstTokensIn: 100, EstTokensOut: 100}
+	})
+	d := r.Route(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: "delete production data"}}})
+	if d.Chosen != "anthropic/opus" || d.AppliedQualityFloor != 0.85 {
+		t.Fatalf("critical-risk decision = %+v", d)
 	}
 }
 
@@ -385,7 +438,7 @@ func TestRouteShortCircuitNotFiredForLongContent(t *testing.T) {
 		called = true
 		return TaskProfile{Difficulty: "medium"}
 	}
-	longContent := string(make([]byte, shortCircuitBytes+1))
+	longContent := string(make([]byte, 501))
 	chat := llm.ChatRequest{
 		Messages: []llm.Message{{Role: "user", Content: longContent}},
 	}
@@ -490,6 +543,7 @@ func TestRouteClassifierBoundsLongSingleTurn(t *testing.T) {
 func TestRouteClassifierFreeLocalModelHandlesNonTrivialRequest(t *testing.T) {
 	cfg := &config.Config{
 		ServerAddr: "x",
+		Classifier: config.ClassifierCfg{Model: "local/model", MaxTokens: 64, Timeout: time.Second},
 		Weights:    config.Weights{Quality: 0.5, Cost: 0.4, Speed: 0.1},
 		Providers: map[string]config.ProviderCreds{
 			"local": {Kind: "openai", BaseURL: "http://127.0.0.1:8080/v1"},
@@ -503,7 +557,11 @@ func TestRouteClassifierFreeLocalModelHandlesNonTrivialRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry: %v", err)
 	}
-	d := NewRouter(cfg, reg).Route(context.Background(), llm.ChatRequest{
+	r := NewRouter(cfg, reg)
+	r.SetClassifier(func(context.Context, llm.LLMProvider, string, int, llm.Message) TaskProfile {
+		return TaskProfile{Difficulty: "low", Risk: "ordinary"}
+	})
+	d := r.Route(context.Background(), llm.ChatRequest{
 		Messages: []llm.Message{{Role: "user", Content: strings.Repeat("build this feature ", 40)}},
 	})
 	if d.NoEligible || d.Chosen != "local/model" {
@@ -536,7 +594,7 @@ func TestRouteDeterministicFloorFloorsClassifierEstimate(t *testing.T) {
 func TestRouteDeterministicFloorDoesNotLower(t *testing.T) {
 	// If the classifier produces a higher estimate than the deterministic floor,
 	// the classifier's estimate should be preserved. Use long content to bypass
-	// the trivial short-circuit so the classifier actually runs.
+	// the classifier's estimate should be preserved.
 	cfg := testCfg()
 	reg, _ := registry.New(context.Background(), cfg)
 	r := NewRouter(cfg, reg)
@@ -544,7 +602,7 @@ func TestRouteDeterministicFloorDoesNotLower(t *testing.T) {
 		return TaskProfile{Difficulty: "low", EstTokensIn: 999999, EstTokensOut: 999999}
 	}
 	chat := llm.ChatRequest{
-		Messages: []llm.Message{{Role: "user", Content: strings.Repeat("x", shortCircuitBytes+1)}},
+		Messages: []llm.Message{{Role: "user", Content: strings.Repeat("x", 501)}},
 	}
 	d := r.Route(context.Background(), chat)
 	if d.Profile.EstTokensIn < 999999 {
@@ -559,8 +617,7 @@ func TestRouteReasoningSetOnDecision(t *testing.T) {
 	r.classifyFn = func(ctx context.Context, p llm.LLMProvider, model string, mt int, turn llm.Message) TaskProfile {
 		return TaskProfile{Difficulty: "high", NeedsReasoning: true, EstTokensIn: 100, EstTokensOut: 100}
 	}
-	// Use content long enough to bypass the trivial short-circuit.
-	chat := llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: strings.Repeat("x", shortCircuitBytes+1)}}}
+	chat := llm.ChatRequest{Messages: []llm.Message{{Role: "user", Content: strings.Repeat("x", 501)}}}
 	d := r.Route(context.Background(), chat)
 	if d.Reasoning == llm.ReasoningOff {
 		t.Error("Decision.Reasoning should be set when NeedsReasoning=true")

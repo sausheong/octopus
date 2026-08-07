@@ -1,0 +1,20 @@
+server:
+  addr: "127.0.0.1:8788"
+classifier:
+  model: ""
+  max_tokens: 256
+  timeout: "30s"
+weights: { quality: 0.5, cost: 0.3, speed: 0.2 }
+routing: { session_sticky: true, session_ttl: "1h", cache_aware: true, max_attempts: 1 }
+default_model: "ollama/qwen2.5:3b"
+providers:
+  ollama:
+    kind: openai
+    base_url: "http://localhost:11434/v1"
+catalog:
+  - id: "ollama/qwen2.5:3b"
+    quality: 0.45
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    speed: 0.85
+    caps: { tools: false, vision: false, reasoning: false, max_context: 32768 }

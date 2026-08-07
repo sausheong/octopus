@@ -45,7 +45,13 @@ routing:
   # reference. "relative" retains the legacy eligible-set comparison.
   cost_mode: "absolute"
   cost_reference_usd: 0.10
-  high_quality_floor: 0.85
+  # Strict quality boundaries. If no otherwise-capable model reaches the
+  # applicable floor, Octopus fails the request instead of silently degrading.
+  quality_floors:
+    trivial: 0.70
+    low: 0.70
+    medium: 0.85
+    high: 0.95
   reasoning_bonus: 0.05
   # Clients may group independent subagent sessions using
   # X-Octopus-Workflow-ID. Cache identities remain separate.

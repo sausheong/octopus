@@ -1,0 +1,272 @@
+{
+  "schema_version": 1,
+  "name": "production",
+  "description": "Fifty multi-turn workflows spanning production routing risks. Running this suite is paid and remains opt-in through run2.sh --yes.",
+  "shared_final_turn": {
+    "difficulty": "low",
+    "prompt": "Review your preceding answer and identify its most important unverified assumption in one sentence."
+  },
+  "assertions_by_scenario": {
+    "code_go_race": [{"id":"mentions-invariant","type":"contains","turn":"all","value":"invariant"}],
+    "code_retry_budget": [{"id":"mentions-retry-after","type":"contains","turn":"all","value":"Retry-After"}],
+    "code_parser": [{"id":"mentions-limit","type":"contains","turn":"all","value":"limit"}],
+    "code_schema_migration": [{"id":"mentions-rollback","type":"contains","turn":"all","value":"rollback"}],
+    "code_property_tests": [{"id":"mentions-idempotency","type":"contains","turn":"all","value":"idempot"}],
+    "security_reset": [{"id":"mentions-replay","type":"contains","turn":"all","value":"replay"}],
+    "security_webhook": [{"id":"mentions-signature","type":"contains","turn":"all","value":"signature"}],
+    "security_ssrf": [{"id":"mentions-dns-rebinding","type":"contains","turn":"all","value":"DNS"}],
+    "security_authz": [{"id":"mentions-tenant-scope","type":"contains","turn":"all","value":"tenant"}],
+    "security_logging": [{"id":"mentions-revocation","type":"contains","turn":"all","value":"revok"}],
+    "ops_blue_green": [{"id":"mentions-reconciliation","type":"contains","turn":"all","value":"reconcil"}],
+    "ops_queue_backlog": [{"id":"mentions-hypothesis","type":"contains","turn":"all","value":"hypoth"}],
+    "ops_region_failover": [{"id":"mentions-split-brain","type":"contains","turn":"all","value":"split"}],
+    "ops_capacity": [{"id":"mentions-load-test","type":"contains","turn":"all","value":"load test"}],
+    "ops_config_reload": [{"id":"mentions-last-known-good","type":"contains","turn":"all","value":"last-known-good"}],
+    "data_refund_cohorts": [{"id":"mentions-cohort","type":"contains","turn":"all","value":"cohort"}],
+    "data_ab_test": [{"id":"mentions-effect-size","type":"contains","turn":"all","value":"effect size"}],
+    "data_missingness": [{"id":"mentions-sensitivity","type":"contains","turn":"all","value":"sensitivity"}],
+    "data_forecast": [{"id":"mentions-backtest","type":"contains","turn":"all","value":"backtest"}],
+    "data_reconciliation": [{"id":"mentions-duplicate","type":"contains","turn":"all","value":"duplicate"}],
+    "writing_incident": [{"id":"preserves-unknowns","type":"contains","turn":"all","value":"unknown"}],
+    "writing_eval_claim": [{"id":"mentions-production-readiness","type":"contains","turn":"all","value":"production"}],
+    "writing_design_doc": [{"id":"mentions-backpressure","type":"contains","turn":"all","value":"backpressure"}],
+    "writing_policy": [{"id":"mentions-escalation","type":"contains","turn":"all","value":"escalat"}],
+    "writing_executive": [{"id":"mentions-quality","type":"contains","turn":"all","value":"quality"}],
+    "support_refund": [{"id":"no-refund-promise","type":"not_contains","turn":3,"value":"I guarantee a refund"}],
+    "support_outage": [{"id":"mentions-duplicate-risk","type":"contains","turn":"all","value":"duplicate"}],
+    "support_accessibility": [{"id":"mentions-screen-reader","type":"contains","turn":"all","value":"screen reader"}],
+    "support_privacy": [{"id":"does-not-request-password","type":"not_contains","turn":"all","value":"send your password"}],
+    "support_chargeback": [{"id":"mentions-double-reimbursement","type":"contains","turn":"all","value":"double"}],
+    "math_bayes": [{"id":"contains-posterior-range","type":"regex","turn":"all","value":"(8\\.|9\\.|approximately 9|about 9).*%"}],
+    "math_queue": [{"id":"contains-effective-arrival","type":"contains","turn":"all","value":"154"}],
+    "math_break_even": [{"id":"contains-break-even-turn","type":"regex","turn":"all","value":"(3|three).*turn"}],
+    "math_probability": [{"id":"mentions-correlation","type":"contains","turn":"all","value":"correlat"}],
+    "math_allocation": [{"id":"mentions-infeasible","type":"contains","turn":"all","value":"infeasib"}],
+    "tools_sql": [{"id":"mentions-parameterisation","type":"contains","turn":"all","value":"parameter"}],
+    "tools_filesystem": [{"id":"mentions-symlink","type":"contains","turn":"all","value":"symlink"}],
+    "tools_browser": [{"id":"mentions-approval","type":"contains","turn":"all","value":"approval"}],
+    "tools_parallel": [{"id":"mentions-dependency","type":"contains","turn":"all","value":"depend"}],
+    "tools_email": [{"id":"mentions-receipt","type":"contains","turn":"all","value":"receipt"}],
+    "cache_long_context": [{"id":"mentions-cancellation","type":"contains","turn":"all","value":"cancel"}],
+    "cache_model_return": [{"id":"mentions-cache-economics","type":"contains","turn":"all","value":"cache"}],
+    "cache_prefix_change": [{"id":"mentions-prefix","type":"contains","turn":"all","value":"prefix"}],
+    "cache_background_ping": [{"id":"exact-pong","type":"exact","turn":1,"value":"PONG"}],
+    "cache_ttl": [{"id":"mentions-expected-reuse","type":"contains","turn":"all","value":"expected"}],
+    "agent_code_review": [{"id":"mentions-reproduction","type":"contains","turn":"all","value":"reproduc"}],
+    "agent_research": [{"id":"mentions-primary-sources","type":"contains","turn":"all","value":"primary"}],
+    "agent_migration": [{"id":"mentions-merge-order","type":"contains","turn":"all","value":"merge"}],
+    "agent_incident": [{"id":"mentions-incident-commander","type":"contains","turn":"all","value":"commander"}],
+    "agent_release": [{"id":"mentions-signature","type":"contains","turn":"all","value":"sign"}]
+  },
+  "scenarios": [
+    {"id":"code_go_race","name":"Go race diagnosis","domains":["coding","short_but_hard"],"turns":[
+      {"difficulty":"low","prompt":"Explain why reading a Go map while another goroutine writes can fail."},
+      {"difficulty":"high","prompt":"In no more than 80 words, choose mutex, actor, or copy-on-write for a read-heavy map with atomic snapshots and cancellation. State the invariant and the failure each rejected choice risks."},
+      {"difficulty":"medium","prompt":"Give three race-detector tests for that design."}]},
+    {"id":"code_retry_budget","name":"Bounded HTTP retries","domains":["coding"],"turns":[
+      {"difficulty":"low","prompt":"List the HTTP status codes normally worth retrying."},
+      {"difficulty":"high","prompt":"Design a Go retry loop with one total deadline, exponential jitter, Retry-After, replay-safe bodies, cancellation and no retry after streamed bytes reach the caller."},
+      {"difficulty":"medium","prompt":"Write table-test cases for deadline exhaustion and partial response delivery."}]},
+    {"id":"code_parser","name":"Streaming parser hardening","domains":["coding"],"turns":[
+      {"difficulty":"trivial","prompt":"What is a bounded buffer? Answer in one sentence."},
+      {"difficulty":"high","prompt":"Review a newline-delimited JSON parser that accepts untrusted 20 MB lines and emits partial records on decode errors. Propose exact limits, error semantics and fuzz properties."},
+      {"difficulty":"medium","prompt":"Provide compact pseudocode implementing the safe read loop."}]},
+    {"id":"code_schema_migration","name":"Schema-compatible deployment","domains":["coding","operations"],"turns":[
+      {"difficulty":"low","prompt":"Define an expand-and-contract database migration."},
+      {"difficulty":"high","prompt":"Plan a zero-downtime migration from one full_name column to given_name and family_name across old and new application versions, including backfill races and rollback."},
+      {"difficulty":"medium","prompt":"Turn the plan into deploy gates with measurable evidence."}]},
+    {"id":"code_property_tests","name":"Ledger property tests","domains":["coding","math_reasoning"],"turns":[
+      {"difficulty":"low","prompt":"State three invariants for a double-entry ledger."},
+      {"difficulty":"high","prompt":"Design property-based tests covering currency minor units, reversals, duplicate idempotency keys, concurrent posting and arbitrary failure injection."},
+      {"difficulty":"medium","prompt":"Give a minimal shrinking strategy for a failing generated transaction sequence."}]},
+
+    {"id":"security_reset","name":"Password reset threat model","domains":["security"],"turns":[
+      {"difficulty":"low","prompt":"Name two ways password-reset endpoints leak account existence."},
+      {"difficulty":"high","prompt":"Threat-model reset tokens, email links, races, sessions, replay, operators, rate limiting and audit evidence. Prioritise concrete mitigations."},
+      {"difficulty":"medium","prompt":"Write six acceptance tests for the highest risks."}]},
+    {"id":"security_webhook","name":"Webhook verification","domains":["security","short_but_hard"],"turns":[
+      {"difficulty":"low","prompt":"Why must webhook signatures cover the raw body?"},
+      {"difficulty":"high","prompt":"A valid signed payment webhook arrives twice and out of order after secret rotation. In 120 words, specify verification, replay defence, idempotency and ordering behaviour."},
+      {"difficulty":"medium","prompt":"List the fields that belong in a redacted audit event."}]},
+    {"id":"security_ssrf","name":"Image fetch SSRF review","domains":["security"],"turns":[
+      {"difficulty":"low","prompt":"Define SSRF in plain language."},
+      {"difficulty":"high","prompt":"Design controls for a service fetching user-supplied image URLs. Cover DNS rebinding, redirects, IPv4/IPv6 private ranges, response size, content type and egress policy."},
+      {"difficulty":"medium","prompt":"Give bypass-oriented tests rather than happy-path tests."}]},
+    {"id":"security_authz","name":"Tenant authorisation boundary","domains":["security","tool_workflows"],"turns":[
+      {"difficulty":"low","prompt":"Distinguish authentication from object-level authorisation."},
+      {"difficulty":"high","prompt":"Review an API where a tool can fetch invoices by ID. Design tenant-scoped authorisation that remains safe across caches, background jobs and support impersonation."},
+      {"difficulty":"medium","prompt":"Produce a deny-by-default policy test matrix."}]},
+    {"id":"security_logging","name":"Sensitive logging incident","domains":["security","operations"],"turns":[
+      {"difficulty":"low","prompt":"What is log redaction?"},
+      {"difficulty":"high","prompt":"Access tokens were written to searchable logs for six hours. Give containment, scoping, revocation, evidence preservation and notification steps without assuming compromise."},
+      {"difficulty":"medium","prompt":"Write the first-hour incident checklist."}]},
+
+    {"id":"ops_blue_green","name":"Payment deployment cutover","domains":["operations"],"turns":[
+      {"difficulty":"trivial","prompt":"What is a rollback trigger?"},
+      {"difficulty":"high","prompt":"Plan a blue-green payment API cutover with database compatibility, queue consumers, duplicate prevention, reconciliation and a 15-minute rollback objective."},
+      {"difficulty":"medium","prompt":"Give ten binary go/no-go checks."}]},
+    {"id":"ops_queue_backlog","name":"Queue backlog response","domains":["operations","data_analysis"],"turns":[
+      {"difficulty":"low","prompt":"Name three useful queue backlog metrics."},
+      {"difficulty":"high","prompt":"A queue is growing while error rate is flat and consumer CPU is 35%. Build a hypothesis tree and safe diagnostic sequence that avoids making the incident worse."},
+      {"difficulty":"medium","prompt":"Define recovery and escalation thresholds."}]},
+    {"id":"ops_region_failover","name":"Regional failover decision","domains":["operations","short_but_hard"],"turns":[
+      {"difficulty":"low","prompt":"Explain RPO and RTO in one sentence each."},
+      {"difficulty":"high","prompt":"Primary writes are intermittently timing out, replication lag is 90 seconds, RPO is 30 seconds, and failover may split brain. Decide whether to fail over now and justify the safest next action in 100 words."},
+      {"difficulty":"medium","prompt":"List the evidence required before promoting the replica."}]},
+    {"id":"ops_capacity","name":"Capacity planning","domains":["operations","math_reasoning"],"turns":[
+      {"difficulty":"low","prompt":"Calculate 40 percent headroom on a 10,000 requests-per-second peak."},
+      {"difficulty":"high","prompt":"Design a capacity model for bursty traffic with correlated downstream latency, retries, queueing and regional loss. State assumptions that must be load-tested."},
+      {"difficulty":"medium","prompt":"Summarise the load-test stages and stop conditions."}]},
+    {"id":"ops_config_reload","name":"Safe live configuration reload","domains":["operations","coding"],"turns":[
+      {"difficulty":"low","prompt":"Why should a service retain its last-known-good configuration?"},
+      {"difficulty":"high","prompt":"Design atomic live reload when the listen address may change. Prevent downtime on bind failure, preserve compatible state and expose the active revision."},
+      {"difficulty":"medium","prompt":"Give fault-injection tests for bind, parse and concurrent-request failures."}]},
+
+    {"id":"data_refund_cohorts","name":"Refund cohort analysis","domains":["data_analysis"],"turns":[
+      {"difficulty":"trivial","prompt":"What is a cohort in data analysis?"},
+      {"difficulty":"high","prompt":"Refund rate rose in one month. Design an analysis separating acquisition mix, tenure, country, product, billing defects and policy changes without claiming causation from aggregates."},
+      {"difficulty":"medium","prompt":"Specify the minimum data-quality checks before presenting results."}]},
+    {"id":"data_ab_test","name":"Experiment stopping decision","domains":["data_analysis","math_reasoning"],"turns":[
+      {"difficulty":"low","prompt":"Define a primary experiment metric."},
+      {"difficulty":"high","prompt":"An A/B test was checked daily and stopped on the first p-value below 0.05. Explain the bias and propose a valid sequential or fixed-horizon analysis with guardrails."},
+      {"difficulty":"medium","prompt":"Write a decision template reporting effect size and uncertainty."}]},
+    {"id":"data_missingness","name":"Missing transaction data","domains":["data_analysis","short_but_hard"],"turns":[
+      {"difficulty":"low","prompt":"Distinguish MCAR, MAR and MNAR briefly."},
+      {"difficulty":"high","prompt":"Seven percent of high-value transactions lack merchant category after a processor change. In 120 words, explain why dropping rows is risky and give a sensitivity-analysis plan."},
+      {"difficulty":"medium","prompt":"Name the plots and tables that would reveal selection bias."}]},
+    {"id":"data_forecast","name":"Demand forecast review","domains":["data_analysis"],"turns":[
+      {"difficulty":"low","prompt":"What is forecast leakage?"},
+      {"difficulty":"high","prompt":"Review a weekly demand forecast trained with future promotion flags and evaluated by random row splits. Redesign features, backtesting, baselines and error analysis."},
+      {"difficulty":"medium","prompt":"Give release criteria for replacing the current forecast."}]},
+    {"id":"data_reconciliation","name":"Settlement reconciliation","domains":["data_analysis","tool_workflows"],"turns":[
+      {"difficulty":"low","prompt":"State the difference between a count check and an amount check."},
+      {"difficulty":"high","prompt":"Design deterministic reconciliation across gateway events, an internal ledger and bank settlement files. Cover duplicates, late events, reversals, currencies and traceable exceptions."},
+      {"difficulty":"medium","prompt":"Define the machine-generated artefacts an auditor should receive."}]},
+
+    {"id":"writing_incident","name":"Incident update writing","domains":["writing","operations"],"turns":[
+      {"difficulty":"low","prompt":"Rewrite 'Everything is broken' as a calibrated status sentence."},
+      {"difficulty":"high","prompt":"Draft a 250-word customer update for intermittent payment delays. Separate known facts, customer impact, mitigations and unknowns; do not promise a recovery time."},
+      {"difficulty":"medium","prompt":"Condense it to a 60-word status-page update without losing uncertainty."}]},
+    {"id":"writing_eval_claim","name":"Evaluation claim review","domains":["writing","short_but_hard"],"turns":[
+      {"difficulty":"low","prompt":"Rewrite 'the router is always better' as a testable claim."},
+      {"difficulty":"high","prompt":"In exactly 100 words, explain why 90 percent cost savings from six scenarios cannot establish production readiness, while still stating what the result genuinely supports."},
+      {"difficulty":"medium","prompt":"Give the note a factual eight-word title."}]},
+    {"id":"writing_design_doc","name":"Architecture decision record","domains":["writing","coding"],"turns":[
+      {"difficulty":"low","prompt":"List the standard sections of an architecture decision record."},
+      {"difficulty":"high","prompt":"Write a concise ADR choosing an asynchronous Insights writer over synchronous full-ledger rewrites. Cover durability, backpressure, shutdown and observable data loss."},
+      {"difficulty":"medium","prompt":"Add measurable acceptance criteria."}]},
+    {"id":"writing_policy","name":"Refund policy clarification","domains":["writing","support"],"turns":[
+      {"difficulty":"trivial","prompt":"Correct: 'Customers has 30 day to reply.'"},
+      {"difficulty":"high","prompt":"Rewrite a refund policy so plan windows, statutory precedence, bounced notices and escalation are clear without inventing legal advice."},
+      {"difficulty":"medium","prompt":"Create a support-agent quick reference that preserves exceptions."}]},
+    {"id":"writing_executive","name":"Executive risk synthesis","domains":["writing","data_analysis"],"turns":[
+      {"difficulty":"low","prompt":"State the difference between a finding and a recommendation."},
+      {"difficulty":"high","prompt":"Write a board-level note balancing model-routing savings, observed quality regression, limited sample size and a staged production plan. Avoid technical jargon and false certainty."},
+      {"difficulty":"medium","prompt":"Reduce the note to three decisions the board must make."}]},
+
+    {"id":"support_refund","name":"Disputed renewal support","domains":["support"],"turns":[
+      {"difficulty":"trivial","prompt":"Which plan is customer C-017 on?"},
+      {"difficulty":"high","prompt":"Handle C-017's disputed renewal using the supplied policy facts. Separate known facts, missing evidence, compliance escalation and safe customer wording."},
+      {"difficulty":"medium","prompt":"Draft the customer reply in under 120 words without promising a refund."}]},
+    {"id":"support_outage","name":"Outage triage conversation","domains":["support","operations"],"turns":[
+      {"difficulty":"low","prompt":"Acknowledge a report that payments are pending."},
+      {"difficulty":"high","prompt":"Build an agent decision tree separating delayed, failed and duplicated payments while an incident is active. Prevent unsafe retry advice and duplicate refunds."},
+      {"difficulty":"medium","prompt":"Turn it into six customer-facing questions."}]},
+    {"id":"support_accessibility","name":"Accessible troubleshooting","domains":["support","writing"],"turns":[
+      {"difficulty":"low","prompt":"Rewrite 'click the red button' without relying on colour alone."},
+      {"difficulty":"high","prompt":"Write accessible account-recovery instructions for screen-reader and keyboard users, including what to do when the registered email is unavailable."},
+      {"difficulty":"medium","prompt":"Check the instructions for assumptions and ambiguous controls."}]},
+    {"id":"support_privacy","name":"Privacy-sensitive support request","domains":["support","security","short_but_hard"],"turns":[
+      {"difficulty":"low","prompt":"Why should support not ask for a full password?"},
+      {"difficulty":"high","prompt":"A caller knows invoice details but cannot access the registered email. In 120 words, propose a verification and escalation path without weakening account security."},
+      {"difficulty":"medium","prompt":"List information the agent must never request in chat."}]},
+    {"id":"support_chargeback","name":"Chargeback handling","domains":["support"],"turns":[
+      {"difficulty":"low","prompt":"Distinguish a refund from a chargeback."},
+      {"difficulty":"high","prompt":"Design an agent workflow for a customer requesting a refund after a chargeback is already open. Prevent double reimbursement and preserve evidence."},
+      {"difficulty":"medium","prompt":"Write the internal hand-off fields."}]},
+
+    {"id":"math_bayes","name":"Bayesian diagnostic reasoning","domains":["math_reasoning","short_but_hard"],"turns":[
+      {"difficulty":"low","prompt":"Define base-rate neglect."},
+      {"difficulty":"high","prompt":"A condition has 1% prevalence; a test has 95% sensitivity and 90% specificity. Calculate the probability of disease after one positive test and show the arithmetic concisely."},
+      {"difficulty":"medium","prompt":"Explain the result to a non-statistician without medical advice."}]},
+    {"id":"math_queue","name":"Queue stability reasoning","domains":["math_reasoning","operations"],"turns":[
+      {"difficulty":"low","prompt":"If arrivals exceed service rate, what happens to a queue over time?"},
+      {"difficulty":"high","prompt":"A service averages 80 jobs/s, peaks at 140, serves 100, and retries 10% of timeouts. Explain why averages hide instability and derive the effective arrival rate during the peak."},
+      {"difficulty":"medium","prompt":"State two operational controls and their trade-offs."}]},
+    {"id":"math_break_even","name":"Model switch break-even","domains":["math_reasoning","cache_heavy"],"turns":[
+      {"difficulty":"low","prompt":"Define a switching break-even point."},
+      {"difficulty":"high","prompt":"Staying costs $0.57 per turn. Switching costs $1.425 now then $0.12 per later turn. Derive the minimum total remaining turns for switching to cost less, including the switch turn."},
+      {"difficulty":"medium","prompt":"Explain how uncertain task length changes the decision."}]},
+    {"id":"math_probability","name":"Correlated failure probability","domains":["math_reasoning"],"turns":[
+      {"difficulty":"low","prompt":"Why can correlated failures not be multiplied as if independent?"},
+      {"difficulty":"high","prompt":"Two regions each show 99.9% availability but share DNS and identity dependencies. Explain what can and cannot be inferred about combined availability and what measurements are needed."},
+      {"difficulty":"medium","prompt":"Give a conservative reporting format for the uncertainty."}]},
+    {"id":"math_allocation","name":"On-call allocation","domains":["math_reasoning","operations"],"turns":[
+      {"difficulty":"low","prompt":"Six engineers must cover three roles. How many two-person role assignments are possible if roles are labelled?"},
+      {"difficulty":"high","prompt":"Now design a fair four-week rota with skills constraints, no consecutive primary weeks and one unavailable engineer in week two. Explain how to detect infeasibility before optimising fairness."},
+      {"difficulty":"medium","prompt":"State the constraints in solver-friendly notation."}]},
+
+    {"id":"tools_sql","name":"SQL tool safety","domains":["tool_workflows","security"],"turns":[
+      {"difficulty":"low","prompt":"Why should a reporting tool use read-only credentials?"},
+      {"difficulty":"high","prompt":"Design a tool-call policy for natural-language analytics. Enforce parameterisation, tenant scope, row limits, timeouts, explain-plan checks and approval for sensitive exports."},
+      {"difficulty":"medium","prompt":"Give allow and deny examples for the policy engine."}]},
+    {"id":"tools_filesystem","name":"Filesystem tool boundaries","domains":["tool_workflows","security"],"turns":[
+      {"difficulty":"trivial","prompt":"What is path traversal?"},
+      {"difficulty":"high","prompt":"Specify a safe file-edit tool restricted to one workspace. Cover symlinks, canonical paths, races, atomic writes, backups and destructive operations."},
+      {"difficulty":"medium","prompt":"Write adversarial tests for escaping the workspace."}]},
+    {"id":"tools_browser","name":"Browser automation recovery","domains":["tool_workflows"],"turns":[
+      {"difficulty":"low","prompt":"Why are visible labels safer than brittle CSS selectors for browser automation?"},
+      {"difficulty":"high","prompt":"Plan a purchase workflow that may encounter login expiry, duplicate submission, price changes and an irreversible final-confirm button. Define where human approval is mandatory."},
+      {"difficulty":"medium","prompt":"Create an idempotent recovery checklist after a timeout."}]},
+    {"id":"tools_parallel","name":"Parallel tool orchestration","domains":["tool_workflows","subagent_workflows"],"turns":[
+      {"difficulty":"low","prompt":"Which tasks can safely run in parallel: unit tests, schema migration, documentation check and production deploy?"},
+      {"difficulty":"high","prompt":"Design a dependency-aware agent workflow that parallelises read-only checks, serialises state changes, cancels obsolete work and merges conflicting evidence."},
+      {"difficulty":"medium","prompt":"Represent it as a small dependency graph in text."}]},
+    {"id":"tools_email","name":"Outbound email approval","domains":["tool_workflows","support"],"turns":[
+      {"difficulty":"low","prompt":"What makes sending an email materially different from drafting one?"},
+      {"difficulty":"high","prompt":"Design an agent workflow for drafting and sending a sensitive customer email. Separate data retrieval, policy checks, approval, send, receipt capture and retry behaviour."},
+      {"difficulty":"medium","prompt":"List audit events without storing unnecessary message content."}]},
+
+    {"id":"cache_long_context","name":"Long cached investigation","domains":["cache_heavy","coding"],"turns":[
+      {"difficulty":"low","prompt":"Summarise the cancellation rule from the reference manual."},
+      {"difficulty":"high","prompt":"Using the same reference context, design a cancellation-safe worker pool with bounded queues, ownership and shutdown invariants."},
+      {"difficulty":"medium","prompt":"Revise only the error propagation section after assuming workers may return partial results."}]},
+    {"id":"cache_model_return","name":"Return to stronger cached model","domains":["cache_heavy"],"turns":[
+      {"difficulty":"medium","prompt":"Analyse whether a model router should switch away from an expensive cached model when a cheaper model has no cache. Include future-turn uncertainty."},
+      {"difficulty":"low","prompt":"State the conclusion in one sentence."},
+      {"difficulty":"high","prompt":"Now reconsider the first analysis for a safety-critical final decision. Explain whether returning to the stronger model changes the cache economics."}]},
+    {"id":"cache_prefix_change","name":"Prompt-prefix invalidation","domains":["cache_heavy","tool_workflows"],"turns":[
+      {"difficulty":"low","prompt":"Name common reasons a provider prompt cache misses."},
+      {"difficulty":"high","prompt":"A tool schema is reordered and one system sentence changes every turn. Diagnose which changes are semantic, which may invalidate cache prefixes and how to measure rather than guess."},
+      {"difficulty":"medium","prompt":"Design a controlled A/B cache experiment."}]},
+    {"id":"cache_background_ping","name":"Background ping routing","domains":["cache_heavy","operations"],"turns":[
+      {"difficulty":"trivial","prompt":"Reply exactly: PONG"},
+      {"difficulty":"high","prompt":"Design a conservative detector for tiny non-streaming background health pings so they avoid loading a full session cache without misrouting real short-but-hard requests."},
+      {"difficulty":"medium","prompt":"List false-positive tests that must pass before enabling it."}]},
+    {"id":"cache_ttl","name":"Cache TTL decision","domains":["cache_heavy","math_reasoning"],"turns":[
+      {"difficulty":"low","prompt":"What does cache TTL mean?"},
+      {"difficulty":"high","prompt":"Compare five-minute and one-hour prompt-cache TTLs for sporadic sessions. Include write premiums, expected reuse, privacy retention and provider-specific support."},
+      {"difficulty":"medium","prompt":"Give a decision rule parameterised by expected next-turn time."}]},
+
+    {"id":"agent_code_review","name":"Subagent code review synthesis","domains":["subagent_workflows","coding"],"turns":[
+      {"difficulty":"low","prompt":"Assign independent review scopes for correctness, security and tests."},
+      {"difficulty":"high","prompt":"Three reviewers disagree about a concurrency bug. Design an evidence-first synthesis process using exact code paths, reproductions and severity criteria rather than majority vote."},
+      {"difficulty":"medium","prompt":"Write the final finding template."}]},
+    {"id":"agent_research","name":"Parallel research verification","domains":["subagent_workflows","writing"],"turns":[
+      {"difficulty":"low","prompt":"Why should parallel researchers avoid duplicating the same source search?"},
+      {"difficulty":"high","prompt":"Plan a four-agent research task where claims are time-sensitive. Partition sources, require primary evidence, reconcile contradictions and prevent uncited synthesis."},
+      {"difficulty":"medium","prompt":"Give the coordinator's acceptance checklist."}]},
+    {"id":"agent_migration","name":"Migration workstream coordination","domains":["subagent_workflows","operations"],"turns":[
+      {"difficulty":"low","prompt":"Split a database migration review into independently useful read-only workstreams."},
+      {"difficulty":"high","prompt":"Coordinate schema, application, observability and rollback agents while only one agent may modify migration files. Handle late discoveries and obsolete plans."},
+      {"difficulty":"medium","prompt":"Define the merge order and go/no-go owner."}]},
+    {"id":"agent_incident","name":"Incident subagent fan-out","domains":["subagent_workflows","operations","short_but_hard"],"turns":[
+      {"difficulty":"low","prompt":"Name four useful read-only incident investigation streams."},
+      {"difficulty":"high","prompt":"Latency is rising during a deployment. In 120 words, allocate log, metrics, change and dependency investigations while preserving one incident commander and avoiding competing mitigations."},
+      {"difficulty":"medium","prompt":"Specify the update cadence and stop conditions."}]},
+    {"id":"agent_release","name":"Release evidence aggregation","domains":["subagent_workflows","tool_workflows"],"turns":[
+      {"difficulty":"low","prompt":"Distinguish a release check from release approval."},
+      {"difficulty":"high","prompt":"Design a release pipeline where agents verify tests, artefacts, signatures, installer behaviour and notes in parallel, but publication remains atomic and reversible until the final step."},
+      {"difficulty":"medium","prompt":"Produce the evidence manifest fields."}]}
+  ]
+}

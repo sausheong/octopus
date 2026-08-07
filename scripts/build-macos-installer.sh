@@ -20,7 +20,7 @@ require_env APP_SIGN_ID
 require_env PKG_SIGN_ID
 require_env KEYCHAIN_PROFILE
 
-for command_name in codesign ditto pkgbuild pkgutil spctl xcrun; do
+for command_name in codesign cyclonedx-gomod ditto go pkgbuild pkgutil python3 shasum spctl xcrun; do
   command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"
 done
 
@@ -79,4 +79,48 @@ xcrun stapler staple "$package_path"
 xcrun stapler validate "$package_path"
 spctl --assess --type install --verbose=2 "$package_path"
 
+checksum_path="$package_path.sha256"
+modules_path="$project_dir/dist/Octopus-$app_version.modules.json"
+sbom_path="$project_dir/dist/Octopus-$app_version.cdx.json"
+(
+  cd "$project_dir"
+  GOWORK=off go list -m -json all | python3 -c '
+import json, sys
+decoder = json.JSONDecoder()
+source = sys.stdin.read()
+items = []
+while source.strip():
+    source = source.lstrip()
+    item, end = decoder.raw_decode(source)
+    items.append(item)
+    source = source[end:]
+json.dump(items, sys.stdout, indent=2)
+sys.stdout.write("\n")
+' >"$modules_path"
+)
+python3 -c 'import json, sys; value = json.load(open(sys.argv[1])); assert isinstance(value, list) and value' "$modules_path"
+(
+  cd "$project_dir"
+  GOWORK=off cyclonedx-gomod app \
+    -json \
+    -output-version 1.6 \
+    -output "$sbom_path" \
+    -main cmd/octopus \
+    "$project_dir"
+)
+python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value.get("bomFormat") == "CycloneDX"
+assert value.get("specVersion") == "1.6"
+assert isinstance(value.get("components", []), list)
+' "$sbom_path"
+(
+  cd "$(dirname "$package_path")"
+  shasum -a 256 "$(basename "$package_path")" >"$(basename "$checksum_path")"
+)
+
 printf 'Built signed and notarized installer: %s\n' "$package_path"
+printf 'Dependency manifest: %s\n' "$modules_path"
+printf 'CycloneDX SBOM: %s\n' "$sbom_path"
+printf 'SHA-256 checksum: %s\n' "$checksum_path"

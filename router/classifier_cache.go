@@ -69,7 +69,7 @@ func (c *classifierMemo) do(
 	ctx context.Context,
 	key string,
 	load func(context.Context) (TaskProfile, *llm.Usage, bool),
-) (profile TaskProfile, usage *llm.Usage, cached bool) {
+) (profile TaskProfile, usage *llm.Usage, cached, coalesced bool) {
 	c.mu.Lock()
 	if elem, found := c.entries[key]; found {
 		entry := elem.Value.(*classifierCacheEntry)
@@ -78,7 +78,7 @@ func (c *classifierMemo) do(
 			c.stats.Hits++
 			profile = entry.profile
 			c.mu.Unlock()
-			return profile, nil, true
+			return profile, nil, true, false
 		}
 		c.removeLocked(elem)
 	}
@@ -87,12 +87,12 @@ func (c *classifierMemo) do(
 		c.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return DefaultProfile(), nil, false
+			return DefaultProfile(), nil, false, true
 		case <-flight.done:
 			if !flight.ok {
-				return DefaultProfile(), nil, false
+				return DefaultProfile(), nil, false, true
 			}
-			return flight.profile, nil, false
+			return flight.profile, nil, false, true
 		}
 	}
 
@@ -113,7 +113,7 @@ func (c *classifierMemo) do(
 	close(flight.done)
 	c.mu.Unlock()
 
-	return profile, usage, false
+	return profile, usage, false, false
 }
 
 func (c *classifierMemo) storeLocked(key string, profile TaskProfile) {

@@ -1,0 +1,20 @@
+{
+  "schema_version": 2,
+  "release": "v0.5.0",
+  "source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "candidate_pkg_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "candidate_binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "config_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "policy_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "decision": "approved_for_production",
+  "reviewed_by": "Release Reviewer",
+  "reviewed_at": "2026-08-07T14:00:00+08:00",
+  "evidence": {
+    "routing": {"type": "routing_gate", "path": "routing.json", "sha256": "1111111111111111111111111111111111111111111111111111111111111111"},
+    "critical": {"type": "critical_review", "path": "critical.json", "sha256": "2222222222222222222222222222222222222222222222222222222222222222"},
+    "soak": {"type": "soak_test", "path": "soak.json", "sha256": "3333333333333333333333333333333333333333333333333333333333333333"},
+    "concurrency": {"type": "concurrency_test", "path": "concurrency.json", "sha256": "4444444444444444444444444444444444444444444444444444444444444444"},
+    "install": {"type": "installer_verification", "path": "install.json", "sha256": "5555555555555555555555555555555555555555555555555555555555555555"},
+    "rollback": {"type": "rollback_test", "path": "rollback.json", "sha256": "6666666666666666666666666666666666666666666666666666666666666666"}
+  }
+}

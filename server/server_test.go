@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	openai "github.com/sashabaranov/go-openai"
@@ -365,6 +366,176 @@ func TestHandlerModels(t *testing.T) {
 	}
 }
 
+func TestHealthAndReadinessProbes(t *testing.T) {
+	s := buildServer(t)
+	for _, path := range []string{"/healthz", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status=%d body=%s", path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("GET %s Cache-Control=%q", path, got)
+		}
+	}
+}
+
+func TestReadinessDoesNotExposeDetailsAndDoesNotRequireRouterAuth(t *testing.T) {
+	s := buildServer(t)
+	s.SetAuthToken("secret")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "anthropic") {
+		t.Fatalf("readiness status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	notReady := New(nil, nil, nil)
+	rec = httptest.NewRecorder()
+	notReady.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("not-ready status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRoutingOverridesRequireConfiguredAuthentication(t *testing.T) {
+	open := buildServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Header.Set(minQualityHeader, "0.95")
+	req.Header.Set(fixedModelHeader, "anthropic/opus")
+	meta, err := open.requestMetadata(req, "/v1/messages", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.MinQuality != 0 || meta.FixedModel != "" || meta.HighestQuality {
+		t.Fatalf("open endpoint trusted policy overrides: %+v", meta)
+	}
+
+	authed := buildServer(t)
+	authed.SetAuthToken("secret")
+	req.Header.Set("x-api-key", "secret")
+	meta, err = authed.requestMetadata(req, "/v1/messages", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.MinQuality != 0.95 || meta.FixedModel != "anthropic/opus" {
+		t.Fatalf("authenticated overrides not parsed: %+v", meta)
+	}
+}
+
+func TestRoutingOverridesRejectInvalidValues(t *testing.T) {
+	s := buildServer(t)
+	s.SetAuthToken("secret")
+	for _, tc := range []struct {
+		header string
+		value  string
+	}{
+		{minQualityHeader, "1.1"},
+		{minQualityHeader, "NaN"},
+		{highestQualityHeader, "sometimes"},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set(tc.header, tc.value)
+		if _, err := s.requestMetadata(req, "/v1/messages", false); err == nil {
+			t.Errorf("%s=%q accepted", tc.header, tc.value)
+		}
+	}
+}
+
+func TestInvalidAuthenticatedOverrideReturnsClientErrorOnBothAPIs(t *testing.T) {
+	s := buildServer(t)
+	s.SetAuthToken("secret")
+	for _, tc := range []struct {
+		path string
+		body string
+	}{
+		{"/v1/messages", `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`},
+		{"/v1/chat/completions", `{"model":"x","messages":[{"role":"user","content":"hi"}]}`},
+	} {
+		req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+		req.Header.Set("x-api-key", "secret")
+		req.Header.Set(minQualityHeader, "expensive")
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("POST %s status=%d body=%s", tc.path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+type stalledProv struct{}
+
+func (*stalledProv) Models() []llm.ModelInfo { return nil }
+func (*stalledProv) NormalizeToolSchema(t []llm.ToolDef) ([]llm.ToolDef, []llm.Diagnostic) {
+	return t, nil
+}
+func (*stalledProv) ChatStream(context.Context, llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	return make(chan llm.ChatEvent), nil
+}
+
+type cancelAwareStalledProv struct{ canceled chan struct{} }
+
+func (*cancelAwareStalledProv) Models() []llm.ModelInfo { return nil }
+func (*cancelAwareStalledProv) NormalizeToolSchema(t []llm.ToolDef) ([]llm.ToolDef, []llm.Diagnostic) {
+	return t, nil
+}
+func (p *cancelAwareStalledProv) ChatStream(ctx context.Context, _ llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	ch := make(chan llm.ChatEvent)
+	go func() {
+		<-ctx.Done()
+		close(p.canceled)
+		close(ch)
+	}()
+	return ch, nil
+}
+
+func TestFirstEventTimeoutFallsBackBeforeWritingClientBytes(t *testing.T) {
+	stalled := &cancelAwareStalledProv{canceled: make(chan struct{})}
+	reg := registry.NewForTest(map[string]llm.LLMProvider{
+		"stalled": stalled,
+		"good":    &fakeProv{text: "bounded fallback"},
+	})
+	s := New(nil, reg, nil)
+	s.SetFirstEventTimeout(20 * time.Millisecond)
+	dec := router.Decision{Chosen: "stalled/model", Eligible: []string{"stalled/model", "good/model"}}
+	started := time.Now()
+	ch, chosen, err := s.tryProvidersStream(context.Background(), dec, llm.ChatRequest{})
+	if err != nil {
+		t.Fatalf("tryProvidersStream: %v", err)
+	}
+	if chosen != "good/model" {
+		t.Fatalf("chosen=%q", chosen)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("fallback took %s", elapsed)
+	}
+	for range ch {
+	}
+	select {
+	case <-stalled.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("timed-out provider context was not cancelled")
+	}
+}
+
+func TestFixedModelOverrideDisablesFallbackCandidates(t *testing.T) {
+	dec := router.Decision{
+		Chosen: "provider/fixed", Eligible: []string{"provider/fixed", "provider/other"}, PolicyOverride: "fixed_model",
+	}
+	got := candidates(dec)
+	if len(got) != 1 || got[0] != "provider/fixed" {
+		t.Fatalf("fixed-model candidates = %v", got)
+	}
+}
+
+func TestNoEligibleMessageExplainsStrictQualityFloor(t *testing.T) {
+	got := noEligibleMessage(router.Decision{Reason: "no eligible model meets quality floor", QualityPolicy: "strict", AppliedQualityFloor: .95})
+	if !strings.Contains(got, "quality floor 0.95") {
+		t.Fatalf("message = %q", got)
+	}
+}
+
 func TestHandlerModelsMethodNotAllowed(t *testing.T) {
 	s := buildServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/v1/models", nil)
@@ -427,7 +598,7 @@ func TestHandlerFallbackOnPrematureProviderClosure(t *testing.T) {
 		},
 		Catalog: []config.CatalogEntry{
 			{ID: "partial/model", Quality: 0.9, Caps: config.Caps{MaxContext: 200000}},
-			{ID: "good/model", Quality: 0.7, Caps: config.Caps{MaxContext: 200000}},
+			{ID: "good/model", Quality: 0.86, Caps: config.Caps{MaxContext: 200000}},
 		},
 	}
 	reg := registry.NewForTest(map[string]llm.LLMProvider{
@@ -619,7 +790,7 @@ func TestLocalOnlyProviderFailureNeverFallsBackToCloud(t *testing.T) {
 			"cloud": {Kind: "anthropic", Location: config.ProviderLocationRemote, APIKey: "test"},
 		},
 		Catalog: []config.CatalogEntry{
-			{ID: "local/model", Quality: 0.8, Speed: 0.5, Caps: config.Caps{MaxContext: 200000}},
+			{ID: "local/model", Quality: 0.9, Speed: 0.5, Caps: config.Caps{MaxContext: 200000}},
 			{ID: "cloud/model", Quality: 0.99, Speed: 0.9, Caps: config.Caps{MaxContext: 200000}},
 		},
 	}
@@ -983,6 +1154,7 @@ func buildFanoutServer(t *testing.T, prov llm.LLMProvider, maxAttempts int) *Ser
 	}
 	cfg := &config.Config{
 		ServerAddr: "x",
+		Classifier: config.ClassifierCfg{Model: "anthropic/m1", MaxTokens: 16},
 		Weights:    config.Weights{Quality: 1},
 		Routing:    config.RoutingCfg{MaxAttempts: maxAttempts},
 		Providers:  map[string]config.ProviderCreds{"anthropic": {APIKeyEnv: "X"}},
@@ -1240,6 +1412,7 @@ func TestUnresolvableModelLeavesFullAttemptBudget(t *testing.T) {
 	prov := &countingErrProv{err: anthErr(429)}
 	cfg := &config.Config{
 		ServerAddr: "x",
+		Classifier: config.ClassifierCfg{Model: "anthropic/m2", MaxTokens: 16},
 		Weights:    config.Weights{Quality: 1},
 		Routing:    config.RoutingCfg{MaxAttempts: 2},
 		Providers:  map[string]config.ProviderCreds{"anthropic": {APIKeyEnv: "X"}},

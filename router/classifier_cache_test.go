@@ -21,11 +21,11 @@ func TestClassifierMemoCachesSuccessfulProfileWithoutUsage(t *testing.T) {
 		return want, wantUsage, true
 	}
 
-	got, usage, cached := memo.do(context.Background(), "digest", load)
-	if got != want || usage != wantUsage || cached {
+	got, usage, cached, coalesced := memo.do(context.Background(), "digest", load)
+	if got != want || usage != wantUsage || cached || coalesced {
 		t.Fatalf("first result = (%+v, %+v, %v)", got, usage, cached)
 	}
-	got, usage, cached = memo.do(context.Background(), "digest", load)
+	got, usage, cached, coalesced = memo.do(context.Background(), "digest", load)
 	if got != want || usage != nil || !cached {
 		t.Fatalf("cached result = (%+v, %+v, %v)", got, usage, cached)
 	}
@@ -45,8 +45,8 @@ func TestClassifierMemoDoesNotCacheFailures(t *testing.T) {
 		return DefaultProfile(), nil, false
 	}
 
-	_, _, _ = memo.do(context.Background(), "digest", load)
-	_, _, _ = memo.do(context.Background(), "digest", load)
+	_, _, _, _ = memo.do(context.Background(), "digest", load)
+	_, _, _, _ = memo.do(context.Background(), "digest", load)
 	if calls.Load() != 2 {
 		t.Fatalf("provider calls = %d, want 2", calls.Load())
 	}
@@ -64,17 +64,17 @@ func TestClassifierMemoExpiresAndEvictsLRU(t *testing.T) {
 		return TaskProfile{EstTokensIn: int(calls.Add(1))}, nil, true
 	}
 
-	_, _, _ = memo.do(context.Background(), "a", load)
-	_, _, _ = memo.do(context.Background(), "b", load)
-	_, _, _ = memo.do(context.Background(), "a", load) // a becomes most recent
-	_, _, _ = memo.do(context.Background(), "c", load) // b is evicted
-	_, _, cached := memo.do(context.Background(), "b", load)
+	_, _, _, _ = memo.do(context.Background(), "a", load)
+	_, _, _, _ = memo.do(context.Background(), "b", load)
+	_, _, _, _ = memo.do(context.Background(), "a", load) // a becomes most recent
+	_, _, _, _ = memo.do(context.Background(), "c", load) // b is evicted
+	_, _, cached, _ := memo.do(context.Background(), "b", load)
 	if cached {
 		t.Fatal("least-recently-used entry was retained")
 	}
 
 	now = now.Add(2 * time.Minute)
-	_, _, cached = memo.do(context.Background(), "c", load)
+	_, _, cached, _ = memo.do(context.Background(), "c", load)
 	if cached {
 		t.Fatal("expired entry was retained")
 	}
@@ -99,12 +99,16 @@ func TestClassifierMemoCoalescesConcurrentLoads(t *testing.T) {
 	const workers = 8
 	var wg sync.WaitGroup
 	wg.Add(workers)
-	results := make(chan TaskProfile, workers)
+	type result struct {
+		profile   TaskProfile
+		coalesced bool
+	}
+	results := make(chan result, workers)
 	for range workers {
 		go func() {
 			defer wg.Done()
-			profile, _, _ := memo.do(context.Background(), "same-digest", load)
-			results <- profile
+			profile, _, _, coalesced := memo.do(context.Background(), "same-digest", load)
+			results <- result{profile: profile, coalesced: coalesced}
 		}()
 	}
 	<-started
@@ -119,10 +123,17 @@ func TestClassifierMemoCoalescesConcurrentLoads(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("provider calls = %d, want 1", calls.Load())
 	}
-	for profile := range results {
-		if profile.Difficulty != "high" {
-			t.Fatalf("shared profile = %+v", profile)
+	coalescedResults := 0
+	for result := range results {
+		if result.profile.Difficulty != "high" {
+			t.Fatalf("shared profile = %+v", result.profile)
 		}
+		if result.coalesced {
+			coalescedResults++
+		}
+	}
+	if coalescedResults != workers-1 {
+		t.Fatalf("coalesced result provenance = %d, want %d", coalescedResults, workers-1)
 	}
 	if stats := memo.snapshot(); stats.Coalesced != workers-1 {
 		t.Fatalf("coalesced = %d, want %d", stats.Coalesced, workers-1)

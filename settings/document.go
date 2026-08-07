@@ -41,6 +41,7 @@ type RoutingDocument struct {
 	SwitchConfidence      float64              `json:"switch_confidence"`
 	CostMode              string               `json:"cost_mode"`
 	CostReferenceUSD      float64              `json:"cost_reference_usd"`
+	QualityFloors         map[string]float64   `json:"quality_floors"`
 	HighQualityFloor      float64              `json:"high_quality_floor"`
 	ReasoningBonus        float64              `json:"reasoning_bonus"`
 	WorkflowAffinity      bool                 `json:"workflow_affinity"`
@@ -74,7 +75,9 @@ func defaultDocument() Document {
 			Strategy: config.RoutingStrategyAmortized, DataPolicy: config.DataPolicyAllowRemote,
 			SessionTTL: "1h", CacheAware: true, MaxAttempts: 3,
 			DefaultRemainingTurns: 4, MinSwitchSavingsUSD: 0.01, MinSwitchSavingsPct: 0.10, SwitchConfidence: 0.60,
-			CostMode: config.CostModeAbsolute, CostReferenceUSD: 0.10, HighQualityFloor: 0.85, ReasoningBonus: 0.05,
+			CostMode: config.CostModeAbsolute, CostReferenceUSD: 0.10,
+			QualityFloors:    map[string]float64{"trivial": 0.70, "low": 0.70, "medium": 0.85, "high": 0.95},
+			HighQualityFloor: 0.95, ReasoningBonus: 0.05,
 			WorkflowAffinity: true,
 		},
 		Providers: []ProviderDocument{{
@@ -105,6 +108,7 @@ func documentFromConfig(cfg *config.Config) Document {
 			SwitchConfidence:      cfg.Routing.SwitchConfidence,
 			CostMode:              cfg.Routing.CostMode,
 			CostReferenceUSD:      cfg.Routing.CostReferenceUSD,
+			QualityFloors:         cloneFloatMap(cfg.Routing.QualityFloors),
 			HighQualityFloor:      cfg.Routing.HighQualityFloor,
 			ReasoningBonus:        cfg.Routing.ReasoningBonus,
 			WorkflowAffinity:      cfg.Routing.WorkflowAffinity,
@@ -144,6 +148,7 @@ func (d Document) config() (*config.Config, error) {
 			MinSwitchSavingsUSD: d.Routing.MinSwitchSavingsUSD, MinSwitchSavingsPct: d.Routing.MinSwitchSavingsPct,
 			SwitchConfidence: d.Routing.SwitchConfidence,
 			CostMode:         d.Routing.CostMode, CostReferenceUSD: d.Routing.CostReferenceUSD,
+			QualityFloors:    cloneFloatMap(d.Routing.QualityFloors),
 			HighQualityFloor: d.Routing.HighQualityFloor,
 			ReasoningBonus:   d.Routing.ReasoningBonus,
 			WorkflowAffinity: d.Routing.WorkflowAffinity, Background: d.Routing.Background,
@@ -180,4 +185,15 @@ func (d Document) config() (*config.Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func cloneFloatMap(source map[string]float64) map[string]float64 {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]float64, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }

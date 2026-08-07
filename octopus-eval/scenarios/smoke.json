@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "name": "smoke",
+  "description": "Six representative four-turn conversations for a bounded paid comparison.",
+  "shared_assertions": [
+    {"id": "responses-non-empty", "type": "non_empty", "turn": "all"}
+  ],
+  "scenarios": [
+    {
+      "id": "customer_support",
+      "name": "Customer support and policy",
+      "domains": ["support"],
+      "turns": [
+        {"difficulty": "trivial", "prompt": "Customer C-017 is on which plan? Reply with the plan name only."},
+        {"difficulty": "low", "prompt": "Draft a two-sentence acknowledgement of C-017's refund request. Do not promise an outcome."},
+        {"difficulty": "high", "prompt": "Analyse C-017's disputed renewal in detail. Reconcile the refund window, bounced notice, policy precedence and limit on legal conclusions. Separate facts, inference, risk and recommendation."},
+        {"difficulty": "low", "prompt": "Turn that analysis into a four-bullet hand-off for the Compliance queue."}
+      ]
+    },
+    {
+      "id": "go_debugging",
+      "name": "Go debugging and concurrency",
+      "domains": ["coding"],
+      "turns": [
+        {"difficulty": "trivial", "prompt": "In one sentence, what does O(n) mean?"},
+        {"difficulty": "medium", "prompt": "Fix this Go function so it cannot race when called concurrently: var totals = map[string]int{}; func add(k string, n int) { totals[k] += n }. Return code and one sentence."},
+        {"difficulty": "high", "prompt": "Design the production version where workers update account totals and snapshots are durable. Cover ownership, cancellation, backpressure, consistency, errors and tests for leaks or lost acknowledged updates."},
+        {"difficulty": "medium", "prompt": "Give a minimal implementation checklist ordered by the failures it prevents."}
+      ]
+    },
+    {
+      "id": "business_analysis",
+      "name": "Business data analysis",
+      "domains": ["data_analysis"],
+      "turns": [
+        {"difficulty": "trivial", "prompt": "What were quarterly net subscriptions? Reply with the number only."},
+        {"difficulty": "medium", "prompt": "Write parameterised PostgreSQL returning monthly gross subscriptions, refunds, net subscriptions and refund rate for supplied dates. Handle division by zero."},
+        {"difficulty": "high", "prompt": "Develop a careful investigation plan for February's refund rise and March's net decline. Specify cohorts, counterfactuals, data-quality checks and stopping conditions before claiming a cause."},
+        {"difficulty": "low", "prompt": "Summarise the decision for an executive in three bullets, preserving the main uncertainty."}
+      ]
+    },
+    {
+      "id": "security_review",
+      "name": "Application security review",
+      "domains": ["security"],
+      "turns": [
+        {"difficulty": "trivial", "prompt": "Name the main vulnerability in SQL built by concatenating an email address."},
+        {"difficulty": "medium", "prompt": "Replace it with safe Go database/sql code and avoid revealing whether an account exists."},
+        {"difficulty": "high", "prompt": "Threat-model a complete password-reset flow. Cover enumeration, token handling, replay, expiry, races, sessions, link leakage, rate limits, audit logs, operator access and denial-of-service trade-offs."},
+        {"difficulty": "low", "prompt": "Produce a P0/P1/P2 remediation list with no more than two items per priority."}
+      ]
+    },
+    {
+      "id": "migration_planning",
+      "name": "Production migration planning",
+      "domains": ["operations"],
+      "turns": [
+        {"difficulty": "trivial", "prompt": "How long is the stated Sunday migration window? Reply with the duration only."},
+        {"difficulty": "medium", "prompt": "Compare rolling and blue-green deployment for the stated payment-system constraints in a small table."},
+        {"difficulty": "high", "prompt": "Design a minute-by-minute migration plan fitting the window, team, read-only, rollback and audit constraints. Include roles, evidence, gates, observability, triggers and unproven assumptions."},
+        {"difficulty": "medium", "prompt": "Write the final go/no-go checklist as ten yes-or-no questions."}
+      ]
+    },
+    {
+      "id": "technical_writing",
+      "name": "Technical writing and synthesis",
+      "domains": ["writing"],
+      "turns": [
+        {"difficulty": "trivial", "prompt": "Correct this sentence: 'The results proves the system are cheaper.'"},
+        {"difficulty": "medium", "prompt": "Rewrite this claim carefully: 'Octopus always picks the perfect model and guarantees massive savings without affecting quality.' Keep it to two sentences."},
+        {"difficulty": "high", "prompt": "Write a 350-word internal note explaining routing cost, uncertain model quality, turns to completion, cache switching penalties and the evidence needed before claiming superior results."},
+        {"difficulty": "low", "prompt": "Give the note a factual title and a one-sentence standfirst."}
+      ]
+    }
+  ]
+}

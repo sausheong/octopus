@@ -1,0 +1,70 @@
+{
+  "routing.json": {
+    "schema_version": 1,
+    "type": "routing_gate",
+    "status": "passed",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "routing_gate_passed": true,
+    "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "config_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policy_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "distinct_runs": 5,
+    "scenarios_per_run": 50,
+    "routed_turns_per_run": 200
+  },
+  "critical.json": {
+    "schema_version": 1,
+    "type": "critical_review",
+    "status": "passed",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "artifact_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "reviewed_by": "Critical-task Reviewer",
+    "reviewed_at": "2026-08-07T12:00:00+08:00"
+  },
+  "soak.json": {
+    "schema_version": 1,
+    "type": "soak_test",
+    "status": "passed",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "started_at": "2026-08-01T00:00:00Z",
+    "ended_at": "2026-08-04T00:00:00Z",
+    "requests": 10000,
+    "router_errors": 0,
+    "error_rate": 0.0,
+    "error_rate_slo_max": 0.001,
+    "availability": 1.0,
+    "availability_slo_min": 0.999
+  },
+  "concurrency.json": {
+    "schema_version": 1,
+    "type": "concurrency_test",
+    "status": "passed",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "parallel_streams": 50,
+    "session_crossovers": 0,
+    "failures": 0
+  },
+  "install.json": {
+    "schema_version": 1,
+    "type": "installer_verification",
+    "status": "passed",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "package_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "notarization_status": "accepted",
+    "staple_validated": true,
+    "install_status": "passed",
+    "upgrade_status": "passed"
+  },
+  "rollback.json": {
+    "schema_version": 1,
+    "type": "rollback_test",
+    "status": "passed",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "artifact_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "rollback_status": "passed",
+    "reviewed_by": "Rollback Reviewer",
+    "reviewed_at": "2026-08-07T13:00:00+08:00"
+  }
+}

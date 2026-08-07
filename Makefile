@@ -8,7 +8,7 @@ UNAME_S   := $(shell uname -s)
 RELEASE_GOALS   := $(filter-out vet,$(filter v%,$(MAKECMDGOALS)))
 RELEASE_VERSION := $(if $(VERSION),$(VERSION),$(RELEASE_GOALS))
 
-.PHONY: all build app installer release notary-profile open-app test test-race vet tidy run clean help
+.PHONY: all build app installer release production-release notary-profile open-app test test-race vet check eval-local eval-gate tidy run clean help
 
 ifneq ($(strip $(RELEASE_GOALS)),)
 .PHONY: $(RELEASE_GOALS)
@@ -36,10 +36,16 @@ app:
 installer:
 	./scripts/build-macos-installer.sh
 
-## release: create a versioned GitHub release and attach the notarized installer
+## release: create a signed candidate GitHub prerelease
 release:
 	@test -n "$(RELEASE_VERSION)" || { echo "usage: make release vX.Y.Z" >&2; exit 1; }
 	@./scripts/release.sh "$(RELEASE_VERSION)"
+
+## production-release: promote a reviewed release with mandatory evidence
+production-release:
+	@test -n "$(RELEASE_VERSION)" || { echo "usage: make production-release vX.Y.Z RELEASE_EVIDENCE=/path/evidence.json" >&2; exit 1; }
+	@test -n "$(RELEASE_EVIDENCE)" || { echo "RELEASE_EVIDENCE is required" >&2; exit 1; }
+	@RELEASE_CHANNEL=production RELEASE_EVIDENCE="$(RELEASE_EVIDENCE)" ./scripts/release.sh "$(RELEASE_VERSION)"
 
 ## notary-profile: store Apple notarization credentials in Keychain (one-time setup)
 notary-profile:
@@ -63,6 +69,22 @@ test-race:
 ## vet: run go vet
 vet:
 	$(GONOSUMDB) $(GOFLAGS) go vet ./...
+
+## check: run the deterministic pre-release Go and evaluation checks
+check: test test-race vet
+	@test -z "$$(gofmt -l .)" || { echo "gofmt required:"; gofmt -l .; exit 1; }
+	PYTHONPATH=octopus-eval/scripts python3 -m unittest discover -s octopus-eval/scripts -p 'test_*.py'
+	./octopus-eval/run.sh --tier-a
+	git diff --check
+
+## eval-local: run the tracked offline and local-mock evaluation tiers
+eval-local:
+	./octopus-eval/run.sh --local
+
+## eval-gate: check one or more RUN2_RESULTS files against production thresholds
+eval-gate:
+	@test -n "$(RUN2_RESULTS)" || { echo "usage: make eval-gate RUN2_RESULTS='result1.json result2.json'" >&2; exit 1; }
+	python3 octopus-eval/scripts/production_gate.py $(RUN2_RESULTS)
 
 ## tidy: tidy and verify go.mod / go.sum
 tidy:

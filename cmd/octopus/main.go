@@ -32,6 +32,11 @@ func main() {
 		slog.Error("config load failed", "err", err)
 		os.Exit(1)
 	}
+	if err := validateRuntimeAuth(cfg); err != nil {
+		slog.Error("config auth failed", "err", err)
+		os.Exit(1)
+	}
+	authToken := cfg.AuthToken()
 
 	// Resolve every provider's key into its config (reading api_key_env now,
 	// while the environment is still intact), then scrub the ambient
@@ -57,13 +62,7 @@ func main() {
 
 	rt := router.NewRouter(cfg, reg)
 	srv := server.New(rt, reg, cfg.Catalog)
-	// Opt-in: an unconfigured or unset variable yields "", which leaves the
-	// endpoints open exactly as they were before this option existed.
-	if cfg.AuthTokenMisconfigured() {
-		slog.Warn("auth token variable is empty; routing endpoints are UNAUTHENTICATED",
-			"auth_token_env", cfg.AuthTokenEnv)
-	}
-	srv.SetAuthToken(cfg.AuthToken())
+	srv.SetAuthToken(authToken)
 
 	httpSrv := &http.Server{
 		Addr:    cfg.ServerAddr,

@@ -22,8 +22,8 @@ jobs:
       # turns a stray go.mod edit into a failure instead of a silent repair.
       GOFLAGS: -mod=readonly
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
         with:
           go-version: '1.25.1'
           cache: true
@@ -52,3 +52,65 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
+      - name: Evaluation report and production-gate tests
+        env:
+          PYTHONPATH: octopus-eval/scripts
+        run: python3 -m unittest discover -s octopus-eval/scripts -p 'test_*.py'
+      - name: Release evidence and shell syntax tests
+        run: |
+          python3 -m unittest scripts/test_validate_release_evidence.py
+          sh -n scripts/release.sh scripts/build-macos-installer.sh
+      - name: Deterministic routing evaluation (Tier A)
+        run: ./octopus-eval/run.sh --tier-a
+
+  security:
+    name: Vulnerability, secret, and SBOM checks
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Gitleaks scans committed history, not only the checked-out tip.
+          fetch-depth: 0
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: '1.25.1'
+          cache: true
+      - name: Install pinned security tools
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install github.com/gitleaks/gitleaks/v8@v8.30.1
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
+      - name: Go vulnerability scan
+        run: |
+          "$(go env GOPATH)/bin/govulncheck" ./...
+      - name: Secret scan
+        run: |
+          "$(go env GOPATH)/bin/gitleaks" git --redact --no-banner .
+      - name: Generate and validate CycloneDX SBOM
+        run: |
+          "$(go env GOPATH)/bin/cyclonedx-gomod" mod -json -output-version 1.6 -output /tmp/octopus.cdx.json .
+          python3 -c 'import json; d=json.load(open("/tmp/octopus.cdx.json")); assert d["bomFormat"] == "CycloneDX" and d["specVersion"] == "1.6"'
+
+  macos:
+    name: macOS application
+    timeout-minutes: 20
+    runs-on: macos-latest
+    env:
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: '1.25.1'
+          cache: true
+      - name: Test Darwin implementation
+        run: go test ./...
+      - name: Build menu bar application
+        run: make app
+      - name: Verify application bundle
+        run: |
+          test -x dist/Octopus.app/Contents/MacOS/octopus
+          plutil -lint dist/Octopus.app/Contents/Info.plist

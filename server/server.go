@@ -7,9 +7,12 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,16 +25,31 @@ import (
 	"github.com/sausheong/octopus/router"
 )
 
-// maxRequestBytes caps the body size for inbound requests (32 MiB).
-const maxRequestBytes = 32 << 20
+const (
+	// maxRequestBytes caps the body size for inbound requests (32 MiB).
+	maxRequestBytes = 32 << 20
+	// defaultFirstEventTimeout bounds how long an upstream may keep a request
+	// waiting without producing even its first event. Long-lived SSE responses
+	// remain unlimited after that point and are governed by client cancellation.
+	defaultFirstEventTimeout = 30 * time.Second
+)
+
+var errFirstEventTimeout = errors.New("provider timed out before first event")
+
+const (
+	minQualityHeader     = "X-Octopus-Min-Quality"
+	fixedModelHeader     = "X-Octopus-Fixed-Model"
+	highestQualityHeader = "X-Octopus-Highest-Quality"
+)
 
 // Server handles POST /v1/messages, POST /v1/chat/completions, and GET /v1/models.
 type Server struct {
-	rt            *router.Router
-	reg           *registry.Registry
-	catalog       []config.CatalogEntry
-	usageObserver func(insights.Observation)
-	authToken     string
+	rt                *router.Router
+	reg               *registry.Registry
+	catalog           []config.CatalogEntry
+	usageObserver     func(insights.Observation)
+	authToken         string
+	firstEventTimeout time.Duration
 }
 
 // SetAuthToken enables shared-secret authentication on the routing endpoints.
@@ -41,11 +59,21 @@ func (s *Server) SetAuthToken(token string) { s.authToken = token }
 
 // New builds a Server.
 func New(rt *router.Router, reg *registry.Registry, catalog []config.CatalogEntry, observers ...func(insights.Observation)) *Server {
-	server := &Server{rt: rt, reg: reg, catalog: catalog}
+	server := &Server{rt: rt, reg: reg, catalog: catalog, firstEventTimeout: defaultFirstEventTimeout}
 	if len(observers) > 0 {
 		server.usageObserver = observers[0]
 	}
 	return server
+}
+
+// SetFirstEventTimeout changes the maximum wait for the first provider event.
+// It primarily exists to make the safety bound testable without slow tests.
+// Non-positive values restore the production default.
+func (s *Server) SetFirstEventTimeout(timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = defaultFirstEventTimeout
+	}
+	s.firstEventTimeout = timeout
 }
 
 // authorized reports whether the request carries the configured shared secret.
@@ -66,6 +94,8 @@ func (s *Server) authorized(r *http.Request) bool {
 // Handler returns the HTTP handler (mux) for the server.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleReady)
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
 			writeAnthropicUnauthorized(w)
@@ -90,9 +120,92 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeProbe(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	writeProbe(w, http.StatusOK, "ok")
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeProbe(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	// Registry creation validates provider construction before a Server is
+	// published. Keep this response deliberately minimal and unauthenticated so
+	// local launch agents can probe it without exposing catalogue or credentials.
+	if s.rt == nil || s.reg == nil || len(s.catalog) == 0 {
+		writeProbe(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
+	writeProbe(w, http.StatusOK, "ready")
+}
+
+func writeProbe(w http.ResponseWriter, status int, value string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": value})
+}
+
+// firstEvent waits for an upstream's first event without allowing a provider
+// that accepted the request but then stalled to pin the client indefinitely.
+func (s *Server) firstEvent(ctx context.Context, ch <-chan llm.ChatEvent) (llm.ChatEvent, bool, error) {
+	timer := time.NewTimer(s.firstEventTimeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return llm.ChatEvent{}, false, ctx.Err()
+	case <-timer.C:
+		return llm.ChatEvent{}, false, errFirstEventTimeout
+	case first, ok := <-ch:
+		return first, ok, nil
+	}
+}
+
+// requestMetadata admits routing-policy overrides only on deployments that
+// configured authentication and only from the authenticated caller. Header
+// values on an open endpoint are ignored, preventing an arbitrary local client
+// from forcing expensive models. Workflow affinity retains its legacy status
+// as a non-policy placement hint.
+func (s *Server) requestMetadata(r *http.Request, endpoint string, stream bool) (router.RequestMetadata, error) {
+	meta := router.RequestMetadata{
+		Endpoint: endpoint, Stream: stream, WorkflowID: r.Header.Get(router.WorkflowIDHeader),
+	}
+	if s.authToken == "" || !s.authorized(r) {
+		return meta, nil
+	}
+	if value := strings.TrimSpace(r.Header.Get(minQualityHeader)); value != "" {
+		minimum, err := strconv.ParseFloat(value, 64)
+		if err != nil || math.IsNaN(minimum) || math.IsInf(minimum, 0) || minimum < 0 || minimum > 1 {
+			return meta, errors.New("X-Octopus-Min-Quality must be a number between 0 and 1")
+		}
+		meta.MinQuality = minimum
+	}
+	meta.FixedModel = strings.TrimSpace(r.Header.Get(fixedModelHeader))
+	if value := strings.TrimSpace(r.Header.Get(highestQualityHeader)); value != "" {
+		highest, err := strconv.ParseBool(value)
+		if err != nil {
+			return meta, errors.New("X-Octopus-Highest-Quality must be true or false")
+		}
+		meta.HighestQuality = highest
+	}
+	if meta.FixedModel != "" && meta.HighestQuality {
+		return meta, errors.New("fixed-model and highest-quality overrides cannot be combined")
+	}
+	return meta, nil
+}
+
 // candidates returns the ordered list of provider IDs to try: chosen first,
 // then the rest of Eligible in score order (duplicates removed).
 func candidates(dec router.Decision) []string {
+	if dec.PolicyOverride == "fixed_model" {
+		return []string{dec.Chosen}
+	}
 	out := []string{dec.Chosen}
 	for _, id := range dec.Eligible {
 		if id != dec.Chosen {
@@ -103,6 +216,9 @@ func candidates(dec router.Decision) []string {
 }
 
 func noEligibleMessage(dec router.Decision) string {
+	if dec.QualityPolicy == "strict" || dec.Reason == "no eligible model meets quality floor" {
+		return fmt.Sprintf("no catalog model meets the required quality floor %.2f", dec.AppliedQualityFloor)
+	}
 	if dec.DataPolicy == config.DataPolicyLocalOnly {
 		return "no local model can satisfy this request; remote routing is disabled by routing.data_policy=local_only"
 	}
@@ -175,8 +291,10 @@ func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, ch
 			continue
 		}
 
-		ch, err := prov.ChatStream(ctx, attempt)
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		ch, err := prov.ChatStream(attemptCtx, attempt)
 		if err != nil {
+			cancelAttempt()
 			lastErr = err
 			logAttemptFailure("provider stream open failed, trying fallback", id, err)
 			attempts++
@@ -188,8 +306,19 @@ func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, ch
 
 		// Peek the first event: empty channel or immediate EventError both mean
 		// the provider failed before producing any content — we can still fall back.
-		first, ok := <-ch
+		first, ok, waitErr := s.firstEvent(attemptCtx, ch)
+		if waitErr != nil {
+			cancelAttempt()
+			lastErr = waitErr
+			logAttemptFailure("provider produced no event before timeout, trying fallback", id, waitErr)
+			attempts++
+			if !anthropicio.Retryable(lastErr) || attempts >= maxTries {
+				break
+			}
+			continue
+		}
 		if !ok {
+			cancelAttempt()
 			lastErr = errors.New("provider returned empty stream")
 			slog.Warn("provider returned empty stream, trying fallback", "model", id)
 			attempts++
@@ -205,10 +334,7 @@ func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, ch
 			}
 			lastErr = chErr
 			logAttemptFailure("provider stream error on first event, trying fallback", id, chErr)
-			go func() {
-				for range ch {
-				}
-			}()
+			cancelAttempt()
 			attempts++
 			if !anthropicio.Retryable(lastErr) || attempts >= maxTries {
 				break
@@ -220,9 +346,14 @@ func (s *Server) tryProvidersStream(ctx context.Context, dec router.Decision, ch
 		out := make(chan llm.ChatEvent, 1)
 		out <- first
 		go func() {
+			defer cancelAttempt()
 			defer close(out)
 			for ev := range ch {
-				out <- ev
+				select {
+				case out <- ev:
+				case <-attemptCtx.Done():
+					return
+				}
 			}
 		}()
 		if id != dec.Chosen {
@@ -263,13 +394,15 @@ func (s *Server) collectWithFallback(
 		// Prefer the provider's native non-streaming transport when it exposes
 		// that optional capability; providers without it retain the existing
 		// stream-and-collect behaviour.
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
 		var ch <-chan llm.ChatEvent
 		if nonStreaming, ok := prov.(llm.NonStreamingProvider); ok {
-			ch, err = nonStreaming.ChatNonStreaming(ctx, attempt)
+			ch, err = nonStreaming.ChatNonStreaming(attemptCtx, attempt)
 		} else {
-			ch, err = prov.ChatStream(ctx, attempt)
+			ch, err = prov.ChatStream(attemptCtx, attempt)
 		}
 		if err != nil {
+			cancelAttempt()
 			lastErr = err
 			logAttemptFailure("provider request failed, trying fallback", id, err)
 			attempts++
@@ -282,8 +415,9 @@ func (s *Server) collectWithFallback(
 		// Require at least one meaningful event before handing the channel to
 		// the collector. An empty stream (closed without events) is treated as
 		// an upstream failure so the next candidate can be tried.
-		peeked, peekErr := peekForContent(ch)
+		peeked, peekErr := s.peekForContent(attemptCtx, ch)
 		if peekErr != nil {
+			cancelAttempt()
 			lastErr = peekErr
 			logAttemptFailure("provider returned empty or failed stream, trying fallback", id, peekErr)
 			attempts++
@@ -294,6 +428,7 @@ func (s *Server) collectWithFallback(
 		}
 
 		out, err := collect(id, s.observeEvents(chat, id, dec, peeked))
+		cancelAttempt()
 		if err != nil {
 			lastErr = err
 			logAttemptFailure("provider collection failed, trying fallback", id, err)
@@ -341,8 +476,11 @@ func (s *Server) observeEvents(chat llm.ChatRequest, model string, decision rout
 // (closed without events) or the first event is EventError, it returns an
 // error so collectWithFallback can try the next candidate. Otherwise it
 // returns a new channel with the first event prepended.
-func peekForContent(ch <-chan llm.ChatEvent) (<-chan llm.ChatEvent, error) {
-	first, ok := <-ch
+func (s *Server) peekForContent(ctx context.Context, ch <-chan llm.ChatEvent) (<-chan llm.ChatEvent, error) {
+	first, ok, err := s.firstEvent(ctx, ch)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, errors.New("provider returned empty stream")
 	}
@@ -461,9 +599,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	dec := s.rt.RouteWithMetadata(ctx, dr.Chat, router.RequestMetadata{
-		Endpoint: "/v1/messages", Stream: dr.Stream, WorkflowID: r.Header.Get(router.WorkflowIDHeader),
-	})
+	meta, err := s.requestMetadata(r, "/v1/messages", dr.Stream)
+	if err != nil {
+		writeError(w, anthropicio.NewAPIError("invalid_request", err.Error()))
+		return
+	}
+	dec := s.rt.RouteWithMetadata(ctx, dr.Chat, meta)
 	dr.Chat = router.RequestForDecision(dr.Chat, dec)
 
 	if dec.NoEligible {
@@ -542,9 +683,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	chat.Messages = msgs
 
 	ctx := r.Context()
-	dec := s.rt.RouteWithMetadata(ctx, chat, router.RequestMetadata{
-		Endpoint: "/v1/chat/completions", Stream: stream, WorkflowID: r.Header.Get(router.WorkflowIDHeader),
-	})
+	meta, err := s.requestMetadata(r, "/v1/chat/completions", stream)
+	if err != nil {
+		writeOAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	dec := s.rt.RouteWithMetadata(ctx, chat, meta)
 	chat = router.RequestForDecision(chat, dec)
 
 	if dec.NoEligible {

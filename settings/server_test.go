@@ -525,3 +525,16 @@ func TestBrowserFormEchoesAuthTokenEnv(t *testing.T) {
 		t.Error("app.js collectDocument() does not echo auth_token_env; a form save will silently disable authentication")
 	}
 }
+
+func TestBrowserFormPreservesAbsentQualityFloorKeys(t *testing.T) {
+	data, err := staticFiles.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	for _, fragment := range []string{"input.dataset.configured = present", ".filter(difficulty => $(`#quality-floor-${difficulty}`).dataset.configured === \"true\")"} {
+		if !strings.Contains(script, fragment) {
+			t.Fatalf("app.js does not preserve absent quality-floor keys; missing %q", fragment)
+		}
+	}
+}

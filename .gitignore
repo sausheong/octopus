@@ -17,7 +17,21 @@ go.work.sum
 /octopus
 /llmrouter
 /dist/
-/octopus-eval/
+# Keep the evaluation harness reproducible. Generated reports, paid-run output,
+# local transcripts, and Python caches remain machine-local.
+/octopus-eval/__pycache__/
+/octopus-eval/CLAUDE.md
+/octopus-eval/raw/
+/octopus-eval/current-run-results.json
+/octopus-eval/checklist.md
+/octopus-eval/report.html
+/octopus-eval/summary.md
+/octopus-eval/run2-insights.json
+/octopus-eval/run2-results.json
+/octopus-eval/run2-results.json.partial*
+/octopus-eval/.insights-*.json
+/octopus-eval/run2-summary.md
+/octopus-eval/run2.log
 /octopus-eval.tgz
 .DS_Store
 __pycache__/

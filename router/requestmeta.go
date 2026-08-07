@@ -12,4 +12,10 @@ type RequestMetadata struct {
 	Endpoint   string
 	Stream     bool
 	WorkflowID string
+	// Policy overrides are trusted control-plane inputs. The transport must
+	// accept them only from an authenticated caller. They can narrow normal
+	// routing but never bypass capabilities or data-placement policy.
+	MinQuality     float64
+	FixedModel     string
+	HighestQuality bool
 }

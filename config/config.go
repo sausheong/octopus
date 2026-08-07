@@ -169,12 +169,16 @@ type RoutingCfg struct {
 	// CostMode controls whether request cost is scored relative to the current
 	// eligible set or against a stable dollar reference. Absolute is the
 	// recommended mode; relative remains available for compatibility.
-	CostMode         string        `yaml:"cost_mode"`
-	CostReferenceUSD float64       `yaml:"cost_reference_usd"`
-	HighQualityFloor float64       `yaml:"high_quality_floor"`
-	ReasoningBonus   float64       `yaml:"reasoning_bonus"`
-	WorkflowAffinity bool          `yaml:"workflow_affinity"`
-	Background       BackgroundCfg `yaml:"background"`
+	CostMode         string  `yaml:"cost_mode"`
+	CostReferenceUSD float64 `yaml:"cost_reference_usd"`
+	// QualityFloors are hard minimum catalogue quality ratings by task
+	// difficulty. A candidate below the applicable floor is never eligible.
+	// HighQualityFloor is retained as the legacy spelling of the "high" entry.
+	QualityFloors    map[string]float64 `yaml:"quality_floors,omitempty"`
+	HighQualityFloor float64            `yaml:"high_quality_floor"`
+	ReasoningBonus   float64            `yaml:"reasoning_bonus"`
+	WorkflowAffinity bool               `yaml:"workflow_affinity"`
+	Background       BackgroundCfg      `yaml:"background"`
 	// MaxAttempts bounds how many backends one request may try. Without it,
 	// worst-case latency and spend grow with catalog size.
 	MaxAttempts int `yaml:"max_attempts"`
@@ -233,6 +237,17 @@ func (c *Config) AuthTokenMisconfigured() bool {
 	return c.AuthTokenEnv != "" && c.AuthToken() == ""
 }
 
+func cloneQualityFloors(src map[string]float64) map[string]float64 {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]float64, len(src))
+	for difficulty, floor := range src {
+		dst[difficulty] = floor
+	}
+	return dst
+}
+
 // yamlConfig mirrors Config but nests server.addr so YAML maps cleanly,
 // then we flatten into Config.
 type yamlConfig struct {
@@ -249,22 +264,23 @@ type yamlConfig struct {
 }
 
 type yamlRoutingCfg struct {
-	Strategy              string        `yaml:"strategy,omitempty"`
-	DataPolicy            string        `yaml:"data_policy,omitempty"`
-	SessionSticky         *bool         `yaml:"session_sticky,omitempty"`
-	SessionTTL            time.Duration `yaml:"session_ttl"`
-	CacheAware            *bool         `yaml:"cache_aware"`
-	MaxAttempts           *int          `yaml:"max_attempts"`
-	DefaultRemainingTurns *int          `yaml:"default_remaining_turns"`
-	MinSwitchSavingsUSD   *float64      `yaml:"min_switch_savings_usd"`
-	MinSwitchSavingsPct   *float64      `yaml:"min_switch_savings_pct"`
-	SwitchConfidence      *float64      `yaml:"switch_confidence"`
-	CostMode              string        `yaml:"cost_mode,omitempty"`
-	CostReferenceUSD      *float64      `yaml:"cost_reference_usd,omitempty"`
-	HighQualityFloor      *float64      `yaml:"high_quality_floor,omitempty"`
-	ReasoningBonus        *float64      `yaml:"reasoning_bonus,omitempty"`
-	WorkflowAffinity      *bool         `yaml:"workflow_affinity,omitempty"`
-	Background            BackgroundCfg `yaml:"background,omitempty"`
+	Strategy              string             `yaml:"strategy,omitempty"`
+	DataPolicy            string             `yaml:"data_policy,omitempty"`
+	SessionSticky         *bool              `yaml:"session_sticky,omitempty"`
+	SessionTTL            time.Duration      `yaml:"session_ttl"`
+	CacheAware            *bool              `yaml:"cache_aware"`
+	MaxAttempts           *int               `yaml:"max_attempts"`
+	DefaultRemainingTurns *int               `yaml:"default_remaining_turns"`
+	MinSwitchSavingsUSD   *float64           `yaml:"min_switch_savings_usd"`
+	MinSwitchSavingsPct   *float64           `yaml:"min_switch_savings_pct"`
+	SwitchConfidence      *float64           `yaml:"switch_confidence"`
+	CostMode              string             `yaml:"cost_mode,omitempty"`
+	CostReferenceUSD      *float64           `yaml:"cost_reference_usd,omitempty"`
+	QualityFloors         map[string]float64 `yaml:"quality_floors,omitempty"`
+	HighQualityFloor      *float64           `yaml:"high_quality_floor,omitempty"`
+	ReasoningBonus        *float64           `yaml:"reasoning_bonus,omitempty"`
+	WorkflowAffinity      *bool              `yaml:"workflow_affinity,omitempty"`
+	Background            BackgroundCfg      `yaml:"background,omitempty"`
 }
 
 // Load reads, parses, and validates the config at path.
@@ -339,6 +355,18 @@ func Parse(data []byte) (*Config, error) {
 	if yc.Routing.HighQualityFloor != nil {
 		highQualityFloor = *yc.Routing.HighQualityFloor
 	}
+	qualityFloors := cloneQualityFloors(yc.Routing.QualityFloors)
+	if qualityFloors == nil {
+		qualityFloors = make(map[string]float64)
+	}
+	if configured, ok := qualityFloors["high"]; ok {
+		if yc.Routing.HighQualityFloor != nil && configured != highQualityFloor {
+			return nil, fmt.Errorf("routing.quality_floors.high conflicts with routing.high_quality_floor")
+		}
+		highQualityFloor = configured
+	} else {
+		qualityFloors["high"] = highQualityFloor
+	}
 	reasoningBonus := 0.05
 	if yc.Routing.ReasoningBonus != nil {
 		reasoningBonus = *yc.Routing.ReasoningBonus
@@ -365,6 +393,7 @@ func Parse(data []byte) (*Config, error) {
 			SwitchConfidence:      switchConfidence,
 			CostMode:              costMode,
 			CostReferenceUSD:      costReferenceUSD,
+			QualityFloors:         qualityFloors,
 			HighQualityFloor:      highQualityFloor,
 			ReasoningBonus:        reasoningBonus,
 			WorkflowAffinity:      workflowAffinity,
@@ -403,6 +432,7 @@ func Marshal(c *Config) ([]byte, error) {
 			SwitchConfidence:      &copyCfg.Routing.SwitchConfidence,
 			CostMode:              copyCfg.Routing.CostMode,
 			CostReferenceUSD:      &copyCfg.Routing.CostReferenceUSD,
+			QualityFloors:         cloneQualityFloors(copyCfg.Routing.QualityFloors),
 			HighQualityFloor:      &copyCfg.Routing.HighQualityFloor,
 			ReasoningBonus:        &copyCfg.Routing.ReasoningBonus,
 			WorkflowAffinity:      &copyCfg.Routing.WorkflowAffinity,
@@ -516,6 +546,25 @@ func (c *Config) Validate() error {
 	}
 	if !finite(c.Routing.HighQualityFloor) || c.Routing.HighQualityFloor < 0 || c.Routing.HighQualityFloor > 1 {
 		return fmt.Errorf("routing.high_quality_floor must be in [0,1]")
+	}
+	if c.Routing.QualityFloors == nil {
+		c.Routing.QualityFloors = map[string]float64{"high": c.Routing.HighQualityFloor}
+	} else {
+		for difficulty, floor := range c.Routing.QualityFloors {
+			switch difficulty {
+			case "trivial", "low", "medium", "high":
+			default:
+				return fmt.Errorf("routing.quality_floors contains unknown difficulty %q", difficulty)
+			}
+			if !finite(floor) || floor < 0 || floor > 1 {
+				return fmt.Errorf("routing.quality_floors.%s must be in [0,1]", difficulty)
+			}
+		}
+		if high, ok := c.Routing.QualityFloors["high"]; ok {
+			c.Routing.HighQualityFloor = high
+		} else {
+			c.Routing.QualityFloors["high"] = c.Routing.HighQualityFloor
+		}
 	}
 	if !finite(c.Routing.ReasoningBonus) || c.Routing.ReasoningBonus < 0 || c.Routing.ReasoningBonus > 1 {
 		return fmt.Errorf("routing.reasoning_bonus must be in [0,1]")

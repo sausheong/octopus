@@ -97,6 +97,18 @@ func TestScoreConfigurableQualityFloor(t *testing.T) {
 	}
 }
 
+func TestScoreProfileMinimumQualityCannotBeOutvotedByEconomics(t *testing.T) {
+	catalog := []config.CatalogEntry{
+		{ID: "p/qualified", Quality: 0.95, CostPerMTokIn: 100, Speed: 0.1, Caps: config.Caps{MaxContext: 100000}},
+		{ID: "p/cheap", Quality: 0.9, CostPerMTokIn: 0.01, Speed: 1, Caps: config.Caps{MaxContext: 100000}},
+	}
+	p := TaskProfile{Difficulty: "low", MinimumQuality: 0.94, EstTokensIn: 1000, EstTokensOut: 100}
+	d := ScoreWithOptions(p, catalog, config.Weights{Cost: 1, Speed: 1}, nil, AbsoluteScoringOptions())
+	if d.Chosen != "p/qualified" || d.AppliedQualityFloor != 0.94 || d.QualityPolicy != "strict" {
+		t.Fatalf("decision = %+v", d)
+	}
+}
+
 func TestScoreReasoningBonusCanBeDisabled(t *testing.T) {
 	zero := 0.0
 	catalog := []config.CatalogEntry{
@@ -139,12 +151,12 @@ func TestScoreReasoningPrefersCapableModel(t *testing.T) {
 	}
 }
 
-func TestScoreReasoningFallsBackToOrdinaryModel(t *testing.T) {
+func TestScoreQualityFloorFailsClosedWithoutQualifyingModel(t *testing.T) {
 	c := cat()[1:]
 	p := TaskProfile{Difficulty: "high", NeedsReasoning: true, EstTokensIn: 1000, EstTokensOut: 500}
 	d := Score(p, c, config.Weights{Quality: 1})
-	if d.NoEligible || d.Chosen != "anthropic/haiku" {
-		t.Fatalf("decision = %+v, want ordinary model fallback", d)
+	if !d.NoEligible || d.Chosen != "" || d.Reason != "no eligible model meets quality floor" {
+		t.Fatalf("decision = %+v, want strict quality-floor failure", d)
 	}
 }
 

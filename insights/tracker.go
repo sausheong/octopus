@@ -3,9 +3,11 @@
 package insights
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,7 +19,7 @@ import (
 	"github.com/sausheong/octopus/router"
 )
 
-const ledgerVersion = 2
+const ledgerVersion = 3
 const maxRecentDecisions = 200
 
 // Observation is the completed, provider-reported usage needed to calculate
@@ -33,11 +35,16 @@ type Observation struct {
 
 // Tracker owns the persistent aggregate ledger.
 type Tracker struct {
-	mu      sync.RWMutex
-	path    string
-	now     func() time.Time
-	ledger  ledger
-	lastErr string
+	mu        sync.RWMutex
+	path      string
+	now       func() time.Time
+	ledger    ledger
+	lastErr   string
+	persistCh chan chan error
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+	closeOnce sync.Once
+	closed    bool
 }
 
 type ledger struct {
@@ -49,22 +56,28 @@ type ledger struct {
 
 // DayAggregate is persisted by local calendar date.
 type DayAggregate struct {
-	Requests              int64                      `json:"requests"`
-	PricedRequests        int64                      `json:"priced_requests"`
-	InputTokens           int64                      `json:"input_tokens"`
-	OutputTokens          int64                      `json:"output_tokens"`
-	CacheCreationTokens   int64                      `json:"cache_creation_tokens"`
-	CacheReadTokens       int64                      `json:"cache_read_tokens"`
-	ActualCostUSD         float64                    `json:"actual_cost_usd"`
-	BaselineCostUSD       float64                    `json:"baseline_cost_usd"`
-	RoutingSavingsUSD     float64                    `json:"routing_savings_usd"`
-	CacheSavingsUSD       float64                    `json:"cache_savings_usd"`
-	ClassifierOverheadUSD float64                    `json:"classifier_overhead_usd"`
-	NetSavingsUSD         float64                    `json:"net_savings_usd"`
-	Models                map[string]*ModelAggregate `json:"models"`
-	AmortizedDecisions    int64                      `json:"amortized_decisions"`
-	AmortizedSwitches     int64                      `json:"amortized_switches"`
-	ForecastSavingsUSD    float64                    `json:"forecast_savings_usd"`
+	Requests               int64                      `json:"requests"`
+	PricedRequests         int64                      `json:"priced_requests"`
+	InputTokens            int64                      `json:"input_tokens"`
+	OutputTokens           int64                      `json:"output_tokens"`
+	CacheCreationTokens    int64                      `json:"cache_creation_tokens"`
+	CacheReadTokens        int64                      `json:"cache_read_tokens"`
+	ActualCostUSD          float64                    `json:"actual_cost_usd"`
+	BaselineCostUSD        float64                    `json:"baseline_cost_usd"`
+	RoutingSavingsUSD      float64                    `json:"routing_savings_usd"`
+	CacheSavingsUSD        float64                    `json:"cache_savings_usd"`
+	ClassifierOverheadUSD  float64                    `json:"classifier_overhead_usd"`
+	NetSavingsUSD          float64                    `json:"net_savings_usd"`
+	Models                 map[string]*ModelAggregate `json:"models"`
+	AmortizedDecisions     int64                      `json:"amortized_decisions"`
+	AmortizedSwitches      int64                      `json:"amortized_switches"`
+	ForecastSavingsUSD     float64                    `json:"forecast_savings_usd"`
+	Difficulties           map[string]int64           `json:"difficulties,omitempty"`
+	Domains                map[string]int64           `json:"domains,omitempty"`
+	Risks                  map[string]int64           `json:"risks,omitempty"`
+	ClassificationSources  map[string]int64           `json:"classification_sources,omitempty"`
+	ClassificationStatuses map[string]int64           `json:"classification_statuses,omitempty"`
+	FallbacksObserved      int64                      `json:"fallbacks_observed,omitempty"`
 }
 
 // ModelAggregate supports the model breakdown without storing request data.
@@ -88,23 +101,29 @@ type Report struct {
 }
 
 type Summary struct {
-	Requests              int64   `json:"requests"`
-	PricedRequests        int64   `json:"priced_requests"`
-	InputTokens           int64   `json:"input_tokens"`
-	OutputTokens          int64   `json:"output_tokens"`
-	CacheCreationTokens   int64   `json:"cache_creation_tokens"`
-	CacheReadTokens       int64   `json:"cache_read_tokens"`
-	ActualCostUSD         float64 `json:"actual_cost_usd"`
-	BaselineCostUSD       float64 `json:"baseline_cost_usd"`
-	RoutingSavingsUSD     float64 `json:"routing_savings_usd"`
-	CacheSavingsUSD       float64 `json:"cache_savings_usd"`
-	ClassifierOverheadUSD float64 `json:"classifier_overhead_usd"`
-	NetSavingsUSD         float64 `json:"net_savings_usd"`
-	SavingsPercent        float64 `json:"savings_percent"`
-	CacheHitPercent       float64 `json:"cache_hit_percent"`
-	AmortizedDecisions    int64   `json:"amortized_decisions"`
-	AmortizedSwitches     int64   `json:"amortized_switches"`
-	ForecastSavingsUSD    float64 `json:"forecast_savings_usd"`
+	Requests               int64            `json:"requests"`
+	PricedRequests         int64            `json:"priced_requests"`
+	InputTokens            int64            `json:"input_tokens"`
+	OutputTokens           int64            `json:"output_tokens"`
+	CacheCreationTokens    int64            `json:"cache_creation_tokens"`
+	CacheReadTokens        int64            `json:"cache_read_tokens"`
+	ActualCostUSD          float64          `json:"actual_cost_usd"`
+	BaselineCostUSD        float64          `json:"baseline_cost_usd"`
+	RoutingSavingsUSD      float64          `json:"routing_savings_usd"`
+	CacheSavingsUSD        float64          `json:"cache_savings_usd"`
+	ClassifierOverheadUSD  float64          `json:"classifier_overhead_usd"`
+	NetSavingsUSD          float64          `json:"net_savings_usd"`
+	SavingsPercent         float64          `json:"savings_percent"`
+	CacheHitPercent        float64          `json:"cache_hit_percent"`
+	AmortizedDecisions     int64            `json:"amortized_decisions"`
+	AmortizedSwitches      int64            `json:"amortized_switches"`
+	ForecastSavingsUSD     float64          `json:"forecast_savings_usd"`
+	Difficulties           map[string]int64 `json:"difficulties,omitempty"`
+	Domains                map[string]int64 `json:"domains,omitempty"`
+	Risks                  map[string]int64 `json:"risks,omitempty"`
+	ClassificationSources  map[string]int64 `json:"classification_sources,omitempty"`
+	ClassificationStatuses map[string]int64 `json:"classification_statuses,omitempty"`
+	FallbacksObserved      int64            `json:"fallbacks_observed,omitempty"`
 }
 
 // RoutingDecision is the prompt-free audit trail behind the Switch economics
@@ -134,6 +153,29 @@ type RoutingDecision struct {
 	WorkflowAffinity       bool                                 `json:"workflow_affinity,omitempty"`
 	LegacyChosen           string                               `json:"legacy_chosen,omitempty"`
 	LegacyChanged          bool                                 `json:"legacy_changed,omitempty"`
+	// The task profile is a bounded set of classifier outputs and numeric
+	// estimates. It deliberately excludes request text and classifier reasoning.
+	Difficulty               string  `json:"difficulty,omitempty"`
+	Domain                   string  `json:"domain,omitempty"`
+	Risk                     string  `json:"risk,omitempty"`
+	NeedsReasoning           bool    `json:"needs_reasoning,omitempty"`
+	NeedsVision              bool    `json:"needs_vision,omitempty"`
+	NeedsTools               bool    `json:"needs_tools,omitempty"`
+	EstimatedInputTokens     int     `json:"estimated_input_tokens,omitempty"`
+	EstimatedOutputTokens    int     `json:"estimated_output_tokens,omitempty"`
+	EstimateConfidence       float64 `json:"estimate_confidence,omitempty"`
+	ClassificationConfidence float64 `json:"classification_confidence,omitempty"`
+	ExpectedRemainingTurns   int     `json:"expected_remaining_turns,omitempty"`
+	ClassificationSource     string  `json:"classification_source,omitempty"`
+	ClassificationStatus     string  `json:"classification_status,omitempty"`
+	ClassifierLatencyMS      int64   `json:"classifier_latency_ms,omitempty"`
+	AppliedQualityFloor      float64 `json:"applied_quality_floor,omitempty"`
+	QualityPolicy            string  `json:"quality_policy,omitempty"`
+	InitialModel             string  `json:"initial_model,omitempty"`
+	SelectedModel            string  `json:"selected_model,omitempty"`
+	FallbackObserved         bool    `json:"fallback_observed,omitempty"`
+	ProviderAttemptsMinimum  int     `json:"provider_attempts_minimum,omitempty"`
+	ProviderOutcome          string  `json:"provider_outcome,omitempty"`
 }
 
 type DayPoint struct {
@@ -159,26 +201,33 @@ func NewTracker(path string) *Tracker {
 }
 
 func newTracker(path string, now func() time.Time) *Tracker {
-	t := &Tracker{path: path, now: now}
+	t := &Tracker{
+		path: path, now: now,
+		persistCh: make(chan chan error, 1), stopCh: make(chan struct{}), doneCh: make(chan struct{}),
+	}
 	t.ledger = ledger{Version: ledgerVersion, CreatedAt: now(), Days: make(map[string]*DayAggregate)}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		go t.persistLoop()
 		return t
 	}
 	if err != nil {
 		t.lastErr = fmt.Sprintf("read insights: %v", err)
+		go t.persistLoop()
 		return t
 	}
 	var loaded ledger
-	if err := json.Unmarshal(data, &loaded); err != nil || (loaded.Version != 1 && loaded.Version != ledgerVersion) || loaded.Days == nil {
+	if err := json.Unmarshal(data, &loaded); err != nil || (loaded.Version < 1 || loaded.Version > ledgerVersion) || loaded.Days == nil {
 		if err == nil {
 			err = fmt.Errorf("unsupported ledger version %d", loaded.Version)
 		}
 		t.lastErr = fmt.Sprintf("load insights: %v", err)
+		go t.persistLoop()
 		return t
 	}
 	loaded.Version = ledgerVersion
 	t.ledger = loaded
+	go t.persistLoop()
 	return t
 }
 
@@ -189,15 +238,20 @@ func (t *Tracker) Record(observation Observation) {
 		return
 	}
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
 	dayKey := t.now().Format("2006-01-02")
 	day := t.ledger.Days[dayKey]
 	if day == nil {
-		day = &DayAggregate{Models: make(map[string]*ModelAggregate)}
+		day = newDayAggregate()
 		t.ledger.Days[dayKey] = day
 	}
 	if day.Models == nil {
 		day.Models = make(map[string]*ModelAggregate)
 	}
+	ensureAuditMaps(day)
 	day.Requests++
 	if calculation.priced {
 		day.PricedRequests++
@@ -212,6 +266,21 @@ func (t *Tracker) Record(observation Observation) {
 	day.CacheSavingsUSD += calculation.cacheSavings
 	day.ClassifierOverheadUSD += calculation.classifierOverhead
 	day.NetSavingsUSD += calculation.netSavings
+	profile := observation.Decision.Profile
+	classificationSource, classificationStatus := classificationAudit(observation.Decision)
+	selectedModel := observation.Decision.Chosen
+	initialModel := observation.Decision.InitialChosen
+	if initialModel == "" {
+		initialModel = selectedModel
+	}
+	fallbackObserved := selectedModel != "" && observation.Model != selectedModel
+	providerAttempts := 1
+	if fallbackObserved {
+		// The server currently reports only the completing provider to Tracker.
+		// A model mismatch proves at least one prior attempt, but not its exact
+		// count or error, so this is explicitly a lower bound.
+		providerAttempts = 2
+	}
 	recent := RoutingDecision{
 		Timestamp: t.now(), Strategy: observation.Decision.Strategy, ActualModel: observation.Model,
 		Decision: observation.Decision.Reason, Reason: observation.Decision.Reason,
@@ -220,6 +289,26 @@ func (t *Tracker) Record(observation Observation) {
 		WorkflowAffinity: observation.Decision.WorkflowAffinity,
 		LegacyChosen:     observation.Decision.LegacyChosen, LegacyChanged: observation.Decision.LegacyChanged,
 		CacheCreationTokens: calculation.cacheCreationTokens, CacheReadTokens: calculation.cacheReadTokens,
+		Difficulty: boundedDifficulty(profile.Difficulty), Domain: boundedDomain(profile.Domain),
+		Risk:           boundedRisk(profile.Risk),
+		NeedsReasoning: profile.NeedsReasoning, NeedsVision: profile.NeedsVision, NeedsTools: profile.NeedsTools,
+		EstimatedInputTokens: nonNegative(profile.EstTokensIn), EstimatedOutputTokens: nonNegative(profile.EstTokensOut),
+		EstimateConfidence: boundedUnit(profile.EstimateConfidence), ExpectedRemainingTurns: boundedTurns(profile.ExpectedRemainingTurns),
+		ClassificationConfidence: boundedUnit(profile.ClassificationConfidence),
+		ClassificationSource:     classificationSource, ClassificationStatus: classificationStatus,
+		ClassifierLatencyMS: nonNegative64(observation.Decision.ClassifierLatencyMS),
+		AppliedQualityFloor: boundedUnit(observation.Decision.AppliedQualityFloor),
+		QualityPolicy:       boundedQualityPolicy(observation.Decision.QualityPolicy),
+		InitialModel:        initialModel, SelectedModel: selectedModel, FallbackObserved: fallbackObserved,
+		ProviderAttemptsMinimum: providerAttempts, ProviderOutcome: "completed",
+	}
+	day.Difficulties[recent.Difficulty]++
+	day.Domains[recent.Domain]++
+	day.Risks[recent.Risk]++
+	day.ClassificationSources[recent.ClassificationSource]++
+	day.ClassificationStatuses[recent.ClassificationStatus]++
+	if fallbackObserved {
+		day.FallbacksObserved++
 	}
 	if economics := observation.Decision.Economics; economics != nil {
 		day.AmortizedDecisions++
@@ -246,16 +335,224 @@ func (t *Tracker) Record(observation Observation) {
 	model.InputTokens += int64(calculation.inputTokens + calculation.cacheCreationTokens + calculation.cacheReadTokens)
 	model.OutputTokens += int64(calculation.outputTokens)
 	model.ActualCostUSD += calculation.chosenActualCost
+	t.mu.Unlock()
+	select {
+	case t.persistCh <- nil:
+	default:
+	}
+}
+
+func (t *Tracker) persistLoop() {
+	defer close(t.doneCh)
+	for {
+		select {
+		case done := <-t.persistCh:
+			err := t.persistSnapshot()
+			if done != nil {
+				done <- err
+				close(done)
+			}
+		case <-t.stopCh:
+			_ = t.persistSnapshot()
+			return
+		}
+	}
+}
+
+func (t *Tracker) persistSnapshot() error {
+	t.mu.RLock()
 	data, err := json.MarshalIndent(t.ledger, "", "  ")
+	t.mu.RUnlock()
 	if err == nil {
 		err = atomicWrite(t.path, data)
 	}
+	t.mu.Lock()
 	if err != nil {
 		t.lastErr = fmt.Sprintf("save insights: %v", err)
 	} else {
 		t.lastErr = ""
 	}
 	t.mu.Unlock()
+	return err
+}
+
+// Flush waits until all observations recorded before the call are represented
+// in the durable snapshot.
+func (t *Tracker) Flush(ctx context.Context) error {
+	done := make(chan error, 1)
+	select {
+	case t.persistCh <- done:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.doneCh:
+		return nil
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.doneCh:
+		return nil
+	}
+}
+
+// Close performs a final durable flush and stops the writer. It is idempotent.
+func (t *Tracker) Close(ctx context.Context) error {
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
+	t.closeOnce.Do(func() { close(t.stopCh) })
+	select {
+	case <-t.doneCh:
+		t.mu.RLock()
+		defer t.mu.RUnlock()
+		if t.lastErr != "" {
+			return errors.New(t.lastErr)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func newDayAggregate() *DayAggregate {
+	day := &DayAggregate{Models: make(map[string]*ModelAggregate)}
+	ensureAuditMaps(day)
+	return day
+}
+
+func ensureAuditMaps(day *DayAggregate) {
+	if day.Difficulties == nil {
+		day.Difficulties = make(map[string]int64)
+	}
+	if day.Domains == nil {
+		day.Domains = make(map[string]int64)
+	}
+	if day.Risks == nil {
+		day.Risks = make(map[string]int64)
+	}
+	if day.ClassificationSources == nil {
+		day.ClassificationSources = make(map[string]int64)
+	}
+	if day.ClassificationStatuses == nil {
+		day.ClassificationStatuses = make(map[string]int64)
+	}
+}
+
+// classificationAudit maps existing prompt-free decision facts into a small,
+// stable vocabulary. It does not guess provider errors or retain free-form
+// classifier output. Router-supplied explicit audit fields can replace this
+// compatibility mapping when available.
+func classificationAudit(decision router.Decision) (source, status string) {
+	if source, status := boundedClassificationSource(decision.ClassificationSource), boundedClassificationStatus(decision.ClassificationStatus); source != "" || status != "" {
+		if source == "" {
+			source = "unknown"
+		}
+		if status == "" {
+			status = "unknown"
+		}
+		return source, status
+	}
+	if source := boundedClassificationSource(decision.Profile.ClassificationSource); source != "" {
+		switch source {
+		case "classifier", "classifier_cache":
+			return source, "completed"
+		case "conservative_fallback":
+			return source, "fallback"
+		default:
+			return source, "skipped"
+		}
+	}
+	switch {
+	case decision.Background:
+		return "deterministic_background", "skipped"
+	case decision.ClassifierModel != "" && decision.ClassifierUsage != nil:
+		return "classifier", "completed"
+	case decision.ClassifierModel != "":
+		return "classifier", "outcome_unavailable"
+	case decision.Reason == "sticky session affinity":
+		return "deterministic_sticky", "skipped"
+	case decision.Profile.Difficulty == "trivial":
+		return "deterministic_trivial", "skipped"
+	default:
+		return "conservative_fallback", "outcome_unavailable"
+	}
+}
+
+func boundedClassificationSource(value string) string {
+	switch value {
+	case "classifier", "classifier_cache", "classifier_coalesced", "conservative_fallback", "allowlisted_background", "deterministic_background", "deterministic_sticky", "explicit_policy":
+		return value
+	default:
+		return ""
+	}
+}
+
+func boundedClassificationStatus(value string) string {
+	switch value {
+	case "completed", "no_user_turn", "skipped_allowlisted_background", "blocked_by_data_policy", "classifier_unavailable", "classifier_failed", "skipped", "fallback", "outcome_unavailable":
+		return value
+	default:
+		return ""
+	}
+}
+
+func boundedDifficulty(value string) string {
+	switch value {
+	case "trivial", "low", "medium", "high":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func boundedDomain(value string) string {
+	switch value {
+	case "code", "writing", "qa", "math", "other":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func boundedRisk(value string) string {
+	switch value {
+	case "ordinary", "important", "critical":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func boundedQualityPolicy(value string) string {
+	switch value {
+	case "none", "strict", "minimum_quality":
+		return value
+	default:
+		return ""
+	}
+}
+
+func boundedUnit(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 1 {
+		return 0
+	}
+	return value
+}
+
+func boundedTurns(value int) int {
+	if value < 0 || value > 50 {
+		return 0
+	}
+	return value
+}
+
+func nonNegative64(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 type calculation struct {
@@ -345,7 +642,8 @@ func (t *Tracker) Report(days int) Report {
 		RangeDays: days,
 		Days:      make([]DayPoint, 0, days),
 		Methodology: "Quality-baseline savings compare each completed request with the highest-quality eligible catalog model at uncached list price. " +
-			"Actual cost uses provider-reported tokens, configured model prices, prompt-cache read/write multipliers, and classifier overhead.",
+			"Actual cost uses provider-reported tokens, configured model prices, prompt-cache read/write multipliers, and classifier overhead. " +
+			"Routing audit data contains bounded profile labels and numeric policy facts only; fallback attempt counts are lower bounds because only the completing provider is observed.",
 		LastError:       t.lastErr,
 		ClassifierCache: router.CurrentClassifierCacheStats(),
 	}
@@ -420,6 +718,24 @@ func addDay(summary *Summary, day *DayAggregate) {
 	summary.AmortizedDecisions += day.AmortizedDecisions
 	summary.AmortizedSwitches += day.AmortizedSwitches
 	summary.ForecastSavingsUSD += day.ForecastSavingsUSD
+	summary.FallbacksObserved += day.FallbacksObserved
+	mergeCounts(&summary.Difficulties, day.Difficulties)
+	mergeCounts(&summary.Domains, day.Domains)
+	mergeCounts(&summary.Risks, day.Risks)
+	mergeCounts(&summary.ClassificationSources, day.ClassificationSources)
+	mergeCounts(&summary.ClassificationStatuses, day.ClassificationStatuses)
+}
+
+func mergeCounts(destination *map[string]int64, source map[string]int64) {
+	if len(source) == 0 {
+		return
+	}
+	if *destination == nil {
+		*destination = make(map[string]int64, len(source))
+	}
+	for key, count := range source {
+		(*destination)[key] += count
+	}
 }
 
 func dateOnly(value time.Time) time.Time {

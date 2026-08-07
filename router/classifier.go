@@ -13,6 +13,7 @@ import (
 const classifierSystemPrompt = `You are a request classifier for an LLM router.
 Read the user's request and respond with ONLY a JSON object (no prose, no code fences) with these fields:
 - "difficulty": one of "trivial","low","medium","high"
+- "risk": one of "ordinary","important","critical"
 - "needs_reasoning": boolean (multi-step logic, math, planning, hard debugging)
 - "needs_vision": boolean (the request depends on understanding images)
 - "needs_tools": boolean (the request expects tool/function calling)
@@ -21,11 +22,21 @@ Read the user's request and respond with ONLY a JSON object (no prose, no code f
 - "domain": one of "code","writing","qa","math","other"
 - "expected_remaining_turns": integer estimate from 1 to 50, including this turn
 - "estimate_confidence": number from 0 to 1 expressing confidence in that turn estimate
+- "classification_confidence": number from 0 to 1 expressing confidence in the whole semantic classification
+
+Difficulty rubric:
+- trivial: exact greetings, acknowledgements, or mechanical transformations with no meaningful judgement
+- low: bounded factual or routine work with clear instructions and low consequence
+- medium: synthesis, several constraints, ordinary coding, analysis, or planning
+- high: hard debugging, architecture, security, production changes, mathematics, extensive synthesis, or many interacting constraints
+Risk is independent of difficulty. Use critical for security-sensitive, destructive, irreversible, production, legal, medical, or financial decisions; important for consequential work; ordinary otherwise.
+A short prompt is not necessarily easy. For example, "fix this production race", "is this migration safe?", and "prove this theorem" are high difficulty even though they are short.
+When uncertain between two difficulty or risk levels, choose the higher one and lower classification_confidence. Never infer trivial merely from length.
 Respond with the JSON object only.`
 
 // classifierCacheVersion is deliberately independent of the Octopus release.
 // Bump it whenever classifier semantics change without changing the prompt.
-const classifierCacheVersion = "1"
+const classifierCacheVersion = "2"
 
 // Classify runs the fixed classifier model on the given user turn and returns
 // the parsed TaskProfile. Any failure (provider error, empty output,
@@ -41,11 +52,22 @@ func classifyWithUsage(ctx context.Context, prov llm.LLMProvider, model string, 
 }
 
 func classifyWithUsageIdentity(ctx context.Context, prov llm.LLMProvider, providerModel, cacheModelID string, maxTokens int, turn llm.Message) (TaskProfile, *llm.Usage) {
+	profile, usage, _ := classifyWithUsageIdentityDetailed(ctx, prov, providerModel, cacheModelID, maxTokens, turn)
+	return profile, usage
+}
+
+func classifyWithUsageIdentityDetailed(ctx context.Context, prov llm.LLMProvider, providerModel, cacheModelID string, maxTokens int, turn llm.Message) (TaskProfile, *llm.Usage, string) {
 	key := classifierMemoKey(cacheModelID, maxTokens, turn)
-	profile, usage, _ := processClassifierCache.do(ctx, key, func(loadCtx context.Context) (TaskProfile, *llm.Usage, bool) {
+	profile, usage, cached, coalesced := processClassifierCache.do(ctx, key, func(loadCtx context.Context) (TaskProfile, *llm.Usage, bool) {
 		return runClassifier(loadCtx, prov, providerModel, maxTokens, turn)
 	})
-	return profile, usage
+	if cached {
+		return profile, usage, "classifier_cache"
+	}
+	if coalesced && profile.ClassificationSource != "conservative_fallback" {
+		return profile, usage, "classifier_coalesced"
+	}
+	return profile, usage, profile.ClassificationSource
 }
 
 func runClassifier(ctx context.Context, prov llm.LLMProvider, model string, maxTokens int, turn llm.Message) (TaskProfile, *llm.Usage, bool) {
@@ -102,15 +124,17 @@ func classifierMemoKey(model string, maxTokens int, turn llm.Message) string {
 // rawProfile is the wire type for classifier JSON — pointer fields let us
 // distinguish missing keys from zero/false values.
 type rawProfile struct {
-	Difficulty             *string  `json:"difficulty"`
-	NeedsReasoning         *bool    `json:"needs_reasoning"`
-	NeedsVision            *bool    `json:"needs_vision"`
-	NeedsTools             *bool    `json:"needs_tools"`
-	EstTokensIn            *int     `json:"est_tokens_in"`
-	EstTokensOut           *int     `json:"est_tokens_out"`
-	Domain                 *string  `json:"domain"`
-	ExpectedRemainingTurns *int     `json:"expected_remaining_turns"`
-	EstimateConfidence     *float64 `json:"estimate_confidence"`
+	Difficulty               *string  `json:"difficulty"`
+	Risk                     *string  `json:"risk"`
+	NeedsReasoning           *bool    `json:"needs_reasoning"`
+	NeedsVision              *bool    `json:"needs_vision"`
+	NeedsTools               *bool    `json:"needs_tools"`
+	EstTokensIn              *int     `json:"est_tokens_in"`
+	EstTokensOut             *int     `json:"est_tokens_out"`
+	Domain                   *string  `json:"domain"`
+	ExpectedRemainingTurns   *int     `json:"expected_remaining_turns"`
+	EstimateConfidence       *float64 `json:"estimate_confidence"`
+	ClassificationConfidence *float64 `json:"classification_confidence"`
 }
 
 // parseProfile extracts the first JSON object from s, validates required
@@ -130,20 +154,22 @@ func parseProfile(s string) (TaskProfile, bool) {
 
 	// All fields are required; a missing field means the classifier produced
 	// an incomplete response — treat it as a failure and use DefaultProfile.
-	if raw.Difficulty == nil || raw.NeedsReasoning == nil || raw.NeedsVision == nil ||
+	if raw.Difficulty == nil || raw.Risk == nil || raw.NeedsReasoning == nil || raw.NeedsVision == nil ||
 		raw.NeedsTools == nil || raw.EstTokensIn == nil || raw.EstTokensOut == nil ||
-		raw.Domain == nil || raw.ExpectedRemainingTurns == nil || raw.EstimateConfidence == nil {
+		raw.Domain == nil || raw.ExpectedRemainingTurns == nil || raw.EstimateConfidence == nil || raw.ClassificationConfidence == nil {
 		return TaskProfile{}, false
 	}
 
 	p := TaskProfile{
-		NeedsReasoning:         *raw.NeedsReasoning,
-		NeedsVision:            *raw.NeedsVision,
-		NeedsTools:             *raw.NeedsTools,
-		EstTokensIn:            *raw.EstTokensIn,
-		EstTokensOut:           *raw.EstTokensOut,
-		ExpectedRemainingTurns: *raw.ExpectedRemainingTurns,
-		EstimateConfidence:     *raw.EstimateConfidence,
+		NeedsReasoning:           *raw.NeedsReasoning,
+		NeedsVision:              *raw.NeedsVision,
+		NeedsTools:               *raw.NeedsTools,
+		EstTokensIn:              *raw.EstTokensIn,
+		EstTokensOut:             *raw.EstTokensOut,
+		ExpectedRemainingTurns:   *raw.ExpectedRemainingTurns,
+		EstimateConfidence:       *raw.EstimateConfidence,
+		ClassificationConfidence: *raw.ClassificationConfidence,
+		ClassificationSource:     "classifier",
 	}
 
 	// Clamp difficulty to known values; unknown → conservative "high".
@@ -152,6 +178,12 @@ func parseProfile(s string) (TaskProfile, bool) {
 		p.Difficulty = *raw.Difficulty
 	default:
 		p.Difficulty = "high"
+	}
+	switch *raw.Risk {
+	case "ordinary", "important", "critical":
+		p.Risk = *raw.Risk
+	default:
+		p.Risk = "critical"
 	}
 
 	// Clamp domain to known values.
@@ -184,6 +216,12 @@ func parseProfile(s string) (TaskProfile, bool) {
 	}
 	if p.EstimateConfidence > 1 {
 		p.EstimateConfidence = 1
+	}
+	if p.ClassificationConfidence < 0 {
+		p.ClassificationConfidence = 0
+	}
+	if p.ClassificationConfidence > 1 {
+		p.ClassificationConfidence = 1
 	}
 
 	return p, true

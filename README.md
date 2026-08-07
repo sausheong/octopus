@@ -35,7 +35,7 @@ Octopus works especially well with Claude Code. It preserves Anthropic prompt-ca
 - OpenAI-compatible `POST /v1/chat/completions`, streaming and buffered.
 - OpenAI-compatible `GET /v1/models` generated from the configured catalog.
 - Routing across Anthropic, OpenAI, Gemini, Qwen, local models, and compatible gateways.
-- Optional low-cost classifier with a zero-call short circuit for trivial requests.
+- Optional low-cost classifier with a bounded, privacy-safe result cache; only exact allowlisted background traffic skips classification.
 - Hard tool, vision, context-window, and output-limit eligibility checks.
 - Quality/cost/speed scoring with deterministic fallback order.
 - Amortised routing that switches only when expected task savings repay the cache change; sticky and per-turn strategies remain available.
@@ -68,7 +68,7 @@ Claude Code, Codex, or another client
 
 - A **provider** is the service that runs a model, such as Anthropic, Google, OpenAI, or Ollama.
 - The **catalogue** is your list of available models. For each model, you describe its price, quality, speed, context window, and abilities such as tools, images, and reasoning.
-- The **classifier** is a small, optional model call that labels a new task as trivial, low, medium, or high difficulty and estimates its size. Obvious trivial requests can skip this call entirely.
+- The **classifier** is a small, optional model call that labels each ordinary user turn as trivial, low, medium, or high difficulty, separately marks its consequence as ordinary, important, or critical, and estimates its size. Prompt length alone never makes a request trivial.
 - A **session** is one conversation. Octopus remembers the model currently serving it, called the incumbent, so follow-up turns are judged with the right history.
 - A **prompt cache** is a provider-side reusable copy of the long, unchanged beginning of a conversation. Reading it can be much cheaper than sending and processing that text again.
 - A **routing strategy** controls whether Octopus may change the incumbent and how it decides whether a change is worthwhile.
@@ -79,8 +79,8 @@ Claude Code, Codex, or another client
 2. **Octopus checks the request.** It rejects malformed or oversized requests before they reach a provider. The model name supplied by the client is a request label, not proof of which backend will be used.
 3. **It identifies the conversation.** An explicit `X-Octopus-Session-ID` is best. Without one, Octopus derives a private identifier from the opening conversation material. Giving each subagent a distinct session ID keeps its history and cache separate.
 4. **It recognises declared background traffic.** Exact, allowlisted, conversation-independent maintenance pings can go to a cheap model in an isolated session. Octopus does not assume every short request is a ping. For a recognised ping, it removes the main conversation history and cache markers before sending the provider request, so the ping does not pay to load the full working conversation.
-5. **It estimates the job.** A new task may be classified for difficulty, tool use, image use, reasoning, and likely input/output size. Identical classifier inputs are briefly cached, so parallel repeats do not pay for the same classification again. If classification fails, Octopus uses conservative defaults rather than blocking the main request.
-6. **It removes models that cannot do the work.** A model is ineligible if it lacks a required ability, cannot fit the context or expected answer, or violates the configured local-only privacy policy.
+5. **It estimates the job.** Each ordinary turn may be classified for difficulty, consequence, tool use, image use, reasoning, and likely input/output size. Identical classifier inputs are briefly cached, so parallel repeats do not pay for the same classification again. If classification fails, Octopus uses a high-difficulty, critical fallback.
+6. **It removes models that cannot do the work.** A model is ineligible if it lacks a required ability, cannot fit the context or expected answer, violates the configured local-only privacy policy, or falls below the applicable strict quality floor.
 7. **It compares the eligible models.** Quality, estimated dollar cost, speed, and reasoning support contribute to a weighted score. The default cost calculation uses actual catalogue prices rather than merely comparing every model with the cheapest model in the current set.
 8. **It considers the rest of the task, not only this turn.** Under the default `amortized` strategy, Octopus estimates how many turns remain. It changes models only when the expected saving across those turns is large and credible enough to repay any cold-cache cost.
 9. **It translates and sends the request.** Octopus converts the common request into the selected provider's wire format while preserving supported tools, images, reasoning blocks, and cache instructions.
@@ -107,9 +107,9 @@ The three strategies make different trade-offs:
 | `sticky` | Keep the first successful model for the session while it remains capable. Simple and cache-friendly, but it does not reconsider price or quality on normal follow-ups. |
 | `per_turn` | Score every turn independently. Responsive to changes, but more likely to move between models and rebuild caches. |
 
-For example, a short question with no tools may skip classification and go to a fast, inexpensive model. A difficult coding request can exclude models without tool support and apply the high-difficulty quality floor. A long conversation may remain on its current model even when another model is cheaper per token, because the one-off cache rebuild would not be recovered before the task ends.
+For example, a short factual question can still be classified as low and go to a fast, inexpensive model. A concise production or security question can be classified as high or critical and require the strongest quality tier. A long conversation may remain on its current eligible model when the one-off cache rebuild would not be recovered before the task ends.
 
-The weights express influence, not hard commands. Raising the quality weight makes quality matter more, but does not guarantee that the highest-quality model wins; cost, speed, eligibility, the task forecast, and an existing warm cache can still change the result. Use `routing.high_quality_floor` when lower-quality models should be excluded from high-difficulty work.
+The weights express influence inside the safe candidate set. `routing.quality_floors` is different: models below the applicable floor are ineligible, and cost, speed, affinity, or a warm cache cannot bring them back. If no model clears a required floor, Octopus fails closed rather than silently lowering quality.
 
 ### Parallel subagents
 
@@ -473,11 +473,10 @@ The classifier returns this task profile:
 - `domain`: `code`, `writing`, `qa`, `math`, or `other`.
 - `expected_remaining_turns`: `1..50`, including the current turn.
 - `estimate_confidence`: `0..1`, used as the switch-confidence gate.
+- `classification_confidence`: `0..1`, confidence in the semantic profile.
+- `risk`: `ordinary`, `important`, or `critical`, independent of difficulty.
 
-The classifier is skipped when either of these conditions applies:
-
-- The request is a short single-turn prompt of at most 500 bytes with no tools, images, or prior assistant turn.
-- `classifier.model` is omitted, in which case a conservative default profile is used.
+The classifier is skipped only for an exact, allowlisted, conversation-independent background signature. If `classifier.model` is omitted, blocked by `local_only`, unavailable, times out, or returns invalid output, Octopus applies the conservative high/critical fallback profile.
 
 For nontrivial conversations, classification uses a bounded recent-context representation. Classification timeouts, malformed output, and unavailable classifier providers fall back to the conservative profile rather than failing the client request.
 
@@ -492,7 +491,7 @@ Models are first filtered by hard requirements:
 - Enough context for estimated input plus output.
 - An output limit, when `caps.max_output_tokens` declares one, at least as large as the estimated response.
 
-For high-difficulty tasks, models below `routing.high_quality_floor` are removed when at least one otherwise-eligible model clears the floor. This floor never empties the eligible set by itself.
+`routing.quality_floors` can declare a strict minimum for every difficulty. Important risk inherits at least the medium floor, critical risk inherits at least the high floor, and an authenticated caller may raise the minimum further. A floor is a safety boundary: when it removes every otherwise-capable model, the request fails instead of degrading silently.
 
 Remaining models receive a normalized weighted score:
 
@@ -505,7 +504,7 @@ quality × quality_utility
 
 Weights need not sum to one; Octopus normalizes them. In the default `absolute` mode, catalogue quality and speed remain on their declared `0..1` scales and request cost uses `1 / (1 + estimated_cost_usd / cost_reference_usd)`. This makes one model's score stable when an unrelated model enters or leaves the eligible set. `relative` preserves the earlier catalogue-relative normalization. Catalogue order is the deterministic tie-breaker.
 
-Classifier results are cached in memory for five minutes in a bounded 1,024-entry LRU and concurrent identical classifications are coalesced. Keys are SHA-256 digests over the exact classifier input and prompt version; prompt text is not retained. Sticky follow-ups skip classification entirely while their incumbent remains deterministically eligible.
+Classifier results are cached in memory for five minutes in a bounded 1,024-entry LRU and concurrent identical classifications are coalesced. Keys are SHA-256 digests over the exact classifier input and prompt version; prompt text is not retained. Ordinary sticky follow-ups are still classified so a newly difficult or critical turn can immediately make a weaker incumbent ineligible.
 
 ### Background requests and subagent workflows
 
@@ -559,6 +558,7 @@ Eligible models are attempted in score order, starting with the chosen model.
 - `routing.max_attempts` (default `3`) bounds the total number of backends tried.
 - A catalog entry naming an unconfigured provider is skipped without consuming an attempt.
 - Once streaming response bytes have been sent, Octopus cannot transparently switch providers.
+- A provider that produces no first event within 30 seconds is treated as failed before response bytes and may fall back within the attempt budget.
 
 If every attempted backend fails, Octopus maps rate-limit, overload, invalid-request, and generic backend failures into the appropriate endpoint-specific error shape.
 
@@ -643,7 +643,7 @@ Octopus parses YAML with unknown-field rejection, so misspelled settings fail fa
 
 When `auth_token_env` is set, requests must present the secret as either `x-api-key` or `Authorization: Bearer <token>`; both are accepted because Anthropic and OpenAI clients each send their own. An `Authorization` header carrying the bare token without the `Bearer ` prefix is also accepted. Requests without a valid secret receive `401` in the error shape of the endpoint they called.
 
-Naming a variable that is not set in the environment resolves to an empty token, which disables authentication rather than rejecting every request. Octopus logs a warning at startup when this happens — `auth token variable is empty; routing endpoints are UNAUTHENTICATED` — because the alternative is a security control that silently is not there. Confirm the variable is exported in the environment the router actually runs in: for the menu bar app, that is the environment Launch Services gives the app, not your shell, so a token exported in `.zshrc` will not be visible to it.
+Naming a variable that is not set in the router's environment is a configuration error. Octopus fails startup or reload and keeps any last-known-good authenticated router running; it never silently publishes an open replacement. Confirm the variable is exported in the environment the router actually runs in. For the menu-bar app, that is the environment Launch Services gives the app, not your shell, so a token exported only in `.zshrc` will not be visible to it.
 
 Saving from Settings rewrites the file through the config marshaller, which always emits `auth_token_env` even when empty. A line reading `auth_token_env: ""` appearing after a save is expected and matches how the sibling `server` fields are written.
 
@@ -685,7 +685,8 @@ The section is optional; these defaults are applied when it is omitted.
 | `switch_confidence` | `0.60` | Minimum turn-estimate confidence required to switch, `0..1`. |
 | `cost_mode` | `absolute` | Stable `absolute` dollar utility or legacy eligible-set-relative scoring. |
 | `cost_reference_usd` | `0.10` | Request cost at which absolute cost utility is `0.5`. Must be positive. |
-| `high_quality_floor` | `0.85` | Quality floor for high-difficulty requests when at least one model clears it. |
+| `quality_floors` | `high: 0.85` | Strict minimum catalogue quality keyed by `trivial`, `low`, `medium`, and `high`. Missing tiers have no floor. |
+| `high_quality_floor` | `0.85` | Legacy spelling for `quality_floors.high`; do not configure conflicting values. |
 | `reasoning_bonus` | `0.05` | Explicit preference for eligible models with native reasoning; `0` disables it. |
 | `workflow_affinity` | `true` | Prefer the last successful eligible model for sessions sharing an explicit `X-Octopus-Workflow-ID`; caches remain independent. |
 | `background` | disabled | Exact SHA-256 allowlist for conversation-independent maintenance requests. |
@@ -800,11 +801,15 @@ The HTTP server uses:
 - No write timeout, allowing long-lived SSE responses.
 - 32 MiB maximum inbound request body.
 
-For a persistent local installation, run the binary under your operating system's service manager and send `SIGTERM` during upgrades. Rebuilding alone does not replace an already-running process.
+The menu-bar app keeps one listener when settings are saved to the same address and atomically swaps in the validated router. In-flight streams continue on the old handler. When the address changes, the new listener is bound before the old one is drained. Invalid settings or a failed bind leave the last-known-good router running.
+
+`GET /healthz` reports process health and `GET /readyz` reports whether a router, registry, and non-empty catalogue were successfully published. Both return deliberately minimal, credential-free JSON for local service probes.
+
+For a persistent non-app installation, run the binary under your operating system's service manager and send `SIGTERM` during upgrades. Rebuilding alone does not replace an already-running process.
 
 ## Observability and troubleshooting
 
-The macOS Settings **Insights** section is the primary view for aggregate usage and estimated savings. It supports 7-day, 30-day, 90-day, and one-year ranges.
+The macOS Settings **Insights** section is the primary view for aggregate usage and estimated savings. It supports 7-day, 30-day, 90-day, and one-year ranges. The version-3 ledger also retains bounded, prompt-free decision evidence: difficulty, domain, risk, classification source/status/latency, applied floor, initial/selected/actual models, and whether fallback was observed. Prompts, responses, session IDs, credentials, and classifier reasoning are not stored. Ledger snapshots are written by a bounded background writer and flushed during graceful shutdown so disk latency does not delay the final streamed event.
 
 Octopus emits structured `slog` text records to standard error. Useful entries include:
 
@@ -815,6 +820,16 @@ Octopus emits structured `slog` text records to standard error. Useful entries i
 - `tool schema normalized`: provider compatibility rewrite.
 - `prompt cache usage`: cache creation and cache-read input tokens.
 - `request handled`: endpoint, final model, requested model, stream mode, routing reason, and elapsed time.
+
+### Authenticated routing controls
+
+When `server.auth_token_env` is configured and the request is authenticated, a caller can safely narrow normal routing with:
+
+- `X-Octopus-Min-Quality: 0.95` to raise the hard quality floor.
+- `X-Octopus-Fixed-Model: provider/model` to require one already-eligible model.
+- `X-Octopus-Highest-Quality: true` to choose the highest-quality eligible model.
+
+These controls cannot bypass tool, vision, context, output, data-placement, or quality requirements. Fixed-model and highest-quality controls cannot be combined. Override headers on an unauthenticated/open router are ignored so another local process cannot force expensive traffic.
 
 ### Octopus does not start
 
@@ -863,6 +878,9 @@ routing:
   strategy: per_turn
   data_policy: local_only
   cache_aware: false
+  # Match this deployment's declared quality scale. Omitting a classifier uses
+  # the conservative high/critical profile, so that floor must be satisfiable.
+  quality_floors: {high: 0.60}
 
 providers:
   local:
@@ -952,6 +970,9 @@ make open-app    # build and launch the macOS app
 make test        # GOWORK=off go test ./...
 make test-race   # race detector across all packages
 make vet         # go vet ./...
+make check       # test, race, vet, formatting, and diff checks
+make eval-local  # tracked offline and local-mock evaluation tiers
+make eval-gate RUN2_RESULTS='a.json b.json' # production thresholds over repeated paid runs
 make tidy        # go mod tidy and go mod verify
 make run         # build and run (menu-bar app on macOS)
 make clean       # remove the generated binary and app bundle
@@ -974,6 +995,8 @@ octopus/
 ├── anthropicio/       Anthropic request decoder and response encoders
 ├── openaiio/          OpenAI request decoder and response encoders
 ├── server/            HTTP endpoints, fallback, normalization, observation
+├── octopus-eval/      Tracked deterministic and paid evaluation harness
+├── docs/              Production gates and engineering specifications
 ├── scripts/           Build and benchmark utilities
 ├── config.example.yaml
 ├── Makefile
@@ -1012,7 +1035,7 @@ Never commit these values or an app-specific password.
 make installer
 ```
 
-This builds `Octopus.app`, signs it with the hardened runtime and a trusted timestamp, checks the signing team against `TEAM_ID`, packages it to install into `/Applications`, notarizes and staples the result, and validates it. Output is `dist/Octopus-<version>.pkg`, versioned from `packaging/Info.plist`.
+This builds `Octopus.app`, signs it with the hardened runtime and a trusted timestamp, checks the signing team against `TEAM_ID`, packages it to install into `/Applications`, notarizes and staples the result, and validates it. It produces `dist/Octopus-<version>.pkg`, a SHA-256 checksum, and a JSON Go dependency manifest, all versioned from `packaging/Info.plist`.
 
 ### Publish a release
 
@@ -1022,7 +1045,7 @@ The worktree must be clean — a tag has to identify one complete commit — and
 make release v0.2.0
 ```
 
-The version must be exactly `vX.Y.Z`; prerelease suffixes are rejected. The target verifies the environment, runs the test suite, bumps `packaging/Info.plist`, pushes the commit and an annotated tag, creates a draft release, builds and notarizes the installer, uploads it, and publishes.
+The version must be exactly `vX.Y.Z`; prerelease suffixes are rejected. The target verifies the environment, runs the complete `make check` gate, bumps `packaging/Info.plist`, pushes the commit and an annotated tag, creates a draft release, builds and notarizes the installer, uploads the installer, checksum, and dependency manifest, then publishes.
 
 It pushes to `origin`, so check your branch first. The only commit it creates is the version bump; it never sweeps up outstanding work.
 

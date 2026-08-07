@@ -9,13 +9,21 @@ import "github.com/sausheong/harness/llm"
 // produces and the scorer consumes. Difficulty is one of
 // "trivial"|"low"|"medium"|"high"; Domain is "code"|"writing"|"qa"|"math"|"other".
 type TaskProfile struct {
-	Difficulty     string `json:"difficulty"`
-	NeedsReasoning bool   `json:"needs_reasoning"`
-	NeedsVision    bool   `json:"needs_vision"`
-	NeedsTools     bool   `json:"needs_tools"`
-	EstTokensIn    int    `json:"est_tokens_in"`
-	EstTokensOut   int    `json:"est_tokens_out"`
-	Domain         string `json:"domain"`
+	Difficulty string `json:"difficulty"`
+	// Risk is "ordinary", "important", or "critical". It is intentionally
+	// separate from difficulty: a simple destructive operation can be critical.
+	Risk           string  `json:"risk"`
+	MinimumQuality float64 `json:"minimum_quality"`
+	// ClassificationConfidence describes confidence in the semantic profile;
+	// EstimateConfidence remains specific to the predicted task horizon.
+	ClassificationConfidence float64 `json:"classification_confidence"`
+	ClassificationSource     string  `json:"classification_source"`
+	NeedsReasoning           bool    `json:"needs_reasoning"`
+	NeedsVision              bool    `json:"needs_vision"`
+	NeedsTools               bool    `json:"needs_tools"`
+	EstTokensIn              int     `json:"est_tokens_in"`
+	EstTokensOut             int     `json:"est_tokens_out"`
+	Domain                   string  `json:"domain"`
 	// ExpectedRemainingTurns is the classifier's task horizon, including the
 	// current turn. EstimateConfidence controls whether amortized routing may
 	// move away from an eligible incumbent.
@@ -28,27 +36,33 @@ type TaskProfile struct {
 // without making optional reasoning support a hard availability requirement.
 func DefaultProfile() TaskProfile {
 	return TaskProfile{
-		Difficulty:     "high",
-		NeedsReasoning: true,
-		EstTokensIn:    4000,
-		EstTokensOut:   2000,
-		Domain:         "other",
+		Difficulty:               "high",
+		Risk:                     "critical",
+		ClassificationConfidence: 0,
+		ClassificationSource:     "conservative_fallback",
+		NeedsReasoning:           true,
+		EstTokensIn:              4000,
+		EstTokensOut:             2000,
+		Domain:                   "other",
 		// Zero lets Router apply routing.default_remaining_turns.
 		ExpectedRemainingTurns: 0,
 		EstimateConfidence:     0.25,
 	}
 }
 
-// TrivialProfile is the optimistic profile used when the short-circuit fires.
-// Routes toward cheap/fast models; no special capabilities assumed.
+// TrivialProfile is used only for an exact, allowlisted, conversation-
+// independent background request. Ordinary user requests are always classified.
 func TrivialProfile() TaskProfile {
 	return TaskProfile{
-		Difficulty:             "trivial",
-		EstTokensIn:            100,
-		EstTokensOut:           200,
-		Domain:                 "other",
-		ExpectedRemainingTurns: 1,
-		EstimateConfidence:     1,
+		Difficulty:               "trivial",
+		Risk:                     "ordinary",
+		ClassificationConfidence: 1,
+		ClassificationSource:     "allowlisted_background",
+		EstTokensIn:              100,
+		EstTokensOut:             200,
+		Domain:                   "other",
+		ExpectedRemainingTurns:   1,
+		EstimateConfidence:       1,
 	}
 }
 
@@ -117,24 +131,4 @@ func EstimateRequestTokens(chat llm.ChatRequest) int {
 	}
 
 	return (totalBytes+tokensPerByte-1)/tokensPerByte + imageTokens
-}
-
-// isTrivial reports whether a request is simple enough to skip the classifier.
-// Conditions: single-turn (no prior assistant messages), last user turn is
-// short, no images, and no tools. Multi-turn conversations are never trivial —
-// a short reply like "yes" may be answering a complex prior question and needs
-// the full context to route correctly.
-func isTrivial(chat llm.ChatRequest, turn llm.Message) bool {
-	if len(chat.Tools) > 0 {
-		return false
-	}
-	if len(turn.Images) > 0 {
-		return false
-	}
-	for _, m := range chat.Messages {
-		if m.Role == "assistant" {
-			return false
-		}
-	}
-	return len(turn.Content) <= shortCircuitBytes
 }

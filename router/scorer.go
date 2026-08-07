@@ -8,11 +8,8 @@ import (
 	"github.com/sausheong/octopus/config"
 )
 
-// HighQualityFloor is the quality a "high"-difficulty task wants. For such
-// tasks, models below the floor are filtered out — but only when at least one
-// at/above-floor model is otherwise eligible, so we never empty the set on
-// quality alone. This keeps hard tasks on capable models without a fragile
-// score penalty that cheap+fast models can overwhelm.
+// HighQualityFloor is the legacy default minimum for high-difficulty work.
+// Quality floors are hard eligibility requirements, never score penalties.
 const HighQualityFloor = 0.85
 
 // CostMode controls how request cost is converted to a score. Relative keeps
@@ -79,8 +76,15 @@ type Decision struct {
 	RemoteFallbackBlocked bool
 	// ClassifierModel and ClassifierUsage let Insights include routing overhead
 	// in request economics. They are empty when classification was skipped.
-	ClassifierModel string
-	ClassifierUsage *llm.Usage
+	ClassifierModel      string
+	ClassifierUsage      *llm.Usage
+	ClassificationSource string  `json:"classification_source,omitempty"`
+	ClassificationStatus string  `json:"classification_status,omitempty"`
+	ClassifierLatencyMS  int64   `json:"classifier_latency_ms,omitempty"`
+	AppliedQualityFloor  float64 `json:"applied_quality_floor,omitempty"`
+	QualityPolicy        string  `json:"quality_policy,omitempty"`
+	InitialChosen        string  `json:"initial_chosen,omitempty"`
+	PolicyOverride       string  `json:"policy_override,omitempty"`
 	// MaxAttempts bounds provider fallback for this request.
 	MaxAttempts int
 	// Strategy and Economics explain whether a conversation was retained or
@@ -217,9 +221,10 @@ func ScoreWithOptions(p TaskProfile, catalog []config.CatalogEntry, w config.Wei
 			elig = append(elig, e)
 		}
 	}
-	// High-difficulty quality floor, applied as a filter only when it leaves
-	// at least one model standing — never empties the set on quality alone.
-	floor, applyFloor := qualityFloor(p.Difficulty, opts)
+	hadCapabilityEligible := len(elig) > 0
+	// A quality floor is a hard policy boundary. If no capability-eligible
+	// model meets it, return no eligible model rather than silently degrading.
+	floor, applyFloor := qualityFloor(p, opts)
 	if applyFloor {
 		var aboveFloor []config.CatalogEntry
 		for _, e := range elig {
@@ -227,29 +232,35 @@ func ScoreWithOptions(p TaskProfile, catalog []config.CatalogEntry, w config.Wei
 				aboveFloor = append(aboveFloor, e)
 			}
 		}
-		if len(aboveFloor) > 0 {
-			for _, e := range elig {
-				if e.Quality < floor {
-					b := breakdowns[e.ID]
-					b.Eligible = false
-					b.RejectionReasons = append(b.RejectionReasons, "below quality floor")
-					breakdowns[e.ID] = b
-				}
+		for _, e := range elig {
+			if e.Quality < floor {
+				b := breakdowns[e.ID]
+				b.Eligible = false
+				b.RejectionReasons = append(b.RejectionReasons, "below quality floor")
+				breakdowns[e.ID] = b
 			}
-			elig = aboveFloor
 		}
+		elig = aboveFloor
 	}
 	if len(elig) == 0 {
+		reason := "no eligible model"
+		qualityPolicy := "none"
+		if applyFloor && hadCapabilityEligible {
+			reason = "no eligible model meets quality floor"
+			qualityPolicy = "strict"
+		}
 		return Decision{
-			Chosen:     "",
-			Profile:    p,
-			Eligible:   nil,
-			Scores:     map[string]float64{},
-			Weights:    w,
-			Reason:     "no eligible model",
-			NoEligible: true,
-			Breakdowns: breakdowns,
-			CostMode:   mode,
+			Chosen:              "",
+			Profile:             p,
+			Eligible:            nil,
+			Scores:              map[string]float64{},
+			Weights:             w,
+			Reason:              reason,
+			NoEligible:          true,
+			Breakdowns:          breakdowns,
+			CostMode:            mode,
+			AppliedQualityFloor: floor,
+			QualityPolicy:       qualityPolicy,
 		}
 	}
 
@@ -358,15 +369,22 @@ func ScoreWithOptions(p TaskProfile, catalog []config.CatalogEntry, w config.Wei
 		return scores[eligIDs[i]] > scores[eligIDs[j]]
 	})
 
+	qualityPolicy := "none"
+	if applyFloor {
+		qualityPolicy = "strict"
+	}
 	return Decision{
-		Chosen:     elig[bestIdx].ID,
-		Profile:    p,
-		Eligible:   eligIDs,
-		Scores:     scores,
-		Weights:    w,
-		Reason:     "highest balanced score",
-		Breakdowns: breakdowns,
-		CostMode:   mode,
+		Chosen:              elig[bestIdx].ID,
+		Profile:             p,
+		Eligible:            eligIDs,
+		Scores:              scores,
+		Weights:             w,
+		Reason:              "highest balanced score",
+		Breakdowns:          breakdowns,
+		CostMode:            mode,
+		AppliedQualityFloor: floor,
+		QualityPolicy:       qualityPolicy,
+		InitialChosen:       elig[bestIdx].ID,
 	}
 }
 
@@ -378,15 +396,19 @@ func inputMultiplier(modelID string, multipliers map[string]float64) float64 {
 	return m
 }
 
-func qualityFloor(difficulty string, opts ScoringOptions) (float64, bool) {
+func qualityFloor(profile TaskProfile, opts ScoringOptions) (float64, bool) {
+	floor := profile.MinimumQuality
 	if opts.QualityFloors != nil {
-		floor, ok := opts.QualityFloors[difficulty]
-		return floor, ok && floor > 0
+		configured, ok := opts.QualityFloors[profile.Difficulty]
+		if ok && configured > floor {
+			floor = configured
+		}
+		return floor, floor > 0
 	}
-	if difficulty == "high" {
-		return HighQualityFloor, true
+	if profile.Difficulty == "high" && HighQualityFloor > floor {
+		floor = HighQualityFloor
 	}
-	return 0, false
+	return floor, floor > 0
 }
 
 func reasoningBonus(opts ScoringOptions) float64 {
